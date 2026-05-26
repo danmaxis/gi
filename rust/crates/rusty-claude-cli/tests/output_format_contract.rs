@@ -1505,6 +1505,70 @@ fn prompt_no_arg_json_error_kind_750() {
 }
 
 #[test]
+fn flag_value_errors_have_error_kind_and_hint_756() {
+    // #756: missing/invalid flag-value errors must emit typed error_kind + non-null hint.
+    // Before #756: all returned error_kind:"unknown" + hint:null.
+    use std::process::Command;
+    let root = unique_temp_dir("flag-value-errors");
+    fs::create_dir_all(&root).expect("temp dir");
+    let bin = env!("CARGO_BIN_EXE_claw");
+
+    // Case 1: --reasoning-effort with invalid value
+    let out = Command::new(bin)
+        .current_dir(&root)
+        .args(["--output-format", "json", "--reasoning-effort", "HIGH"])
+        .output()
+        .expect("claw --reasoning-effort HIGH should run");
+    assert!(
+        !out.status.success(),
+        "invalid reasoning-effort must exit non-zero"
+    );
+    let raw = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with('{'))
+        .collect::<Vec<_>>()
+        .join("");
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|_| panic!("invalid --reasoning-effort must emit JSON; got: {raw}"));
+    assert_eq!(
+        parsed["error_kind"], "invalid_flag_value",
+        "invalid --reasoning-effort must be invalid_flag_value (#756): {parsed}"
+    );
+    assert!(
+        parsed["hint"].as_str().map_or(false, |h| h.contains("low")
+            || h.contains("medium")
+            || h.contains("high")),
+        "hint must mention valid values (#756): {parsed}"
+    );
+
+    // Case 2: --model flag with missing value (trailing flag)
+    let out2 = Command::new(bin)
+        .current_dir(&root)
+        .args(["--output-format", "json", "--model"])
+        .output()
+        .expect("claw --model (no value) should run");
+    assert!(
+        !out2.status.success(),
+        "missing --model value must exit non-zero"
+    );
+    let raw2 = String::from_utf8_lossy(&out2.stderr)
+        .lines()
+        .filter(|l| l.starts_with('{'))
+        .collect::<Vec<_>>()
+        .join("");
+    let parsed2: serde_json::Value = serde_json::from_str(&raw2)
+        .unwrap_or_else(|_| panic!("missing --model value must emit JSON; got: {raw2}"));
+    assert_eq!(
+        parsed2["error_kind"], "missing_flag_value",
+        "missing --model value must be missing_flag_value (#756): {parsed2}"
+    );
+    assert!(
+        parsed2["hint"].as_str().map_or(false, |h| !h.is_empty()),
+        "missing --model hint must be non-empty (#756): {parsed2}"
+    );
+}
+
+#[test]
 fn short_p_flag_swallows_no_flags_755() {
     // #755: `claw -p hello --output-format json` must parse --output-format json
     // as a flag rather than swallowing it as part of the prompt. Before #755,

@@ -286,6 +286,10 @@ fn classify_error_kind(message: &str) -> &'static str {
         "unsupported_skills_action"
     } else if message.contains("unrecognized argument") || message.contains("unknown option") {
         "cli_parse"
+    } else if message.starts_with("missing_flag_value:") {
+        "missing_flag_value"
+    } else if message.starts_with("invalid_flag_value:") {
+        "invalid_flag_value"
     } else if message.contains("invalid model syntax") {
         "invalid_model_syntax"
     } else if message.contains("is not yet implemented") {
@@ -776,7 +780,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--model" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --model".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --model.\nUsage: --model <provider/model>  e.g. --model anthropic/claude-opus-4-7".to_string())?;
                 let resolved = resolve_model_alias_with_config(value);
                 debug!("Resolved --model '{}' -> '{}'", value, resolved);
                 validate_model_syntax(&resolved)?;
@@ -796,14 +800,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--output-format" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --output-format".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --output-format.\nUsage: --output-format text  or  --output-format json".to_string())?;
                 output_format = CliOutputFormat::parse(value)?;
                 index += 2;
             }
             "--permission-mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --permission-mode".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --permission-mode.\nUsage: --permission-mode default|acceptEdits|bypassPermissions|dangerFullAccess".to_string())?;
                 permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
@@ -826,7 +830,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--base-commit" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --base-commit".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --base-commit.\nUsage: --base-commit <git-sha>".to_string())?;
                 base_commit = Some(value.clone());
                 index += 2;
             }
@@ -837,10 +841,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             "--reasoning-effort" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
+                    .ok_or_else(|| "missing_flag_value: missing value for --reasoning-effort.\nUsage: --reasoning-effort low|medium|high".to_string())?;
                 if !matches!(value.as_str(), "low" | "medium" | "high") {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid_flag_value: invalid value for --reasoning-effort: '{value}'.\nUsage: --reasoning-effort low|medium|high"
                     ));
                 }
                 reasoning_effort = Some(value.clone());
@@ -850,7 +854,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = &flag[19..];
                 if !matches!(value, "low" | "medium" | "high") {
                     return Err(format!(
-                        "invalid value for --reasoning-effort: '{value}'; must be low, medium, or high"
+                        "invalid_flag_value: invalid value for --reasoning-effort: '{value}'.\nUsage: --reasoning-effort low|medium|high"
                     ));
                 }
                 reasoning_effort = Some(value.to_string());

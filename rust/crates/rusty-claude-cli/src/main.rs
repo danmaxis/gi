@@ -274,12 +274,15 @@ fn classify_error_kind(message: &str) -> &'static str {
         "missing_worker_state"
     } else if message.contains("session not found") {
         "session_not_found"
-    } else if message.contains("failed to restore session") {
-        "session_load_failed"
     } else if message.contains("no managed sessions found") {
         "no_managed_sessions"
     } else if message.contains("legacy session is missing workspace binding") {
+        // #780: must precede the generic "failed to restore session" arm — the full
+        // error message is "failed to restore session: legacy session is missing workspace
+        // binding: ...", so the specific arm must be checked first.
         "legacy_session_no_workspace_binding"
+    } else if message.contains("failed to restore session") {
+        "session_load_failed"
     } else if message.contains("unsupported ACP invocation") {
         "unsupported_acp_invocation"
     } else if message.contains("unsupported skills action") {
@@ -12942,8 +12945,15 @@ mod tests {
             classify_error_kind("session not found: abc123"),
             "session_not_found"
         );
+        // #780: "no managed sessions found" is more specific than generic "failed to restore"
+        // session_load_failed; the reordered classifier now correctly returns no_managed_sessions.
         assert_eq!(
             classify_error_kind("failed to restore session: no managed sessions found"),
+            "no_managed_sessions"
+        );
+        // Bare session load failures that aren't no_managed_sessions or legacy_binding still map here
+        assert_eq!(
+            classify_error_kind("failed to restore session: file not found"),
             "session_load_failed"
         );
         assert_eq!(
@@ -12994,6 +13004,12 @@ mod tests {
         );
         assert_eq!(
             classify_error_kind("legacy session is missing workspace binding"),
+            "legacy_session_no_workspace_binding"
+        );
+        // #780: full error string produced by resume_session includes the
+        // "failed to restore session: " prefix — the specific arm must win.
+        assert_eq!(
+            classify_error_kind("failed to restore session: legacy session is missing workspace binding: /path/to/session.jsonl"),
             "legacy_session_no_workspace_binding"
         );
         assert_eq!(

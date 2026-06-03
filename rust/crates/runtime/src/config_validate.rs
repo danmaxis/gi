@@ -92,6 +92,7 @@ enum FieldType {
     Bool,
     Object,
     StringArray,
+    RulesImport,
     Number,
 }
 
@@ -102,6 +103,7 @@ impl FieldType {
             Self::Bool => "a boolean",
             Self::Object => "an object",
             Self::StringArray => "an array of strings",
+            Self::RulesImport => "a string or an array of strings",
             Self::Number => "a number",
         }
     }
@@ -114,6 +116,12 @@ impl FieldType {
             Self::StringArray => value
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
+            Self::RulesImport => {
+                value.as_str().is_some()
+                    || value
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some()))
+            }
             Self::Number => value.as_i64().is_some(),
         }
     }
@@ -200,6 +208,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "provider",
         expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "rulesImport",
+        expected: FieldType::RulesImport,
     },
 ];
 
@@ -703,6 +715,34 @@ mod tests {
         // then
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].field, "hooks.BadHook");
+    }
+
+    #[test]
+    fn validates_rules_import_string_and_array_forms() {
+        for source in [
+            r#"{"rulesImport":"auto"}"#,
+            r#"{"rulesImport":"none"}"#,
+            r#"{"rulesImport":["cursor","copilot"]}"#,
+        ] {
+            let parsed = JsonValue::parse(source).expect("valid json");
+            let object = parsed.as_object().expect("object");
+
+            let result = validate_config_file(object, source, &test_path());
+
+            assert!(result.errors.is_empty(), "{source}: {:?}", result.errors);
+        }
+    }
+
+    #[test]
+    fn rejects_rules_import_wrong_type() {
+        let source = r#"{"rulesImport":42}"#;
+        let parsed = JsonValue::parse(source).expect("valid json");
+        let object = parsed.as_object().expect("object");
+
+        let result = validate_config_file(object, source, &test_path());
+
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].field, "rulesImport");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::config::{ConfigError, ConfigLoader, RulesImportConfig, RuntimeConfig};
 use crate::git_context::GitContext;
 
 /// Errors raised while assembling the final system prompt.
@@ -86,7 +86,24 @@ impl ProjectContext {
         current_date: impl Into<String>,
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
-        let instruction_files = discover_instruction_files(&cwd)?;
+        let instruction_files = discover_instruction_files(&cwd, &RulesImportConfig::default())?;
+        Ok(Self {
+            cwd,
+            current_date: current_date.into(),
+            git_status: None,
+            git_diff: None,
+            git_context: None,
+            instruction_files,
+        })
+    }
+
+    pub fn discover_with_rules_import(
+        cwd: impl Into<PathBuf>,
+        current_date: impl Into<String>,
+        rules_import: &RulesImportConfig,
+    ) -> std::io::Result<Self> {
+        let cwd = cwd.into();
+        let instruction_files = discover_instruction_files(&cwd, rules_import)?;
         Ok(Self {
             cwd,
             current_date: current_date.into(),
@@ -107,6 +124,18 @@ impl ProjectContext {
         context.git_context = GitContext::detect(&context.cwd);
         Ok(context)
     }
+}
+
+fn discover_with_git_and_rules_import(
+    cwd: impl Into<PathBuf>,
+    current_date: impl Into<String>,
+    rules_import: &RulesImportConfig,
+) -> std::io::Result<ProjectContext> {
+    let mut context = ProjectContext::discover_with_rules_import(cwd, current_date, rules_import)?;
+    context.git_status = read_git_status(&context.cwd);
+    context.git_diff = read_git_diff(&context.cwd);
+    context.git_context = GitContext::detect(&context.cwd);
+    Ok(context)
 }
 
 /// Builder for the runtime system prompt and dynamic environment sections.
@@ -227,7 +256,10 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
 
-fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+fn discover_instruction_files(
+    cwd: &Path,
+    rules_import: &RulesImportConfig,
+) -> std::io::Result<Vec<ContextFile>> {
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
@@ -248,11 +280,17 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         ] {
             push_context_file(&mut files, candidate)?;
         }
+        push_rules_dir(&mut files, dir.join(".claw").join("rules"))?;
+        push_rules_dir(&mut files, dir.join(".claw").join("rules.local"))?;
+        push_framework_imports(&mut files, &dir, rules_import)?
     }
     Ok(dedupe_instruction_files(files))
 }
 
 fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
     match fs::read_to_string(&path) {
         Ok(content) if !content.trim().is_empty() => {
             files.push(ContextFile { path, content });
@@ -262,6 +300,64 @@ fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Re
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn push_rules_dir(files: &mut Vec<ContextFile>, dir: PathBuf) -> std::io::Result<()> {
+    if dir.is_file() {
+        return Ok(());
+    }
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_supported_rule_file(path))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        push_context_file(files, path)?;
+    }
+    Ok(())
+}
+
+fn is_supported_rule_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "txt" | "mdc"
+            )
+        })
+}
+
+fn push_framework_imports(
+    files: &mut Vec<ContextFile>,
+    dir: &Path,
+    rules_import: &RulesImportConfig,
+) -> std::io::Result<()> {
+    if rules_import.should_import("cursor") {
+        push_context_file(files, dir.join(".cursorrules"))?;
+        push_rules_dir(files, dir.join(".cursor").join("rules"))?;
+    }
+    if rules_import.should_import("copilot") {
+        push_context_file(files, dir.join(".github").join("copilot-instructions.md"))?;
+    }
+    if rules_import.should_import("windsurf") {
+        push_context_file(files, dir.join(".windsurfrules"))?;
+        push_rules_dir(files, dir.join(".windsurfrules"))?;
+    }
+    if rules_import.should_import("plandex") {
+        push_context_file(files, dir.join(".plandex").join("instructions.md"))?;
+    }
+    if rules_import.should_import("crush") {
+        push_context_file(files, dir.join(".crush").join("CLAUDE.md"))?;
+        push_rules_dir(files, dir.join(".crush").join("rules"))?;
+    }
+    Ok(())
 }
 
 fn read_git_status(cwd: &Path) -> Option<String> {
@@ -478,8 +574,9 @@ pub fn load_system_prompt(
     model_family: ModelFamilyIdentity,
 ) -> Result<Vec<String>, PromptBuildError> {
     let cwd = cwd.into();
-    let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
+    let project_context =
+        discover_with_git_and_rules_import(&cwd, current_date.into(), config.rules_import())?;
     Ok(SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_model_family(model_family)
@@ -590,6 +687,78 @@ mod tests {
             std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))
                 .expect("test cwd should be recoverable");
         }
+    }
+
+    #[test]
+    fn discovers_claw_rules_files_in_sorted_order() {
+        let root = temp_dir();
+        let rules = root.join(".claw").join("rules");
+        let local_rules = root.join(".claw").join("rules.local");
+        fs::create_dir_all(&rules).expect("rules dir");
+        fs::create_dir_all(&local_rules).expect("local rules dir");
+        fs::write(rules.join("b.txt"), "b rule").expect("write b rule");
+        fs::write(rules.join("a.md"), "a rule").expect("write a rule");
+        fs::write(rules.join("ignored.json"), "ignored rule").expect("write ignored");
+        fs::write(local_rules.join("c.mdc"), "c local rule").expect("write local rule");
+
+        let context = ProjectContext::discover(&root, "2026-03-31").expect("context should load");
+        let contents = context
+            .instruction_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents, vec!["a rule", "b rule", "c local rule"]);
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_import_none_suppresses_external_framework_rules() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw").join("rules")).expect("rules dir");
+        fs::write(
+            root.join(".claw").join("rules").join("project.md"),
+            "claw rule",
+        )
+        .expect("write claw rule");
+        fs::write(root.join(".cursorrules"), "cursor rule").expect("write cursor rule");
+
+        let context = ProjectContext::discover_with_rules_import(
+            &root,
+            "2026-03-31",
+            &crate::config::RulesImportConfig::None,
+        )
+        .expect("context should load");
+        let rendered = render_instruction_files(&context.instruction_files);
+
+        assert!(rendered.contains("claw rule"));
+        assert!(!rendered.contains("cursor rule"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_import_list_loads_only_selected_framework_rules() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(root.join(".cursorrules"), "cursor rule").expect("write cursor rule");
+        fs::create_dir_all(root.join(".github")).expect("github dir");
+        fs::write(
+            root.join(".github").join("copilot-instructions.md"),
+            "copilot rule",
+        )
+        .expect("write copilot rule");
+
+        let context = ProjectContext::discover_with_rules_import(
+            &root,
+            "2026-03-31",
+            &crate::config::RulesImportConfig::List(vec!["copilot".to_string()]),
+        )
+        .expect("context should load");
+        let rendered = render_instruction_files(&context.instruction_files);
+
+        assert!(rendered.contains("copilot rule"));
+        assert!(!rendered.contains("cursor rule"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -932,6 +1101,51 @@ mod tests {
 
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_system_prompt_respects_rules_import_config() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::write(root.join(".cursorrules"), "cursor rule").expect("write cursor rule");
+        fs::write(
+            root.join(".claw").join("settings.json"),
+            r#"{"rulesImport":"none"}"#,
+        )
+        .expect("write settings");
+
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let previous = std::env::current_dir().expect("cwd");
+        let original_home = std::env::var("HOME").ok();
+        let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        std::env::set_current_dir(&root).expect("change cwd");
+        let prompt = super::load_system_prompt(
+            &root,
+            "2026-03-31",
+            "linux",
+            "6.8",
+            ModelFamilyIdentity::Claude,
+        )
+        .expect("system prompt should load")
+        .join("\n\n");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        if let Some(value) = original_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = original_claw_home {
+            std::env::set_var("CLAW_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("CLAW_CONFIG_HOME");
+        }
+
+        assert!(!prompt.contains("cursor rule"));
+        assert!(prompt.contains("rulesImport"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

@@ -95,6 +95,32 @@ pub struct RuntimeFeatureConfig {
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
     trusted_roots: Vec<String>,
+    rules_import: RulesImportConfig,
+}
+
+/// Controls which external AI coding framework rules are imported into the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RulesImportConfig {
+    /// Import from all supported frameworks when files are detected.
+    #[default]
+    Auto,
+    /// Do not import external framework rules; keep Claw instruction files only.
+    None,
+    /// Import only the named frameworks.
+    List(Vec<String>),
+}
+
+impl RulesImportConfig {
+    #[must_use]
+    pub fn should_import(&self, framework: &str) -> bool {
+        match self {
+            Self::Auto => true,
+            Self::None => false,
+            Self::List(frameworks) => frameworks
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(framework)),
+        }
+    }
 }
 
 /// Ordered chain of fallback model identifiers used when the primary
@@ -353,6 +379,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            rules_import: parse_optional_rules_import(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -410,6 +437,7 @@ impl ConfigLoader {
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
+            rules_import: parse_optional_rules_import(&merged_value)?,
         };
 
         let config = RuntimeConfig {
@@ -511,6 +539,11 @@ impl RuntimeConfig {
         &self.feature_config.trusted_roots
     }
 
+    #[must_use]
+    pub fn rules_import(&self) -> &RulesImportConfig {
+        &self.feature_config.rules_import
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -589,6 +622,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.trusted_roots
+    }
+
+    #[must_use]
+    pub fn rules_import(&self) -> &RulesImportConfig {
+        &self.rules_import
     }
 
     /// Merge this config's default trusted roots with per-call roots.
@@ -1162,6 +1200,37 @@ fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigE
     )
 }
 
+fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RulesImportConfig::default());
+    };
+    let Some(value) = object.get("rulesImport") else {
+        return Ok(RulesImportConfig::default());
+    };
+
+    match value {
+        JsonValue::String(value) if value.eq_ignore_ascii_case("auto") => Ok(RulesImportConfig::Auto),
+        JsonValue::String(value) if value.eq_ignore_ascii_case("none") => Ok(RulesImportConfig::None),
+        JsonValue::String(value) => Err(ConfigError::Parse(format!(
+            "merged settings.rulesImport: expected \"auto\", \"none\", or an array of framework names, got \"{value}\""
+        ))),
+        JsonValue::Array(values) => values
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    ConfigError::Parse(
+                        "merged settings.rulesImport: array entries must be strings".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(RulesImportConfig::List),
+        _ => Err(ConfigError::Parse(
+            "merged settings.rulesImport: expected \"auto\", \"none\", or an array of framework names".to_string(),
+        )),
+    }
+}
+
 fn parse_filesystem_mode_label(value: &str) -> Result<FilesystemIsolationMode, ConfigError> {
     match value {
         "off" => Ok(FilesystemIsolationMode::Off),
@@ -1720,6 +1789,72 @@ mod tests {
         assert_eq!(chain.primary(), None);
         assert!(chain.fallbacks().is_empty());
         assert!(chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_rules_import_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"rulesImport": ["cursor", "copilot"]}"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(loaded.rules_import().should_import("cursor"));
+        assert!(loaded.rules_import().should_import("copilot"));
+        assert!(!loaded.rules_import().should_import("windsurf"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rules_import_none_disables_external_frameworks() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), r#"{"rulesImport": "none"}"#)
+            .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert!(!loaded.rules_import().should_import("cursor"));
+        assert!(!loaded.rules_import().should_import("copilot"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn rejects_rules_import_array_with_non_string_entries() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"rulesImport": ["cursor", 42]}"#,
+        )
+        .expect("write settings");
+
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("config should fail");
+
+        assert!(error.to_string().contains("rulesImport"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

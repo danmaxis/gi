@@ -519,6 +519,23 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json`
 
+## Project instruction rules
+
+In addition to root instruction files such as `CLAUDE.md`, `AGENTS.md`, `.claw/CLAUDE.md`, `.claude/CLAUDE.md`, and `.claw/instructions.md`, `claw` loads sorted Markdown/text rule files from:
+
+- `<repo>/.claw/rules/` (`.md`, `.txt`, `.mdc`) for shared project rules.
+- `<repo>/.claw/rules.local/` for personal local rules; this path is gitignored.
+
+By default, `claw` also imports detected rules from common AI coding tools such as Cursor (`.cursorrules`, `.cursor/rules/`), GitHub Copilot (`.github/copilot-instructions.md`), Windsurf, Plandex, and Crush. Control this with `rulesImport` in any settings file:
+
+```json
+{
+  "rulesImport": "none"
+}
+```
+
+Use `"auto"` (the default) to import every supported framework, `"none"` to load only Claw instruction/rules files, or an array such as `["cursor", "copilot"]` to import selected frameworks.
+
 ## Mock parity harness
 
 The workspace includes a deterministic Anthropic-compatible mock service and parity harness.

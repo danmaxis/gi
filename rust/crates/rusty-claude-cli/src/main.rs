@@ -3131,6 +3131,17 @@ fn parse_system_prompt_args(
                     "missing_flag_value: missing value for --cwd.\nUsage: --cwd <path>".to_string()
                 })?;
                 cwd = PathBuf::from(value);
+                // #99: validate --cwd path exists and is a directory
+                if !cwd.exists() {
+                    return Err(format!(
+                        "invalid_cwd: path '{value}' does not exist.\nUsage: claw system-prompt --cwd <existing-directory>"
+                    ));
+                }
+                if !cwd.is_dir() {
+                    return Err(format!(
+                        "invalid_cwd: path '{value}' is not a directory.\nUsage: claw system-prompt --cwd <existing-directory>"
+                    ));
+                }
                 index += 2;
             }
             "--date" => {
@@ -3138,9 +3149,22 @@ fn parse_system_prompt_args(
                     "missing_flag_value: missing value for --date.\nUsage: --date <YYYY-MM-DD>"
                         .to_string()
                 })?;
+                // #99: validate --date is a plausible date string (no newlines, reasonable length)
+                if value.contains('\n') || value.contains('\r') {
+                    return Err(format!(
+                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
+                    ));
+                }
+                if value.len() > 20 {
+                    return Err(format!(
+                        "invalid_flag_value: --date value is too long ({len} chars, expected YYYY-MM-DD).\nUsage: --date <YYYY-MM-DD>",
+                        len = value.len()
+                    ));
+                }
                 date.clone_from(value);
                 index += 2;
             }
+
             other => {
                 // #152: hint `--output-format json` when user types `--json`.
                 // #790: use unknown_option: prefix + \n hint so classify_error_kind returns

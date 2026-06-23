@@ -148,6 +148,17 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             extra_env: None,
             resume_session: None,
         },
+        ScenarioCase {
+            name: "ask_user_interactive",
+            permission_mode: "read-only",
+            allowed_tools: None,
+            // Piped stdin is not a TTY, so ask_user must report interactive_required.
+            stdin: Some("1\n"),
+            prepare: prepare_noop,
+            assert: assert_ask_user_interactive,
+            extra_env: None,
+            resume_session: None,
+        },
     ];
 
     let case_names = cases.iter().map(|case| case.name).collect::<Vec<_>>();
@@ -194,8 +205,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
         .collect();
     assert_eq!(
         messages_only.len(),
-        21,
-        "twelve scenarios should produce twenty-one /v1/messages requests (total captured: {}, includes count_tokens)",
+        23,
+        "thirteen scenarios should produce twenty-three /v1/messages requests (total captured: {}, includes count_tokens)",
         captured.len()
     );
     assert!(messages_only.iter().all(|request| request.stream));
@@ -228,6 +239,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             "plugin_tool_roundtrip",
             "auto_compact_triggered",
             "token_cost_reporting",
+            "ask_user_interactive",
+            "ask_user_interactive",
         ]
     );
 
@@ -743,6 +756,33 @@ fn assert_token_cost_reporting(_: &HarnessWorkspace, run: &ScenarioRun) {
             .is_some_and(|cost| cost.starts_with('$')),
         "estimated_cost should be a dollar-prefixed string"
     );
+}
+
+fn assert_ask_user_interactive(_: &HarnessWorkspace, run: &ScenarioRun) {
+    // Tool call (ask_user) + final turn.
+    assert_eq!(run.response["iterations"], Value::from(2));
+    let tool_output = run.response["tool_results"][0]["output"]
+        .as_str()
+        .expect("ask_user tool output");
+    let parsed: Value = serde_json::from_str(tool_output).expect("ask_user output json");
+    // Stdin is a pipe (not a TTY), so the Slice 4 guard returns interactive_required
+    // with typed metadata instead of blocking on stdin.
+    assert_eq!(parsed["interactive_required"], Value::Bool(true));
+    assert_eq!(
+        parsed["source"],
+        Value::String("non_interactive".to_string())
+    );
+    assert_eq!(parsed["timed_out"], Value::Bool(false));
+    assert_eq!(parsed["cancelled"], Value::Bool(false));
+    assert_eq!(parsed["answer"], Value::Null);
+    assert_eq!(
+        parsed["question"],
+        Value::String("Pick an option".to_string())
+    );
+    assert!(run.response["message"]
+        .as_str()
+        .expect("message text")
+        .contains("ask_user complete"));
 }
 
 fn parse_json_output(stdout: &str) -> Value {

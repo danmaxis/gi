@@ -183,7 +183,7 @@ Existing `OLLAMA_HOST` support remains the preferred Ollama path.
 - [x] Add prompt tests proving the Sakana-GI section appears in `system-prompt`.
 - [x] Add render tests for `sakana-dark`, `sakana-light`, and unknown theme fallback.
 - [x] Add pure tests for `ask_user` default, numeric, id, label, free-text, and invalid-answer resolution.
-- [ ] Add stdin-backed integration tests for the full `ask_user` terminal prompt.
+- [x] Add stdin-backed integration tests for `ask_user` (mock-LLM parity scenario `ask_user_interactive` drives the real `gi` binary with piped non-TTY stdin and asserts the typed `interactive_required` result). A fully-interactive numeric/free-text path over a PTY remains a possible future addition.
 - [x] Run `cargo fmt --all`.
 - [x] Run targeted tests for `runtime` and `rusty-claude-cli`.
 - [x] Run relevant `tools` registry coverage through `cargo test -p tools`.
@@ -206,11 +206,11 @@ Implementation notes:
 
 ### Slice 4: Interactive Question Polish
 
-- [ ] Add strict timeout support without leaking blocked stdin readers.
-- [ ] Add typed transcript metadata for questions and answers.
-- [ ] Add JSON event output for external UIs and opencode-compatible bridges.
-- [ ] Add cancellation semantics for empty answers when no default exists.
-- [ ] Add safeguards so unattended/non-interactive mode reports `interactive_required` instead of blocking.
+- [x] Add strict timeout support without leaking blocked stdin readers (Unix polls the stdin fd via `nix::poll` with the requested timeout; no reader thread is spawned, so a timeout strands nothing. Returns a typed `timed_out` result).
+- [x] Add typed transcript metadata for questions and answers (`AskUserResult` with `question`, `answer`, `choice_id`, `source`, `timed_out`, `cancelled`, `interactive_required`, serialized as the tool result — no `ContentBlock` schema change).
+- [x] Add JSON event output for external UIs and opencode-compatible bridges (`ask_user` `prompt`/`answer` events emitted as JSON lines on stderr when JSON output mode is active; stdout tool-result contract preserved).
+- [x] Add cancellation semantics for empty answers when no default exists (resolves to a typed `cancelled` result instead of a hard error).
+- [x] Add safeguards so unattended/non-interactive mode reports `interactive_required` instead of blocking (non-TTY stdin short-circuits before any read).
 
 ### Slice 5: Skill System Upgrade
 

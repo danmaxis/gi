@@ -468,3 +468,30 @@ known pre-existing env cases (sandbox #831, pwsh stub) plus intermittent
 subprocess-timing flakes (mcp_stdio reset, repl python) that pass in isolation and
 whose logic the rename never touched. Smoke: gi status/doctor, gi /theme gi-dark
 persists to ~/.gi/settings.json, GI_THEME=gi-light overrides (source=env).
+
+Iteration 2026-06-23 - Slice 4: ask_user Interactive Question Polish (Part B)
+-----------------------------------------------------------------------------
+Full Slice 4 on the renamed `gi` code (crates/gi-cli/src/main.rs):
+- Typed AskUserResult { question, answer, choice_id, source, timed_out, cancelled,
+  interactive_required } serialized as the tool result (typed transcript metadata;
+  no ContentBlock schema change). AskUserSource enum (choice/default/free_text/
+  timeout/non_interactive/cancelled).
+- Non-interactive safeguard: non-TTY stdin (io::stdin().is_terminal()==false)
+  short-circuits to interactive_required instead of blocking.
+- Strict timeout without leaking stdin readers: Unix polls the stdin fd via
+  nix::poll with timeout_ms (no thread spawned); Windows falls back to a blocking
+  read. Timeout -> typed timed_out result. (workspace forbids unsafe, so libc::poll
+  was replaced with the safe nix wrapper.)
+- Cancellation: empty answer with no default -> cancelled result (not an error);
+  non-empty-unmatched-no-free-text stays an error.
+- JSON events: ask_user prompt/answer emitted as JSON lines on stderr when
+  GI_OUTPUT_FORMAT/--output-format json is active; stdout tool contract preserved.
+
+Tests: 7 unit tests (default/choice/free-text/cancel/invalid/source-tagging/
+AskUserResult serialization). End-to-end integration: new mock-LLM parity scenario
+`ask_user_interactive` (mock-anthropic-service + mock_parity_scenarios.json) drives
+the real `gi` binary with piped non-TTY stdin and asserts the typed
+interactive_required result. Added libc->nix(poll) dep to gi-cli. Plan doc Slice 4
++ Slice 2 stdin box ticked.
+
+Verification: fmt clean; gi-cli ask_user unit tests + mock_parity_harness green.

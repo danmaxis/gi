@@ -100,6 +100,7 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    AskUserInteractive,
 }
 
 impl Scenario {
@@ -117,6 +118,7 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "ask_user_interactive" => Some(Self::AskUserInteractive),
             _ => None,
         }
     }
@@ -135,6 +137,7 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::AskUserInteractive => "ask_user_interactive",
         }
     }
 }
@@ -464,6 +467,16 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::AskUserInteractive => match latest_tool_result(request) {
+            Some((tool_output, _)) => final_text_sse(&format!("ask_user complete: {tool_output}")),
+            None => tool_use_sse(
+                "toolu_ask_user",
+                "ask_user",
+                &[
+                    r#"{"question":"Pick an option","choices":[{"id":"alpha","label":"Alpha","recommended":true},{"id":"beta","label":"Beta"}]}"#,
+                ],
+            ),
+        },
     }
 }
 
@@ -634,6 +647,18 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::AskUserInteractive => match latest_tool_result(request) {
+            Some((tool_output, _)) => text_message_response(
+                "msg_ask_user_final",
+                &format!("ask_user complete: {tool_output}"),
+            ),
+            None => tool_message_response(
+                "msg_ask_user_tool",
+                "toolu_ask_user",
+                "ask_user",
+                json!({"question":"Pick an option","choices":[{"id":"alpha","label":"Alpha","recommended":true},{"id":"beta","label":"Beta"}]}),
+            ),
+        },
     }
 }
 
@@ -651,6 +676,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::AskUserInteractive => "req_ask_user_interactive",
     }
 }
 

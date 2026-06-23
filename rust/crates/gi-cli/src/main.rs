@@ -63,7 +63,7 @@ use runtime::{
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
     RuntimeInvalidHookConfig, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tools::{
     canonical_allowed_tool_name, execute_tool, mvp_tool_specs, GlobalToolRegistry,
@@ -7440,10 +7440,53 @@ struct AskUserChoice {
     recommended: bool,
 }
 
+/// How an `ask_user` result was produced — typed metadata carried in the tool
+/// result and the JSON event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AskUserSource {
+    /// User selected one of the offered choices (by number, id, or label).
+    Choice,
+    /// User pressed enter and the recommended/default choice was applied.
+    Default,
+    /// User typed a free-text answer (allowed and non-empty).
+    FreeText,
+    /// The requested timeout elapsed before an answer was read.
+    Timeout,
+    /// stdin was not a TTY, so the question could not be asked.
+    NonInteractive,
+    /// User declined (empty answer with no default available).
+    Cancelled,
+}
+
+/// A successfully resolved interactive answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AskUserAnswer {
     answer: String,
     choice_id: Option<String>,
+    source: AskUserSource,
+}
+
+/// Why answer resolution did not produce an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskUserError {
+    /// Empty answer and no default choice — treated as a user cancellation.
+    Cancelled,
+    /// Non-empty answer that matched no choice while free text is disabled.
+    Invalid,
+}
+
+/// Typed `ask_user` result serialized as the tool output and JSON events. This
+/// is the durable, self-describing transcript metadata for a question/answer.
+#[derive(Debug, Clone, Serialize)]
+struct AskUserResult {
+    question: String,
+    answer: Option<String>,
+    choice_id: Option<String>,
+    source: AskUserSource,
+    timed_out: bool,
+    cancelled: bool,
+    interactive_required: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14188,7 +14231,7 @@ impl CliToolExecutor {
     fn execute_ask_user(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: AskUserRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let question = input.question.trim();
+        let question = input.question.trim().to_string();
         if question.is_empty() {
             return Err(ToolError::new("ask_user requires a non-empty question"));
         }
@@ -14198,6 +14241,22 @@ impl CliToolExecutor {
             .iter()
             .position(|choice| choice.recommended)
             .or_else(|| (!choices.is_empty()).then_some(0));
+
+        emit_ask_user_event("prompt", &json!({ "question": question }));
+
+        // Slice 4: never block on a non-interactive stdin. Report
+        // `interactive_required` so the model can proceed on its own judgment.
+        if !io::stdin().is_terminal() {
+            return finish_ask_user(AskUserResult {
+                question,
+                answer: None,
+                choice_id: None,
+                source: AskUserSource::NonInteractive,
+                timed_out: false,
+                cancelled: false,
+                interactive_required: true,
+            });
+        }
 
         println!();
         println!("Question");
@@ -14226,22 +14285,117 @@ impl CliToolExecutor {
         print!("Answer: ");
         let _ = io::stdout().flush();
 
-        let mut response = String::new();
-        io::stdin()
-            .read_line(&mut response)
-            .map_err(|error| ToolError::new(format!("failed to read user answer: {error}")))?;
-        let answer = response.trim();
+        // Slice 4: strict timeout that does not leak a blocked stdin reader.
+        let response = match read_line_with_timeout(input.timeout_ms) {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                return finish_ask_user(AskUserResult {
+                    question,
+                    answer: None,
+                    choice_id: None,
+                    source: AskUserSource::Timeout,
+                    timed_out: true,
+                    cancelled: false,
+                    interactive_required: false,
+                });
+            }
+            Err(error) => {
+                return Err(ToolError::new(format!(
+                    "failed to read user answer: {error}"
+                )));
+            }
+        };
 
-        match resolve_ask_user_answer(answer, &choices, recommended, input.allow_free_text) {
-            Ok(resolved) => serde_json::to_string_pretty(&json!({
-                "answer": resolved.answer,
-                "choice_id": resolved.choice_id,
-                "timed_out": false,
-            }))
-            .map_err(|error| ToolError::new(error.to_string())),
-            Err(error) => Err(ToolError::new(error)),
+        match resolve_ask_user_answer(
+            response.trim(),
+            &choices,
+            recommended,
+            input.allow_free_text,
+        ) {
+            Ok(resolved) => finish_ask_user(AskUserResult {
+                question,
+                answer: Some(resolved.answer),
+                choice_id: resolved.choice_id,
+                source: resolved.source,
+                timed_out: false,
+                cancelled: false,
+                interactive_required: false,
+            }),
+            Err(AskUserError::Cancelled) => finish_ask_user(AskUserResult {
+                question,
+                answer: None,
+                choice_id: None,
+                source: AskUserSource::Cancelled,
+                timed_out: false,
+                cancelled: true,
+                interactive_required: false,
+            }),
+            Err(AskUserError::Invalid) => Err(ToolError::new(
+                "answer did not match an available choice and free text is disabled",
+            )),
         }
     }
+}
+
+/// Serialize an `AskUserResult` as the tool output, also emitting it as the
+/// `answer` phase of the JSON event stream.
+fn finish_ask_user(result: AskUserResult) -> Result<String, ToolError> {
+    let value = serde_json::to_value(&result).map_err(|error| ToolError::new(error.to_string()))?;
+    emit_ask_user_event("answer", &value);
+    serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
+}
+
+/// Emit an `ask_user` lifecycle event as a JSON line on stderr when JSON output
+/// mode is active, so external/opencode-style UIs can observe questions without
+/// disturbing the stdout tool-result contract. No-op in text mode.
+fn emit_ask_user_event(phase: &str, payload: &Value) {
+    if !matches!(
+        current_output_format_selection().format,
+        CliOutputFormat::Json
+    ) {
+        return;
+    }
+    let event = json!({
+        "event": "ask_user",
+        "phase": phase,
+        "data": payload,
+    });
+    if let Ok(line) = serde_json::to_string(&event) {
+        eprintln!("{line}");
+    }
+}
+
+/// Read a line from stdin, returning `Ok(None)` when `timeout_ms` elapses first.
+///
+/// On Unix this polls the stdin file descriptor once with the timeout, so a
+/// timeout returns without ever spawning or stranding a blocked reader thread.
+/// On other platforms the read is blocking and the timeout is not enforced.
+#[cfg(unix)]
+fn read_line_with_timeout(timeout_ms: Option<u64>) -> std::io::Result<Option<String>> {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::fd::AsFd;
+
+    let stdin = io::stdin();
+    if let Some(ms) = timeout_ms {
+        let timeout = PollTimeout::try_from(i32::try_from(ms).unwrap_or(i32::MAX))
+            .unwrap_or(PollTimeout::MAX);
+        let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+        let ready = poll(&mut fds, timeout)
+            .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+        if ready == 0 {
+            return Ok(None);
+        }
+    }
+    let mut line = String::new();
+    stdin.read_line(&mut line)?;
+    Ok(Some(line))
+}
+
+#[cfg(not(unix))]
+fn read_line_with_timeout(_timeout_ms: Option<u64>) -> std::io::Result<Option<String>> {
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(Some(line))
 }
 
 fn resolve_ask_user_answer(
@@ -14249,30 +14403,41 @@ fn resolve_ask_user_answer(
     choices: &[AskUserChoice],
     recommended: Option<usize>,
     allow_free_text: bool,
-) -> Result<AskUserAnswer, String> {
+) -> Result<AskUserAnswer, AskUserError> {
     let answer = answer.trim();
     let selected = if answer.is_empty() {
-        recommended.and_then(|index| choices.get(index))
+        recommended
+            .and_then(|index| choices.get(index))
+            .map(|choice| (choice, AskUserSource::Default))
     } else if let Ok(index) = answer.parse::<usize>() {
-        index.checked_sub(1).and_then(|index| choices.get(index))
+        index
+            .checked_sub(1)
+            .and_then(|index| choices.get(index))
+            .map(|choice| (choice, AskUserSource::Choice))
     } else {
         choices
             .iter()
             .find(|choice| choice.id == answer || choice.label.eq_ignore_ascii_case(answer))
+            .map(|choice| (choice, AskUserSource::Choice))
     };
 
-    if let Some(choice) = selected {
+    if let Some((choice, source)) = selected {
         Ok(AskUserAnswer {
             answer: choice.label.clone(),
             choice_id: Some(choice.id.clone()),
+            source,
         })
-    } else if allow_free_text {
+    } else if allow_free_text && !answer.is_empty() {
         Ok(AskUserAnswer {
             answer: answer.to_string(),
             choice_id: None,
+            source: AskUserSource::FreeText,
         })
+    } else if answer.is_empty() {
+        // Empty answer with no default available: treat as a cancellation.
+        Err(AskUserError::Cancelled)
     } else {
-        Err("answer did not match an available choice and free text is disabled".to_string())
+        Err(AskUserError::Invalid)
     }
 }
 
@@ -14618,10 +14783,10 @@ mod tests {
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
         status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
-        validate_no_args, write_mcp_server_fixture, AskUserAnswer, AskUserChoice, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
+        validate_no_args, write_mcp_server_fixture, AskUserAnswer, AskUserChoice, AskUserError,
+        AskUserResult, AskUserSource, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
         SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
         LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
@@ -19546,8 +19711,65 @@ UU conflicted.rs",
             AskUserAnswer {
                 answer: "Minimal".to_string(),
                 choice_id: Some("minimal".to_string()),
+                source: AskUserSource::Default,
             }
         );
+    }
+
+    #[test]
+    fn ask_user_answer_resolution_cancels_on_empty_without_default() {
+        // Empty answer + no default (and no free text) is a cancellation, not an error.
+        assert_eq!(
+            resolve_ask_user_answer("", &ask_user_choices(), None, false),
+            Err(AskUserError::Cancelled)
+        );
+        // Even with free text allowed, an empty answer cancels rather than
+        // returning an empty free-text string.
+        assert_eq!(
+            resolve_ask_user_answer("", &ask_user_choices(), None, true),
+            Err(AskUserError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn ask_user_answer_resolution_tags_source() {
+        let choices = ask_user_choices();
+        assert_eq!(
+            resolve_ask_user_answer("2", &choices, Some(0), false)
+                .unwrap()
+                .source,
+            AskUserSource::Choice
+        );
+        assert_eq!(
+            resolve_ask_user_answer("", &choices, Some(0), false)
+                .unwrap()
+                .source,
+            AskUserSource::Default
+        );
+        assert_eq!(
+            resolve_ask_user_answer("custom", &choices, Some(0), true)
+                .unwrap()
+                .source,
+            AskUserSource::FreeText
+        );
+    }
+
+    #[test]
+    fn ask_user_result_serializes_typed_fields() {
+        let result = AskUserResult {
+            question: "Which?".to_string(),
+            answer: None,
+            choice_id: None,
+            source: AskUserSource::NonInteractive,
+            timed_out: false,
+            cancelled: false,
+            interactive_required: true,
+        };
+        let value = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(value["source"], "non_interactive");
+        assert_eq!(value["interactive_required"], true);
+        assert_eq!(value["answer"], serde_json::Value::Null);
+        assert_eq!(value["question"], "Which?");
     }
 
     #[test]
@@ -19580,16 +19802,17 @@ UU conflicted.rs",
             AskUserAnswer {
                 answer: "custom".to_string(),
                 choice_id: None,
+                source: AskUserSource::FreeText,
             }
         );
     }
 
     #[test]
     fn ask_user_answer_resolution_rejects_invalid_choice_without_free_text() {
-        let error = resolve_ask_user_answer("unknown", &ask_user_choices(), Some(0), false)
-            .expect_err("invalid answer should fail");
-
-        assert!(error.contains("free text is disabled"));
+        assert_eq!(
+            resolve_ask_user_answer("unknown", &ask_user_choices(), Some(0), false),
+            Err(AskUserError::Invalid)
+        );
     }
 
     #[test]

@@ -105,5 +105,13 @@
     "parity_refs": [
       "Token counting / cost tracking accuracy"
     ]
+  },
+  {
+    "name": "ask_user_interactive",
+    "category": "interactive",
+    "description": "ask_user returns typed interactive_required metadata when stdin is not a TTY (Slice 4).",
+    "parity_refs": [
+      "Interactive question polish (ask_user)"
+    ]
   }
 ]

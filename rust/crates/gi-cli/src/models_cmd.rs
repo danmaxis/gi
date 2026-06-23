@@ -26,7 +26,7 @@ pub struct ProviderModels {
 
 /// Run an async future to completion on a fresh single-threaded runtime, on a
 /// dedicated thread so it is safe even if called from within another runtime.
-fn run_async<T, F>(future: F) -> T
+pub(crate) fn run_async<T, F>(future: F) -> T
 where
     F: std::future::Future<Output = T> + Send,
     T: Send,

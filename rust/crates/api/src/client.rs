@@ -262,4 +262,28 @@ mod tests {
             other => panic!("Expected ProviderClient::OpenAi for local model, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn ollama_host_routes_any_model_to_authless_openai_client() {
+        // OLLAMA_HOST is the highest-priority router: with it set, even an
+        // anthropic-named model routes through the OpenAI-compatible client
+        // pointed at the Ollama host, with no auth required.
+        let _lock = env_lock();
+        let _ollama = EnvVarGuard::set("OLLAMA_HOST", Some("http://127.0.0.1:11434"));
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+        let _openai_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _anthropic_key = EnvVarGuard::set("ANTHROPIC_API_KEY", Some("test-anthropic-key"));
+        let _anthropic_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+        let client = ProviderClient::from_model("claude-sonnet-4-6")
+            .expect("OLLAMA_HOST should route any model to an authless OpenAI-compatible client");
+        match client {
+            ProviderClient::OpenAi(openai_client) => assert!(
+                openai_client.base_url().contains("127.0.0.1:11434"),
+                "OLLAMA_HOST should set the base URL, got: {}",
+                openai_client.base_url()
+            ),
+            other => panic!("Expected ProviderClient::OpenAi under OLLAMA_HOST, got: {other:?}"),
+        }
+    }
 }

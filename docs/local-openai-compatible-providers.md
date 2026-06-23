@@ -140,6 +140,53 @@ Offline install checklist:
 - After installing, run `/skills list` or `gi skills --output-format json` to confirm the discovered name and source path.
 - If a skill invocation fails with an HTTP/provider error, the skill may have installed correctly but the current model/provider call failed. Run `gi doctor`, verify provider credentials, and try a simple prompt smoke test before reinstalling the skill.
 
+## Provider diagnostics (`gi doctor`)
+
+`gi doctor` includes a **Providers** check that resolves the active model to its
+provider and reports routing, reachability, and capability hints — without making an
+inference/chat call:
+
+```text
+Providers
+  Status           ok
+  Summary          OpenAI-compatible · model mistral-small3.2:latest
+  Details
+    - Model            mistral-small3.2:latest
+    - Provider         OpenAI-compatible
+    - Base URL         http://192.168.50.24:11434/v1/
+    - Auth             OPENAI_API_KEY (unset)
+    - Tool calls       supported
+    - Streaming        supported
+    - Reachability     reachable (8 models)
+```
+
+What it does:
+
+- **Routing** — shows the resolved provider (Anthropic / xAI / OpenAI / OpenAI-compatible /
+  Ollama), the effective base URL, and the auth env var (and whether it's set).
+- **Reachability (safe-only)** — probes the model list of **local endpoints only** — Ollama
+  (`GET $OLLAMA_HOST/api/tags`) or a local/LAN `OPENAI_BASE_URL` (`GET {base}/models`). Remote
+  SaaS endpoints (e.g. `api.openai.com`) are **never** contacted by `doctor`; they show
+  `not probed (remote endpoint)`. "Local" means loopback, a private-LAN IP (10/8, 172.16/12,
+  192.168/16), or a `*.local` host.
+- **Tool-call hints** — surfaces whether the resolved model advertises tool/function calling
+  and streaming. A model without `tool_calls` support gets a `warn` (agent tools may not work).
+
+The same routing is available as structured data in `gi status --output-format json` under a
+`provider` object (`kind`, `base_url`, `auth_env`, `credentialed`, `tool_calls_supported`,
+`openai_compatible`).
+
+**Credential fallback.** Provider selection is env-driven: `OLLAMA_HOST` wins outright (any
+model routes to the local Ollama, no key required); otherwise a model name prefix
+(`claude-*`, `grok-*`, `openai/*`, `qwen-*`, `kimi-*`, `local/*`) or `*_BASE_URL` picks the
+provider; only then does ambient auth (Anthropic → OpenAI → xAI) decide. A persisted choice
+from `gi models` is applied in-process at startup, so plain `gi` honors it.
+
+**OpenRouter-style gateways.** Any OpenAI-compatible gateway works the same way — set
+`OPENAI_BASE_URL` to the gateway's `/v1` URL and `OPENAI_API_KEY` to your gateway token, then
+use the gateway's model IDs. If the gateway host is public, `gi doctor` won't probe it, but
+routing/capability hints still apply.
+
 ## Troubleshooting
 
 | Symptom | Check |

@@ -534,3 +534,25 @@ from the slash-command interactive_only guard, version-header assertion.
 Verification: fmt/build/clippy(CI) clean; cargo test --workspace fails only on the
 known pre-existing/flaky cases (sandbox #831, pwsh stub, repl python, plugin
 discovery - all pass in isolation).
+
+Iteration 2026-06-23 (b) - New 技 karateka splash + Slice 7 Provider Diagnostics
+--------------------------------------------------------------------------------
+Splash: startup_logo() replaced with the karateka 「技」 + GI art. Traditional palette:
+white/ivory gi (density ramp ░▒▓█ → grey→ivory) with a vermilion belt; GI letters in a
+cool indigo→vermilion Japanese degrade; header/tagline restrained sumi/vermilion. Zoned
+colorizer (karateka/GI/tagline), NO_COLOR/non-TTY safe.
+
+Slice 7 (Provider Diagnostics):
+- check_providers_health (gi doctor "Providers"): resolves active model→provider
+  (provider_diagnostics_for_model + provider_capabilities_for_model), probes reachability
+  for LOCAL endpoints only (Ollama /api/tags when OLLAMA_HOST; local/LAN OPENAI_BASE_URL
+  /v1/models via run_async) — never remote SaaS, never an inference call — and shows
+  tool-call/streaming hints. Warn on unreachable-local or no-tool-calls.
+- status_json_value gained a `provider` object {kind, base_url, auth_env, credentialed,
+  tool_calls_supported, openai_compatible}; text status gained a Provider line.
+- api re-exports provider_capabilities_for_model/ProviderCapabilityReport/
+  ProviderFeatureSupport; models_cmd::run_async made pub(crate).
+- Docs: docs/local-openai-compatible-providers.md gained a Provider-diagnostics section
+  (doctor output, safe-probe rules, credential fallback, OpenRouter gateways).
+- Tests: is_local_base_url (loopback/private-LAN/.local vs remote), OLLAMA_HOST routing
+  precedence (client.rs), doctor check list updated to 14 (+providers), check_names preview.

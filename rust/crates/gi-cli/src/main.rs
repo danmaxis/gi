@@ -3143,48 +3143,135 @@ fn config_model_for_current_dir() -> Option<String> {
 /// 技 (gi = "technique/skill"), a neon scanline, and a small-caps `harness`
 /// tagline. With `use_color`, each `GI` row gets an Outrun sunset gradient
 /// (magenta → violet → cyan); without it, plain monospace is returned.
+/// The Gi startup splash: a karateka figure (left, rendered in `░▒▓█`) beside
+/// block `GI` letters, headed by `「 技 」`. Returns plain text when `use_color`
+/// is false (NO_COLOR / non-TTY); the colored form paints the karateka as a
+/// shaded white gi, the `GI` letters with a cool indigo→vermilion gradient, and
+/// restrained sumi/vermilion accents on the header and tagline.
 fn startup_logo(use_color: bool) -> String {
-    const GI: [&str; 6] = [
-        " ██████╗ ██╗",
-        "██╔════╝ ██║",
-        "██║  ███╗██║",
-        "██║   ██║██║",
-        "╚██████╔╝██║",
-        " ╚═════╝ ╚═╝",
+    const HEADER: &str = "「 技 」";
+    const ART: [&str; 14] = [
+        "    ░░▒░░░░▓██▓▒",
+        "    ░░░░░░░▒▓▒▒░",
+        "    ░░░░░░░▒▒▒▒░",
+        "      ░░░░░░░░░                    ░░░░░   ░░░░░",
+        "       ░░░▒  ░  ░░░               ░░        ░░░",
+        "        ░░░░░   ░░░░░             ▒▒        ▒▒▒   ·  the",
+        "         ░░░░      ░░░░           ▒▒  ▒▒▒   ▒▒▒      coding",
+        "        ░░▓░░░░▓▓    ░░░▒░░       ▓▓   ▓▓   ▓▓▓      harness  ·",
+        "        ░░█████▓░░░     ▒▒░       ██   ██   ███",
+        " ░░░░░░▒░░█▓▓█░░ ░░░░              █████   █████",
+        " ░░░░░▒░  ▓█▓█░░░░░░░░░",
+        " ░░░▒▓▒    █░▒   ░░░░░░░░  ▒░",
+        "    ░▒▒▒   ▒        ░░░░░░░▒▒▒░",
+        "   ░▒▒▒▒░              ░░    ░▒░",
     ];
-    // Per-row Outrun gradient for the GI glyphs.
-    const GRADIENT: [(u8, u8, u8); 6] = [
-        (255, 78, 168),
-        (228, 84, 206),
-        (188, 96, 238),
-        (132, 118, 250),
-        (74, 178, 250),
-        (40, 216, 255),
-    ];
-    // Right-column accents, aligned row-for-row with the GI block.
-    const ACCENT: [&str; 6] = [
-        " 技",
-        "",
-        " the coding",
-        "      ʜᴀʀɴᴇss",
-        "",
-        "▂▂▂▂▂▂▂▂▂▂▂▂",
-    ];
+
     let mut out = String::new();
-    for row in 0..GI.len() {
+    if use_color {
+        out.push_str(&colorize_splash_header(HEADER));
+    } else {
+        out.push_str(HEADER);
+    }
+    out.push_str("\n\n");
+    for (row, line) in ART.iter().enumerate() {
         if use_color {
-            let (r, g, b) = GRADIENT[row];
-            let accent = match row {
-                0 => format!("\x1b[38;2;255;82;66m{}\x1b[0m", ACCENT[row]), // 技 vermilion
-                5 => format!("\x1b[38;2;96;104;124m{}\x1b[0m", ACCENT[row]), // scanline dim
-                _ => format!("\x1b[2m{}\x1b[0m", ACCENT[row]),
-            };
-            out.push_str(&format!(
-                "\x1b[38;2;{r};{g};{b}m{}\x1b[0m   \x1b[38;2;96;104;124m▏\x1b[0m{accent}\n",
-                GI[row]
-            ));
+            out.push_str(&colorize_splash_line(line, row));
         } else {
-            out.push_str(&format!("{}   ▏{}\n", GI[row], ACCENT[row]));
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Which palette a splash glyph uses, decided by row + column. The `GI` block
+/// and tagline only occupy the upper rows, so lower rows are all karateka.
+enum SplashZone {
+    Karateka,
+    Gi,
+    Tagline,
+}
+
+fn splash_zone(row: usize, col: usize) -> SplashZone {
+    if (3..=9).contains(&row) {
+        if col >= 48 {
+            SplashZone::Tagline
+        } else if col >= 30 {
+            SplashZone::Gi
+        } else {
+            SplashZone::Karateka
+        }
+    } else {
+        SplashZone::Karateka
+    }
+}
+
+/// Cool Japanese degrade for the `GI` letters: indigo at the top fading to
+/// vermilion at the bottom (rising-sun feel).
+fn gi_gradient(row: usize) -> (u8, u8, u8) {
+    const RAMP: [(u8, u8, u8); 7] = [
+        (64, 86, 196),
+        (96, 84, 190),
+        (140, 80, 170),
+        (180, 76, 140),
+        (210, 72, 104),
+        (228, 72, 72),
+        (236, 96, 60),
+    ];
+    RAMP[row.saturating_sub(3).min(RAMP.len() - 1)]
+}
+
+/// Shade a karateka glyph as white-gi fabric (density ramp), with a vermilion
+/// belt/sash across the torso row.
+fn karateka_color(ch: char, row: usize) -> (u8, u8, u8) {
+    if row == 8 && (ch == '█' || ch == '▓') {
+        return (202, 64, 50); // belt
+    }
+    match ch {
+        '█' => (242, 242, 236),
+        '▓' => (200, 200, 196),
+        '▒' => (150, 150, 156),
+        '░' => (88, 90, 98),
+        _ => (180, 180, 184),
+    }
+}
+
+fn colorize_splash_header(header: &str) -> String {
+    let mut out = String::new();
+    for ch in header.chars() {
+        match ch {
+            '技' => out.push_str(&format!("\x1b[1;38;2;214;82;64m{ch}\x1b[0m")),
+            '「' | '」' => out.push_str(&format!("\x1b[38;2;120;120;128m{ch}\x1b[0m")),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn colorize_splash_line(line: &str, row: usize) -> String {
+    let mut out = String::new();
+    for (col, ch) in line.chars().enumerate() {
+        if ch == ' ' {
+            out.push(' ');
+            continue;
+        }
+        match splash_zone(row, col) {
+            SplashZone::Gi => {
+                let (r, g, b) = gi_gradient(row);
+                out.push_str(&format!("\x1b[1;38;2;{r};{g};{b}m{ch}\x1b[0m"));
+            }
+            SplashZone::Tagline => {
+                if ch == '·' {
+                    out.push_str(&format!("\x1b[38;2;210;90;70m{ch}\x1b[0m"));
+                } else {
+                    out.push_str(&format!("\x1b[2m{ch}\x1b[0m"));
+                }
+            }
+            SplashZone::Karateka => {
+                let (r, g, b) = karateka_color(ch, row);
+                out.push_str(&format!("\x1b[38;2;{r};{g};{b}m{ch}\x1b[0m"));
+            }
         }
     }
     out
@@ -3903,6 +3990,181 @@ fn check_theme_health(config: Option<&runtime::RuntimeConfig>) -> DiagnosticChec
     ]))
 }
 
+/// Human label for the active model's provider.
+fn provider_kind_label(kind: api::ProviderKind, openai_compatible: bool) -> String {
+    match kind {
+        api::ProviderKind::Anthropic => "Anthropic".to_string(),
+        api::ProviderKind::Xai => "xAI".to_string(),
+        api::ProviderKind::OpenAi => {
+            if env::var_os("OLLAMA_HOST").is_some() {
+                "Ollama (local)".to_string()
+            } else if openai_compatible {
+                "OpenAI-compatible".to_string()
+            } else {
+                "OpenAI".to_string()
+            }
+        }
+    }
+}
+
+fn feature_support_label(support: api::ProviderFeatureSupport) -> &'static str {
+    match support {
+        api::ProviderFeatureSupport::Supported => "supported",
+        api::ProviderFeatureSupport::Unsupported => "unsupported",
+        api::ProviderFeatureSupport::PassthroughAsTool => "passthrough as tool",
+    }
+}
+
+/// True when a base URL points at a loopback / private-LAN / `.local` host, so
+/// it is safe to probe its model list without a remote round-trip.
+fn is_local_base_url(url: &str) -> bool {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0" | "::1") || host.ends_with(".local") {
+        return true;
+    }
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_private() || ip.is_loopback())
+}
+
+fn provider_has_credentials(diag: &api::ProviderDiagnostics) -> bool {
+    let has = |key: &str| env::var(key).is_ok_and(|value| !value.is_empty());
+    if has(diag.auth_env) {
+        return true;
+    }
+    matches!(diag.provider, api::ProviderKind::Anthropic) && has("ANTHROPIC_AUTH_TOKEN")
+}
+
+/// Diagnostics for the active model's provider: routing, a safe reachability
+/// probe for local endpoints, and tool-call/streaming capability hints.
+fn check_providers_health() -> DiagnosticCheck {
+    let model = ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL).map_or_else(
+        |_| DEFAULT_MODEL.to_string(),
+        |provenance| provenance.resolved,
+    );
+    let diag = api::provider_diagnostics_for_model(&model);
+    let caps = api::provider_capabilities_for_model(&model);
+    let provider_label = provider_kind_label(diag.provider, diag.openai_compatible);
+
+    let ollama_host = env::var("OLLAMA_HOST")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let base_url = ollama_host
+        .clone()
+        .or_else(|| {
+            env::var(diag.base_url_env)
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| diag.default_base_url.to_string());
+    let credentialed = ollama_host.is_some() || provider_has_credentials(&diag);
+
+    // Reachability — local endpoints only, metadata GET only (never a chat/
+    // inference call, never a remote SaaS round-trip).
+    let (reach_label, reachable, probe_target): (String, Option<bool>, Option<String>) =
+        if let Some(host) = &ollama_host {
+            match models_cmd::run_async(api::fetch_ollama_models(host)) {
+                Ok(models) => (
+                    format!("reachable ({} models)", models.len()),
+                    Some(true),
+                    Some(host.clone()),
+                ),
+                Err(error) => (
+                    format!("unreachable: {error}"),
+                    Some(false),
+                    Some(host.clone()),
+                ),
+            }
+        } else if is_local_base_url(&base_url) {
+            let key = env::var(diag.auth_env)
+                .ok()
+                .filter(|value| !value.is_empty());
+            match models_cmd::run_async(api::fetch_openai_compat_models(&base_url, key.as_deref()))
+            {
+                Ok(models) => (
+                    format!("reachable ({} models)", models.len()),
+                    Some(true),
+                    Some(base_url.clone()),
+                ),
+                Err(error) => (
+                    format!("unreachable: {error}"),
+                    Some(false),
+                    Some(base_url.clone()),
+                ),
+            }
+        } else {
+            ("not probed (remote endpoint)".to_string(), None, None)
+        };
+
+    let tool_calls_supported = matches!(caps.tool_calls, api::ProviderFeatureSupport::Supported);
+    let level = if reachable == Some(false) || !tool_calls_supported {
+        DiagnosticLevel::Warn
+    } else {
+        DiagnosticLevel::Ok
+    };
+
+    let details = vec![
+        format!("Model            {model}"),
+        format!("Provider         {provider_label}"),
+        format!("Base URL         {base_url}"),
+        format!(
+            "Auth             {} ({})",
+            diag.auth_env,
+            if credentialed { "set" } else { "unset" }
+        ),
+        format!(
+            "Tool calls       {}",
+            feature_support_label(caps.tool_calls)
+        ),
+        format!("Streaming        {}", feature_support_label(caps.streaming)),
+        format!("Reachability     {reach_label}"),
+    ];
+
+    let mut check = DiagnosticCheck::new(
+        "Providers",
+        level,
+        format!("{provider_label} · model {model}"),
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([
+        ("model".to_string(), json!(model)),
+        ("provider".to_string(), json!(provider_label)),
+        (
+            "openai_compatible".to_string(),
+            json!(diag.openai_compatible),
+        ),
+        ("base_url".to_string(), json!(base_url)),
+        ("auth_env".to_string(), json!(diag.auth_env)),
+        ("credentialed".to_string(), json!(credentialed)),
+        (
+            "tool_calls".to_string(),
+            json!(feature_support_label(caps.tool_calls)),
+        ),
+        (
+            "streaming".to_string(),
+            json!(feature_support_label(caps.streaming)),
+        ),
+        ("reachable".to_string(), json!(reachable)),
+        ("probe_target".to_string(), json!(probe_target)),
+    ]));
+    if reachable == Some(false) {
+        check = check.with_hint(format!(
+            "{provider_label} endpoint {base_url} is unreachable — is the server running? Try `gi models`."
+        ));
+    } else if !tool_calls_supported {
+        check = check.with_hint(format!(
+            "model `{model}` does not advertise tool/function calling; agent tools may not work"
+        ));
+    }
+    check
+}
+
 fn render_doctor_report(
     config_warning_mode: ConfigWarningMode,
     permission_mode: PermissionModeProvenance,
@@ -3978,6 +4240,7 @@ fn render_doctor_report(
         checks: vec![
             check_auth_health(),
             check_base_url_health(),
+            check_providers_health(),
             check_config_health(&config_loader, config.as_ref()),
             check_mcp_validation_health(&mcp_validation),
             check_hook_validation_health(&hook_validation),
@@ -10047,6 +10310,31 @@ fn status_json_value(
     let model_raw = provenance.and_then(|p| p.raw.clone());
     let model_alias_resolved_to = provenance.and_then(|p| p.alias_resolved_to.clone());
     let model_env_var = provenance.and_then(|p| p.env_var.clone());
+    // Provider routing + tool-call capability for the resolved model (no network).
+    let provider_block = model.map(|model| {
+        let diag = api::provider_diagnostics_for_model(model);
+        let caps = api::provider_capabilities_for_model(model);
+        let base_url = env::var("OLLAMA_HOST")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                env::var(diag.base_url_env)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| diag.default_base_url.to_string());
+        let credentialed = env::var("OLLAMA_HOST").is_ok_and(|value| !value.is_empty())
+            || provider_has_credentials(&diag);
+        json!({
+            "kind": provider_kind_label(diag.provider, diag.openai_compatible),
+            "openai_compatible": diag.openai_compatible,
+            "base_url": base_url,
+            "auth_env": diag.auth_env,
+            "credentialed": credentialed,
+            "tool_calls_supported":
+                matches!(caps.tool_calls, api::ProviderFeatureSupport::Supported),
+        })
+    });
     let permission_mode_source = permission_provenance.map(|p| p.source.as_str());
     let permission_mode_env_var = permission_provenance.and_then(|p| p.env_var);
     let (theme_name, theme_source) = render::effective_theme();
@@ -10074,6 +10362,7 @@ fn status_json_value(
         "model_raw": model_raw,
         "model_alias_resolved_to": model_alias_resolved_to,
         "model_env_var": model_env_var,
+        "provider": provider_block,
         "permission_mode": permission_mode,
         "permission_mode_source": permission_mode_source,
         "permission_mode_env_var": permission_mode_env_var,
@@ -10339,10 +10628,19 @@ fn format_status_report(
         .unwrap_or_default();
     let (theme_name, theme_source) = render::effective_theme();
     let theme_source = theme_source.as_str();
+    let provider_line = {
+        let diag = api::provider_diagnostics_for_model(model);
+        let caps = api::provider_capabilities_for_model(model);
+        format!(
+            "\n  Provider         {} (tool calls: {})",
+            provider_kind_label(diag.provider, diag.openai_compatible),
+            feature_support_label(caps.tool_calls)
+        )
+    };
     blocks.extend([
         format!(
             "{status_line}
-  Model            {model}{model_source_line}
+  Model            {model}{model_source_line}{provider_line}
   Permission mode  {permission_mode}{permission_source_line}
   Theme            {theme_name} ({theme_source})
   Messages         {}
@@ -10834,7 +11132,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "theme", "system"],
+        "check_names": ["auth", "providers", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "theme", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -19576,6 +19874,23 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn is_local_base_url_detects_loopback_and_private_lan() {
+        // Local / LAN endpoints are safe to probe in the doctor Providers check.
+        assert!(super::is_local_base_url("http://127.0.0.1:11434/v1"));
+        assert!(super::is_local_base_url("http://localhost:8080/v1"));
+        assert!(super::is_local_base_url("http://192.168.50.24:11434/v1/"));
+        assert!(super::is_local_base_url("http://10.0.0.5:1234"));
+        assert!(super::is_local_base_url("http://172.16.4.4:11434"));
+        assert!(super::is_local_base_url("http://zordon.local/v1"));
+        // Remote SaaS endpoints must NOT be probed.
+        assert!(!super::is_local_base_url("https://api.openai.com/v1"));
+        assert!(!super::is_local_base_url("https://api.moonshot.ai/v1"));
+        assert!(!super::is_local_base_url(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ));
+    }
+
+    #[test]
     fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
         let snapshot = InternalPromptProgressState {
             command_label: "Ultraplan",
@@ -19841,10 +20156,13 @@ UU conflicted.rs",
     #[test]
     fn startup_logo_shows_gi_brand_not_claw() {
         let plain = super::startup_logo(false);
-        assert!(plain.contains("██"), "logo should render block GI: {plain}");
-        assert!(plain.contains('技'), "logo should include the kanji accent");
         assert!(
-            plain.contains("ʜᴀʀɴᴇss"),
+            plain.contains("██"),
+            "logo should render block art: {plain}"
+        );
+        assert!(plain.contains('技'), "logo should include the 技 header");
+        assert!(
+            plain.contains("harness"),
             "logo should include the harness tagline"
         );
         assert!(!plain.contains("CLAW") && !plain.contains('🦞'));

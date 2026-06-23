@@ -233,11 +233,16 @@ Implementation notes:
 
 ### Slice 7: Provider Diagnostics
 
-- [ ] Add an Ollama health probe using `OLLAMA_HOST`.
-- [ ] Add OpenAI-compatible `/v1/models` or chat smoke diagnostics where safe.
-- [ ] Report tool-call compatibility hints.
-- [ ] Improve local model docs for Ollama, llama.cpp, vLLM, and OpenRouter-style gateways.
-- [ ] Add tests for local base URL routing and credential fallback.
+- [x] Add an Ollama health probe using `OLLAMA_HOST` (doctor "Providers" check; `/api/tags`).
+- [x] Add OpenAI-compatible `/v1/models` smoke diagnostics where safe (local/LAN base URLs only).
+- [x] Report tool-call compatibility hints (from `provider_capabilities_for_model`).
+- [x] Improve local model docs for Ollama, llama.cpp, vLLM, and OpenRouter-style gateways.
+- [x] Add tests for local base URL routing and credential fallback.
+
+Done 2026-06-23: `check_providers_health` in `gi doctor` resolves the active model's
+provider, probes reachability for local endpoints only (never remote SaaS, never an
+inference call), and surfaces tool-call/streaming hints; `gi status --output-format json`
+gained a `provider` object. Shipped with the new karateka `「技」` splash.
 
 ### Slice 8: Opencode Compatibility
 

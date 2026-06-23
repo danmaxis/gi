@@ -37,7 +37,7 @@ use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
-pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+pub const GI_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,7 +171,7 @@ pub enum RulesImportConfig {
     /// Import from all supported frameworks when files are detected.
     #[default]
     Auto,
-    /// Do not import external framework rules; keep Claw instruction files only.
+    /// Do not import external framework rules; keep Gi instruction files only.
     None,
     /// Import only the named frameworks.
     List(Vec<String>),
@@ -192,7 +192,7 @@ impl RulesImportConfig {
 
 /// Stored provider configuration from the setup wizard.
 ///
-/// Represents the `provider` section in `~/.claw/settings.json`, used as a
+/// Represents the `provider` section in `~/.gi/settings.json`, used as a
 /// fallback when environment variables are absent (3-tier resolution:
 /// env var > .env file > stored config).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -366,7 +366,7 @@ pub struct McpOAuthConfig {
     pub xaa: Option<bool>,
 }
 
-/// OAuth client configuration used by the main Claw runtime.
+/// OAuth client configuration used by the main Gi runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OAuthConfig {
     pub client_id: String,
@@ -435,8 +435,8 @@ impl ConfigLoader {
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
         let user_legacy_path = self.config_home.parent().map_or_else(
-            || PathBuf::from(".claw.json"),
-            |parent| parent.join(".claw.json"),
+            || PathBuf::from(".gi.json"),
+            |parent| parent.join(".gi.json"),
         );
         vec![
             ConfigEntry {
@@ -449,15 +449,15 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw.json"),
+                path: self.cwd.join(".gi.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".claw").join("settings.json"),
+                path: self.cwd.join(".gi").join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
-                path: self.cwd.join(".claw").join("settings.local.json"),
+                path: self.cwd.join(".gi").join("settings.local.json"),
             },
         ]
     }
@@ -882,7 +882,7 @@ impl RuntimeConfig {
 
     /// The persisted terminal theme name, if any (top-level `"theme"` key).
     ///
-    /// This is the configured default; the `SAKANA_GI_THEME` environment
+    /// This is the configured default; the `GI_THEME` environment
     /// variable still overrides it at render time.
     #[must_use]
     pub fn theme(&self) -> Option<&str> {
@@ -1111,13 +1111,13 @@ impl RuntimePluginConfig {
 #[must_use]
 /// Returns the default per-user config directory used by the runtime.
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("CLAW_CONFIG_HOME")
+    std::env::var_os("GI_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
-        .unwrap_or_else(|| PathBuf::from(".claw"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".gi")))
+        .unwrap_or_else(|| PathBuf::from(".gi"))
 }
 
-/// Save provider settings to the user-level `~/.claw/settings.json`.
+/// Save provider settings to the user-level `~/.gi/settings.json`.
 /// Creates the file and directory if they don't exist. Sets file permissions
 /// to `0o600` (owner read/write only) to protect stored API keys.
 pub fn save_user_provider_settings(
@@ -1172,7 +1172,7 @@ pub fn save_user_provider_settings(
 }
 
 /// Persist the selected terminal theme to the user-level
-/// `~/.claw/settings.json` under the top-level `"theme"` key, preserving other
+/// `~/.gi/settings.json` under the top-level `"theme"` key, preserving other
 /// settings. Unlike provider settings this holds no secret, so the default file
 /// mode is left untouched.
 pub fn save_user_theme(theme: &str) -> Result<(), ConfigError> {
@@ -1188,7 +1188,7 @@ pub fn save_user_theme(theme: &str) -> Result<(), ConfigError> {
     write_settings_root(&settings_path, &root)
 }
 
-/// Remove the `provider` section from the user-level `~/.claw/settings.json`.
+/// Remove the `provider` section from the user-level `~/.gi/settings.json`.
 pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     let config_home = default_config_home();
     let settings_path = config_home.join("settings.json");
@@ -1537,7 +1537,7 @@ enum OptionalConfigFile {
 }
 
 fn read_optional_json_object(path: &Path) -> Result<OptionalConfigFile, ConfigError> {
-    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claw.json");
+    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".gi.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2612,7 +2612,7 @@ mod tests {
     use super::{
         deep_merge_objects, parse_permission_mode_label, ConfigFileStatus, ConfigLoader,
         ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode, RuntimeFeatureConfig,
-        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, CLAW_SETTINGS_SCHEMA_NAME,
+        RuntimeHookCommand, RuntimeHookConfig, RuntimePluginConfig, GI_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -2641,7 +2641,7 @@ mod tests {
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "[]").expect("write bad settings");
@@ -2662,19 +2662,19 @@ mod tests {
     fn surfaces_persisted_theme_without_unknown_key_warning() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","theme":"sakana-light"}"#,
+            r#"{"model":"sonnet","theme":"gi-light"}"#,
         )
         .expect("write settings");
 
         let (loaded, warnings) = ConfigLoader::new(&cwd, &home)
             .load_collecting_warnings()
             .expect("config should load");
-        assert_eq!(loaded.theme(), Some("sakana-light"));
+        assert_eq!(loaded.theme(), Some("gi-light"));
         assert_eq!(loaded.model(), Some("sonnet"));
         assert!(
             !warnings.iter().any(|w| w.contains("theme")),
@@ -2689,19 +2689,19 @@ mod tests {
     #[test]
     fn save_user_theme_persists_and_preserves_other_keys() {
         let root = temp_dir();
-        let config_home = root.join(".claw");
+        let config_home = root.join(".gi");
         fs::create_dir_all(&config_home).expect("config home");
         fs::write(config_home.join("settings.json"), r#"{"model":"opus"}"#).expect("seed settings");
 
-        // `save_user_theme` resolves the config home via CLAW_CONFIG_HOME; this is
+        // `save_user_theme` resolves the config home via GI_CONFIG_HOME; this is
         // the only test that touches that variable, so there is no cross-test race.
-        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
-        super::save_user_theme("sakana-dark").expect("persist theme");
-        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_var("GI_CONFIG_HOME", &config_home);
+        super::save_user_theme("gi-dark").expect("persist theme");
+        std::env::remove_var("GI_CONFIG_HOME");
 
         let written = fs::read_to_string(config_home.join("settings.json")).expect("read back");
         let value: serde_json::Value = serde_json::from_str(&written).expect("valid json");
-        assert_eq!(value["theme"], "sakana-dark");
+        assert_eq!(value["theme"], "gi-dark");
         assert_eq!(value["model"], "opus", "existing keys must be preserved");
 
         if root.exists() {
@@ -2713,12 +2713,12 @@ mod tests {
     fn loads_and_merges_claude_code_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            home.parent().expect("home parent").join(".claw.json"),
+            home.parent().expect("home parent").join(".gi.json"),
             r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
         )
         .expect("write user compat config");
@@ -2728,17 +2728,17 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw.json"),
+            cwd.join(".gi.json"),
             r#"{"model":"project-compat","env":{"B":"2"}}"#,
         )
         .expect("write project compat config");
         fs::write(
-            cwd.join(".claw").join("settings.json"),
+            cwd.join(".gi").join("settings.json"),
             r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"],"PostToolUseFailure":["project-failure"]},"permissions":{"ask":["Edit"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".gi").join("settings.local.json"),
             r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
         )
         .expect("write local settings");
@@ -2747,7 +2747,7 @@ mod tests {
             .load()
             .expect("config should load");
 
-        assert_eq!(CLAW_SETTINGS_SCHEMA_NAME, "SettingsSchema");
+        assert_eq!(GI_SETTINGS_SCHEMA_NAME, "SettingsSchema");
         assert_eq!(loaded.loaded_entries().len(), 5);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
         assert_eq!(
@@ -2799,7 +2799,7 @@ mod tests {
     fn parses_object_style_hook_entries_with_matchers() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -2835,7 +2835,7 @@ mod tests {
     fn records_object_style_hook_entries_without_command_441() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -2866,15 +2866,12 @@ mod tests {
     fn inspect_classifies_missing_loaded_and_legacy_skipped_files() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
-        fs::write(cwd.join(".claw.json"), "{not json").expect("write legacy config");
-        fs::write(
-            cwd.join(".claw").join("settings.json"),
-            r#"{"model":"opus"}"#,
-        )
-        .expect("write project settings");
+        fs::write(cwd.join(".gi.json"), "{not json").expect("write legacy config");
+        fs::write(cwd.join(".gi").join("settings.json"), r#"{"model":"opus"}"#)
+            .expect("write project settings");
 
         let inspection = ConfigLoader::new(&cwd, &home).inspect_collecting_warnings();
 
@@ -2912,12 +2909,12 @@ mod tests {
     fn inspect_reports_parse_errors_but_keeps_valid_merged_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
         fs::write(home.join("settings.json"), r#"{"model":"sonnet"}"#)
             .expect("write user settings");
-        fs::write(cwd.join(".claw").join("settings.json"), "{not json")
+        fs::write(cwd.join(".gi").join("settings.json"), "{not json")
             .expect("write invalid project settings");
 
         let inspection = ConfigLoader::new(&cwd, &home).inspect_collecting_warnings();
@@ -2946,12 +2943,12 @@ mod tests {
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".gi").join("settings.local.json"),
             r#"{
               "sandbox": {
                 "enabled": true,
@@ -2985,8 +2982,8 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
         fs::write(
             home.join("settings.json"),
@@ -3021,7 +3018,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "{}").expect("write empty settings");
@@ -3044,7 +3041,7 @@ mod tests {
     fn parses_rules_import_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3068,7 +3065,7 @@ mod tests {
     fn rules_import_none_disables_external_frameworks() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), r#"{"rulesImport": "none"}"#)
@@ -3088,7 +3085,7 @@ mod tests {
     fn rejects_rules_import_array_with_non_string_entries() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3111,7 +3108,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3137,7 +3134,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3182,7 +3179,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "{}").expect("write empty settings");
@@ -3202,8 +3199,8 @@ mod tests {
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -3241,7 +3238,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".gi").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote-server": {
@@ -3296,7 +3293,7 @@ mod tests {
     fn infers_http_mcp_servers_from_url_only_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3334,8 +3331,8 @@ mod tests {
     fn parses_plugin_config_from_enabled_plugins() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -3372,8 +3369,8 @@ mod tests {
     fn parses_plugin_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -3425,7 +3422,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3457,7 +3454,7 @@ mod tests {
     fn loads_valid_mcp_servers_and_collects_all_invalid_siblings_440() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3506,8 +3503,8 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -3516,7 +3513,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".claw").join("settings.local.json"),
+            cwd.join(".gi").join("settings.local.json"),
             r#"{"aliases":{"smart":"claude-sonnet-4-6","cheap":"grok-3-mini"}}"#,
         )
         .expect("write local settings");
@@ -3549,7 +3546,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "").expect("write empty settings");
@@ -3604,9 +3601,9 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
-        let project_settings = cwd.join(".claw").join("settings.json");
-        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        let home = root.join("home").join(".gi");
+        let project_settings = cwd.join(".gi").join("settings.json");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -3710,7 +3707,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         let user_settings = home.join("settings.json");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
@@ -3748,7 +3745,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         let user_settings = home.join("settings.json");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
@@ -3786,7 +3783,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         let user_settings = home.join("settings.json");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
@@ -3822,7 +3819,7 @@ mod tests {
         // same config are collected.
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3866,7 +3863,7 @@ mod tests {
         // should not reject entire hooks config; they are recorded as invalid.
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3915,7 +3912,7 @@ mod tests {
         // must load without config_load_error.
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -3944,7 +3941,7 @@ mod tests {
         // given
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claw");
+        let home = root.join("home").join(".gi");
         let user_settings = home.join("settings.json");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");

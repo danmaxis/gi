@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the canonical Claw Code 2.0 execution board from frozen roadmap evidence."""
+"""Generate the canonical Gi Code 2.0 execution board from frozen roadmap evidence."""
 from __future__ import annotations
 
 import argparse
@@ -32,14 +32,14 @@ STATUSES = {
     "stale_done",
     "superseded",
     "deferred_with_rationale",
-    "rejected_not_claw",
+    "rejected_not_gi",
 }
 RELEASE_BUCKETS = {
     "alpha_blocker",
     "beta_adoption",
     "ga_ecosystem",
     "post_2_0_research",
-    "rejected_not_claw",
+    "rejected_not_gi",
     "context",
     "2.x_intake",
 }
@@ -69,7 +69,7 @@ CATEGORY_KEYWORDS = [
     ("event_report", ["event", "report", "schema", "projection", "redaction", "clawhip", "lane"]),
     ("branch_recovery", ["branch", "stale", "recovery", "green", "flake"]),
     ("boot", ["boot", "worker", "startup", "ready", "prompt"]),
-    ("task_policy", ["task", "policy", "claw-native", "dashboard", "lane board"]),
+    ("task_policy", ["task", "policy", "gi-native", "dashboard", "lane board"]),
     ("ux_tui", ["tui", "statusline", "keymap", "clickable", "copy", "paste"]),
     ("anti_slop", ["spam", "slop", "issue hygiene", "bot"]),
 ]
@@ -174,8 +174,8 @@ def release_bucket_for(record: RoadmapRecord, status: str) -> str:
     category = category_for(combined)
     if status == "context":
         return "context"
-    if status == "rejected_not_claw":
-        return "rejected_not_claw"
+    if status == "rejected_not_gi":
+        return "rejected_not_gi"
     if any(k in combined for k in ["phase 1", "phase 2", "phase 3", "phase 4", "p0", "p1", "security", "sandbox", "trust", "worker", "event", "branch freshness"]):
         return "alpha_blocker"
     if category in {"windows_install", "provider", "sessions", "docs_license", "anti_slop"}:
@@ -198,8 +198,8 @@ def status_for(record: RoadmapRecord) -> str:
             return "active"
         if "pinpoint" not in title.lower() and not any(word in combined for word in ["gap", "routing"]):
             return "context"
-    if any(word in combined for word in ["rejected_not_claw", "not claw", "outside claw"]):
-        return "rejected_not_claw"
+    if any(word in combined for word in ["rejected_not_gi", "not gi", "outside gi"]):
+        return "rejected_not_gi"
     if "superseded" in combined:
         return "superseded"
     if "deferred" in combined or "post-2.0" in combined or "post_2_0" in combined:
@@ -216,8 +216,8 @@ def status_for(record: RoadmapRecord) -> str:
 def deferral_for(record: RoadmapRecord, status: str) -> str:
     if status == "deferred_with_rationale":
         return "Deferred by roadmap/approved plan until prerequisite contracts or post-2.0 research admission gates are satisfied."
-    if status == "rejected_not_claw":
-        return "Rejected because the source describes clone-only breadth or behavior outside Claw's machine-truth/clawable-harness identity."
+    if status == "rejected_not_gi":
+        return "Rejected because the source describes clone-only breadth or behavior outside Gi's machine-truth/clawable-harness identity."
     if status == "superseded":
         return "Superseded by a newer roadmap entry or canonical Rust/control-plane contract; keep only for audit traceability."
     if status == "stale_done":
@@ -356,7 +356,7 @@ def summarize_counts(items: list[dict[str, Any]], key: str) -> dict[str, int]:
 
 def render_markdown(board: dict[str, Any]) -> str:
     lines = [
-        "# Claw Code 2.0 Canonical Board",
+        "# Gi Code 2.0 Canonical Board",
         "",
         f"Generated: `{board['generated_at']}`",
         f"Roadmap SHA-256 prefix: `{board['sources']['roadmap']['sha256_prefix']}`",
@@ -428,14 +428,14 @@ def build_board(repo_root: Path) -> dict[str, Any]:
     items = [roadmap_item(record, i) for i, record in enumerate(headings, 1)]
     items.extend(roadmap_item(record, i) for i, record in enumerate(actions, 1))
 
-    latest_issues = load_json(research / "claw-open-latest.json")
-    all_issues = load_json(research / "claw-issues.json")
-    items.extend(issue_item(issue, "claw-open-latest", "latest_open_issue", "2.x_intake") for issue in latest_issues)
+    latest_issues = load_json(research / "gi-open-latest.json")
+    all_issues = load_json(research / "gi-issues.json")
+    items.extend(issue_item(issue, "gi-open-latest", "latest_open_issue", "2.x_intake") for issue in latest_issues)
     # Include a small real-issue sample from the full freeze to keep the board tied to the larger issue manifest without exploding scope.
     for issue in all_issues[:50]:
         title_body = f"{issue.get('title','')} {issue.get('body','')}".lower()
         if any(k in title_body for k in ["security", "windows", "install", "provider", "model", "session", "license", "zed", "spam", "plugin"]):
-            items.append(issue_item(issue, "claw-issues", "issue_theme", "beta_adoption"))
+            items.append(issue_item(issue, "gi-issues", "issue_theme", "beta_adoption"))
     for source_name in ["opencode", "codex"]:
         repo_meta = load_json(research / f"{source_name}-repo.json")
         items.append(repo_context_item(repo_meta, source_name))
@@ -467,8 +467,8 @@ def build_board(repo_root: Path) -> dict[str, Any]:
             },
             "research": {
                 "root": str(source_omx / "research"),
-                "claw_open_latest_count": len(latest_issues),
-                "claw_issues_count": len(all_issues),
+                "gi_open_latest_count": len(latest_issues),
+                "gi_issues_count": len(all_issues),
                 "opencode_repo": ".omx/research/opencode-repo.json",
                 "codex_repo": ".omx/research/codex-repo.json",
             },

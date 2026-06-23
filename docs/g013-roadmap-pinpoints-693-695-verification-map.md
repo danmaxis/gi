@@ -2,11 +2,11 @@
 
 This map records the current-head follow-up that was discovered after resetting
 `main` to `origin/main`: ROADMAP.md contained three new Pinpoint headings not
-covered by the Claw Code 2.0 board.
+covered by the Gi Code 2.0 board.
 
 ## Pinpoint #693 — typed phase error instead of silent `unknown`
 
-- Code: `rust/crates/claw-analog/src/lib.rs`
+- Code: `rust/crates/gi-analog/src/lib.rs`
 - Behavior: `format_rag_query_json_for_model` now rejects missing, empty, or
   literal `"unknown"` phase values with a structured error envelope containing
   `kind:"unknown_bootstrap_phase"`, `field:"phase"`, and `received_value`.
@@ -18,7 +18,7 @@ covered by the Claw Code 2.0 board.
 - Hook: `.github/hooks/pre-push`
 - Install command: `git config core.hooksPath .github/hooks`
 - Gate: `cargo build --manifest-path rust/Cargo.toml --workspace --locked`
-- Escape hatch: `SKIP_CLAW_PRE_PUSH_BUILD=1` prints an explicit skip message.
+- Escape hatch: `SKIP_GI_PRE_PUSH_BUILD=1` prints an explicit skip message.
 - Regression test: `tests/test_pre_push_hook_contract.py` locks the skip
   hatch and `--locked` build command contract.
 - Purpose: mirror the CI build job locally so stale field/variant references are
@@ -45,7 +45,7 @@ python3 .omx/cc2/validate_issue_parity_intake.py .omx/cc2/issue-parity-intake.js
 bash -n .github/hooks/pre-push
 python3 tests/test_pre_push_hook_contract.py -v
 cargo fmt --manifest-path rust/Cargo.toml --all -- --check
-cargo test --manifest-path rust/Cargo.toml -p claw-analog rag_response_ -- --nocapture
+cargo test --manifest-path rust/Cargo.toml -p gi-analog rag_response_ -- --nocapture
 cargo test --manifest-path rust/Cargo.toml -p runtime startup_preflight -- --nocapture
 cargo build --manifest-path rust/Cargo.toml --workspace --locked
 ```

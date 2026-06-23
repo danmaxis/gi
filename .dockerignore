@@ -2,8 +2,8 @@
 .git
 .github
 **/target
-**/.claw-rag
-**/.claw
+**/.gi-rag
+**/.gi
 **/.claude
 **/.cursor
 **/node_modules

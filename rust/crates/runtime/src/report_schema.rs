@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-pub const REPORT_SCHEMA_V1: &str = "claw.report.v1";
-pub const DEFAULT_PROJECTION_POLICY_V1: &str = "claw.report.projection.v1";
+pub const REPORT_SCHEMA_V1: &str = "gi.report.v1";
+pub const DEFAULT_PROJECTION_POLICY_V1: &str = "gi.report.projection.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

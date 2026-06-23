@@ -12,15 +12,15 @@ services:
   rag-serve:
     build:
       context: ./rust
-      dockerfile: crates/claw-rag-service/Dockerfile
+      dockerfile: crates/gi-rag-service/Dockerfile
     command: ["serve", "--db", "/data/index.sqlite"]
     environment:
       # Use mock embeddings by default for local dev; override in your shell for real providers.
-      CLAW_RAG_MOCK_PROVIDERS: "1"
-      CLAW_RAG_DB: "/data/index.sqlite"
-      CLAW_RAG_HOST: "0.0.0.0"
-      CLAW_RAG_QDRANT_URL: "http://qdrant:6334"
-      CLAW_RAG_QDRANT_COLLECTION: "claw_rag_chunks"
+      GI_RAG_MOCK_PROVIDERS: "1"
+      GI_RAG_DB: "/data/index.sqlite"
+      GI_RAG_HOST: "0.0.0.0"
+      GI_RAG_QDRANT_URL: "http://qdrant:6334"
+      GI_RAG_QDRANT_COLLECTION: "gi_rag_chunks"
     ports:
       - "8787:8787"
     depends_on:
@@ -31,13 +31,13 @@ services:
   rag-ingest:
     build:
       context: ./rust
-      dockerfile: crates/claw-rag-service/Dockerfile
+      dockerfile: crates/gi-rag-service/Dockerfile
     command: ["ingest", "--db", "/data/index.sqlite"]
     environment:
-      CLAW_RAG_MOCK_PROVIDERS: "1"
-      CLAW_RAG_DB: "/data/index.sqlite"
-      CLAW_RAG_QDRANT_URL: "http://qdrant:6334"
-      CLAW_RAG_QDRANT_COLLECTION: "claw_rag_chunks"
+      GI_RAG_MOCK_PROVIDERS: "1"
+      GI_RAG_DB: "/data/index.sqlite"
+      GI_RAG_QDRANT_URL: "http://qdrant:6334"
+      GI_RAG_QDRANT_COLLECTION: "gi_rag_chunks"
     depends_on:
       - qdrant
     volumes:

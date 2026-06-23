@@ -1,8 +1,8 @@
 # This .dockerignore applies to docker-compose build context: ./rust
 target
 **/target
-.claw
-.claw-rag
+.gi
+.gi-rag
 .claude
 node_modules
 dist

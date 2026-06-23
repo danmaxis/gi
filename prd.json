@@ -249,7 +249,7 @@
     {
       "id": "US-018",
       "title": "Phase 2 - Nudge acknowledgment / dedupe contract",
-      "description": "Periodic clawhip nudges should carry nudge id/cycle id and delivery timestamp. Expose whether claw has already acknowledged or responded for that cycle. Distinguish new nudge, retry nudge, and stale duplicate.",
+      "description": "Periodic clawhip nudges should carry nudge id/cycle id and delivery timestamp. Expose whether gi has already acknowledged or responded for that cycle. Distinguish new nudge, retry nudge, and stale duplicate.",
       "acceptanceCriteria": [
         "Nudge id / cycle id and delivery timestamp attached",
         "Acknowledgment state exposed (already acknowledged or not)",
@@ -263,7 +263,7 @@
     {
       "id": "US-019",
       "title": "Phase 2 - Stable roadmap-id assignment for newly filed pinpoints",
-      "description": "When a claw records a new pinpoint/follow-up, assign or expose a stable tracking id immediately. Expose that id in structured event/report payload and preserve across edits, reorderings, and summary compression.",
+      "description": "When a gi records a new pinpoint/follow-up, assign or expose a stable tracking id immediately. Expose that id in structured event/report payload and preserve across edits, reorderings, and summary compression.",
       "acceptanceCriteria": [
         "Canonical roadmap id assigned at filing time",
         "Roadmap id exposed in structured event/report payload",

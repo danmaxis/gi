@@ -14,8 +14,8 @@ Use the lightest support path that fits the request:
 When asking for help, include:
 
 ```text
-claw --version
-claw doctor
+gi --version
+gi doctor
 operating system and shell
 command you ran
 ```

@@ -353,7 +353,7 @@ impl Display for ApiError {
                     "\nhint: check that your API key is valid and matches the target provider. \
                      For OpenAI-compatible providers set OPENAI_API_KEY or OPENAI_BASE_URL. \
                      For Anthropic set ANTHROPIC_API_KEY. \
-                     Run `claw doctor` to verify your credential configuration."
+                     Run `gi doctor` to verify your credential configuration."
                 )
             }
             Self::Api {

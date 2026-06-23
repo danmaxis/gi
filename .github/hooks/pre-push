@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claw Code local pre-push safety gate.
+# Gi Code local pre-push safety gate.
 #
 # Install with:
 #   git config core.hooksPath .github/hooks
@@ -16,8 +16,8 @@ if [[ -x scripts/roadmap-check-ids.sh ]]; then
   scripts/roadmap-check-ids.sh >&2
 fi
 
-if [[ "${SKIP_CLAW_PRE_PUSH_BUILD:-}" == "1" ]]; then
-  echo "pre-push: SKIP_CLAW_PRE_PUSH_BUILD=1 set; skipping cargo workspace build" >&2
+if [[ "${SKIP_GI_PRE_PUSH_BUILD:-}" == "1" ]]; then
+  echo "pre-push: SKIP_GI_PRE_PUSH_BUILD=1 set; skipping cargo workspace build" >&2
   exit 0
 fi
 

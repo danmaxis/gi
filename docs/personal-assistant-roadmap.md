@@ -1,4 +1,4 @@
-# From Claw Code to a Personal AI Assistant (Life OS)
+# From Gi Code to a Personal AI Assistant (Life OS)
 
 This document turns the current “developer CLI agent” direction into a concrete path toward a **personal AI assistant**: a multi-channel interface (chat/voice), personal memory (RAG for life), tool/action integrations (MCP + plugins), proactivity (OmX-style loops), and long-lived identity (sessions + profile).
 
@@ -9,11 +9,11 @@ It is intentionally pragmatic: each section has **MVP scope**, **next step**, an
 ## 1) Interface: out of the terminal
 
 ### Goal
-Make `claw` usable without opening an IDE or terminal — from a phone, from chat, and eventually by voice.
+Make `gi` usable without opening an IDE or terminal — from a phone, from chat, and eventually by voice.
 
 ### MVP
-- **Chat bridge**: a small service that relays messages from **Discord** (primary) or Telegram to `claw` / `claw-analog`.
-  - Treat the chat thread as the “front-end”, and `claw` as the execution runtime.
+- **Chat bridge**: a small service that relays messages from **Discord** (primary) or Telegram to `gi` / `gi-analog`.
+  - Treat the chat thread as the “front-end”, and `gi` as the execution runtime.
   - Map a channel/thread to a **session id** (resume/append).
 - **Basic UX**: slash-like commands in chat:
   - `/prompt …`, `/resume latest`, `/status`, `/cost`, `/help`
@@ -63,7 +63,7 @@ The assistant is valuable because it can **do** things, not only talk.
 - Wire in external systems via **MCP servers**:
   - Calendar, notes (Notion), email, task trackers, smart home (as available).
 - Establish a convention for “personal skills”:
-  - a dedicated directory (e.g. `.claw/skills/`) for user-specific automations
+  - a dedicated directory (e.g. `.gi/skills/`) for user-specific automations
   - small, composable tools (digest, budgeting, reminders) rather than monoliths
 
 ### Next step

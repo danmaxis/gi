@@ -6,6 +6,6 @@ cargo build --release
 
 # Link to ~/.local/bin
 mkdir -p "$HOME/.local/bin"
-ln -sf "$(pwd)/target/release/claw" "$HOME/.local/bin/claw"
+ln -sf "$(pwd)/target/release/gi" "$HOME/.local/bin/gi"
 
-echo "✓ Claw installed to ~/.local/bin/claw"
+echo "✓ Gi installed to ~/.local/bin/gi"

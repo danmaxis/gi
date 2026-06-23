@@ -215,6 +215,7 @@ impl SystemPromptBuilder {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
         sections.push(get_simple_system_section());
+        sections.push(get_gi_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
@@ -276,13 +277,13 @@ fn instruction_file_source(path: &Path) -> &'static str {
         .and_then(|name| name.to_str());
 
     match (parent_name, file_name) {
-        (Some(".claw"), Some("CLAUDE.md")) => "claw_claude_md",
+        (Some(".gi"), Some("CLAUDE.md")) => "gi_claude_md",
         (Some(".claude"), Some("CLAUDE.md")) => "claude_claude_md",
         (_, Some("CLAUDE.md")) => "claude_md",
-        (_, Some("CLAW.md")) => "claw_md",
+        (_, Some("GI.md")) => "gi_md",
         (_, Some("AGENTS.md")) => "agents_md",
         (_, Some("CLAUDE.local.md")) => "claude_local_md",
-        (Some(".claw"), Some("instructions.md")) => "claw_instructions",
+        (Some(".gi"), Some("instructions.md")) => "gi_instructions",
         _ => "rule_file",
     }
 }
@@ -297,17 +298,17 @@ fn discover_instruction_files(
     for dir in directories {
         for candidate in [
             dir.join("CLAUDE.md"),
-            dir.join("CLAW.md"),
+            dir.join("GI.md"),
             dir.join("AGENTS.md"),
             dir.join("CLAUDE.local.md"),
-            dir.join(".claw").join("CLAUDE.md"),
+            dir.join(".gi").join("CLAUDE.md"),
             dir.join(".claude").join("CLAUDE.md"),
-            dir.join(".claw").join("instructions.md"),
+            dir.join(".gi").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
-        push_rules_dir(&mut files, dir.join(".claw").join("rules"))?;
-        push_rules_dir(&mut files, dir.join(".claw").join("rules.local"))?;
+        push_rules_dir(&mut files, dir.join(".gi").join("rules"))?;
+        push_rules_dir(&mut files, dir.join(".gi").join("rules.local"))?;
         push_framework_imports(&mut files, &dir, rules_import)?
     }
     Ok(dedupe_instruction_files(files))
@@ -656,7 +657,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No Claw Code settings files loaded.".to_string()
+            "No Gi Code settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }
@@ -695,6 +696,21 @@ fn get_simple_system_section() -> String {
     ]);
 
     std::iter::once("# System".to_string())
+        .chain(items)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn get_gi_section() -> String {
+    let items = prepend_bullets(vec![
+        "Gi favors collective intelligence: compare plausible approaches, use specialized tools and local project knowledge, and choose the smallest approach that can be verified.".to_string(),
+        "When a user preference materially changes the outcome, use the ask_user tool instead of guessing. Keep questions concrete, offer meaningful choices when possible, and proceed once the answer is available.".to_string(),
+        "Be model-agnostic and provider-agnostic. Local and OpenAI-compatible models are valid first-class backends, so avoid provider identity assumptions unless the runtime says otherwise.".to_string(),
+        "Counter common autonomous-agent failures by verifying implementations, preserving reproducible command evidence, checking numeric claims carefully, and keeping risky actions behind explicit approval.".to_string(),
+        "Treat memory and instruction files as durable project context, but keep external or generated memory subordinate to current user messages and higher-priority system instructions.".to_string(),
+    ]);
+
+    std::iter::once("# Gi operating principles".to_string())
         .chain(items)
         .collect::<Vec<_>>()
         .join("\n")
@@ -757,10 +773,10 @@ mod tests {
     }
 
     #[test]
-    fn discovers_claw_rules_files_in_sorted_order() {
+    fn discovers_gi_rules_files_in_sorted_order() {
         let root = temp_dir();
-        let rules = root.join(".claw").join("rules");
-        let local_rules = root.join(".claw").join("rules.local");
+        let rules = root.join(".gi").join("rules");
+        let local_rules = root.join(".gi").join("rules.local");
         fs::create_dir_all(&rules).expect("rules dir");
         fs::create_dir_all(&local_rules).expect("local rules dir");
         fs::write(rules.join("b.txt"), "b rule").expect("write b rule");
@@ -782,12 +798,9 @@ mod tests {
     #[test]
     fn rules_import_none_suppresses_external_framework_rules() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw").join("rules")).expect("rules dir");
-        fs::write(
-            root.join(".claw").join("rules").join("project.md"),
-            "claw rule",
-        )
-        .expect("write claw rule");
+        fs::create_dir_all(root.join(".gi").join("rules")).expect("rules dir");
+        fs::write(root.join(".gi").join("rules").join("project.md"), "gi rule")
+            .expect("write gi rule");
         fs::write(root.join(".cursorrules"), "cursor rule").expect("write cursor rule");
 
         let context = ProjectContext::discover_with_rules_import(
@@ -798,7 +811,7 @@ mod tests {
         .expect("context should load");
         let rendered = render_instruction_files(&context.instruction_files);
 
-        assert!(rendered.contains("claw rule"));
+        assert!(rendered.contains("gi rule"));
         assert!(!rendered.contains("cursor rule"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -832,24 +845,24 @@ mod tests {
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
+        fs::create_dir_all(nested.join(".gi")).expect("nested gi dir");
         fs::create_dir(root.join(".git")).expect("git boundary");
         fs::write(root.join("CLAUDE.md"), "root instructions").expect("write root instructions");
         fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
-        fs::create_dir_all(root.join("apps").join(".claw")).expect("apps claw dir");
+        fs::create_dir_all(root.join("apps").join(".gi")).expect("apps gi dir");
         fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(
-            root.join("apps").join(".claw").join("instructions.md"),
+            root.join("apps").join(".gi").join("instructions.md"),
             "apps dot claude instructions",
         )
         .expect("write apps dot claude instructions");
-        fs::write(nested.join(".claw").join("CLAUDE.md"), "nested rules")
+        fs::write(nested.join(".gi").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
         fs::write(
-            nested.join(".claw").join("instructions.md"),
+            nested.join(".gi").join("instructions.md"),
             "nested instructions",
         )
         .expect("write nested instructions");
@@ -912,11 +925,11 @@ mod tests {
     }
 
     #[test]
-    fn discovers_claude_claw_agents_and_dot_claude_instruction_files_together() {
+    fn discovers_claude_gi_agents_and_dot_claude_instruction_files_together() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".claude")).expect("dot claude dir");
         fs::write(root.join("CLAUDE.md"), "claude instructions").expect("write CLAUDE.md");
-        fs::write(root.join("CLAW.md"), "claw instructions").expect("write CLAW.md");
+        fs::write(root.join("GI.md"), "gi instructions").expect("write GI.md");
         fs::write(root.join("AGENTS.md"), "agents instructions").expect("write AGENTS.md");
         fs::write(
             root.join(".claude").join("CLAUDE.md"),
@@ -934,10 +947,10 @@ mod tests {
 
         assert_eq!(
             sources,
-            vec!["claude_md", "claw_md", "agents_md", "claude_claude_md"]
+            vec!["claude_md", "gi_md", "agents_md", "claude_claude_md"]
         );
         assert!(rendered.contains("claude instructions"));
-        assert!(rendered.contains("claw instructions"));
+        assert!(rendered.contains("gi instructions"));
         assert!(rendered.contains("agents instructions"));
         assert!(rendered.contains("dot claude instructions"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -1022,7 +1035,7 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.claw/CLAUDE.md")),
+            display_context_path(Path::new("/tmp/project/.gi/CLAUDE.md")),
             "CLAUDE.md"
         );
     }
@@ -1182,10 +1195,10 @@ mod tests {
     #[test]
     fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::create_dir_all(root.join(".gi")).expect("gi dir");
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write instructions");
         fs::write(
-            root.join(".claw").join("settings.json"),
+            root.join(".gi").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -1194,9 +1207,9 @@ mod tests {
         ensure_valid_cwd();
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
-        let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_gi_home = std::env::var("GI_CONFIG_HOME").ok();
         std::env::set_var("HOME", &root);
-        std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        std::env::set_var("GI_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(
             &root,
@@ -1217,10 +1230,10 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        if let Some(value) = original_claw_home {
-            std::env::set_var("CLAW_CONFIG_HOME", value);
+        if let Some(value) = original_gi_home {
+            std::env::set_var("GI_CONFIG_HOME", value);
         } else {
-            std::env::remove_var("CLAW_CONFIG_HOME");
+            std::env::remove_var("GI_CONFIG_HOME");
         }
 
         assert!(prompt.contains("Project rules"));
@@ -1231,10 +1244,10 @@ mod tests {
     #[test]
     fn load_system_prompt_respects_rules_import_config() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::create_dir_all(root.join(".gi")).expect("gi dir");
         fs::write(root.join(".cursorrules"), "cursor rule").expect("write cursor rule");
         fs::write(
-            root.join(".claw").join("settings.json"),
+            root.join(".gi").join("settings.json"),
             r#"{"rulesImport":"none"}"#,
         )
         .expect("write settings");
@@ -1243,9 +1256,9 @@ mod tests {
         ensure_valid_cwd();
         let previous = std::env::current_dir().expect("cwd");
         let original_home = std::env::var("HOME").ok();
-        let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_gi_home = std::env::var("GI_CONFIG_HOME").ok();
         std::env::set_var("HOME", &root);
-        std::env::set_var("CLAW_CONFIG_HOME", root.join("missing-home"));
+        std::env::set_var("GI_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(
             &root,
@@ -1262,10 +1275,10 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        if let Some(value) = original_claw_home {
-            std::env::set_var("CLAW_CONFIG_HOME", value);
+        if let Some(value) = original_gi_home {
+            std::env::set_var("GI_CONFIG_HOME", value);
         } else {
-            std::env::remove_var("CLAW_CONFIG_HOME");
+            std::env::remove_var("GI_CONFIG_HOME");
         }
 
         assert!(!prompt.contains("cursor rule"));
@@ -1318,12 +1331,30 @@ mod tests {
     }
 
     #[test]
+    fn renders_gi_operating_principles() {
+        let project_context = ProjectContext {
+            cwd: PathBuf::from("/tmp/project"),
+            current_date: "2026-03-31".to_string(),
+            ..ProjectContext::default()
+        };
+
+        let prompt = SystemPromptBuilder::new()
+            .with_os("linux", "6.8")
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("# Gi operating principles"));
+        assert!(prompt.contains("use the ask_user tool"));
+        assert!(prompt.contains("OpenAI-compatible models"));
+    }
+
+    #[test]
     fn renders_claude_code_style_sections_with_project_context() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::create_dir_all(root.join(".gi")).expect("gi dir");
         fs::write(root.join("CLAUDE.md"), "Project rules").expect("write CLAUDE.md");
         fs::write(
-            root.join(".claw").join("settings.json"),
+            root.join(".gi").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -1362,9 +1393,9 @@ mod tests {
     fn discovers_dot_claude_instructions_markdown() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(nested.join(".claw")).expect("nested claw dir");
+        fs::create_dir_all(nested.join(".gi")).expect("nested gi dir");
         fs::write(
-            nested.join(".claw").join("instructions.md"),
+            nested.join(".gi").join("instructions.md"),
             "instruction markdown",
         )
         .expect("write instructions.md");
@@ -1373,7 +1404,7 @@ mod tests {
         assert!(context
             .instruction_files
             .iter()
-            .any(|file| file.path.ends_with(".claw/instructions.md")));
+            .any(|file| file.path.ends_with(".gi/instructions.md")));
         assert!(
             render_instruction_files(&context.instruction_files).contains("instruction markdown")
         );

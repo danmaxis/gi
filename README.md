@@ -1,11 +1,11 @@
-# Claw Code
+# Gi Code
 
 <p align="center">
   <a href="https://github.com/code-yeongyu/lazycodex">
     <img src="https://img.shields.io/badge/LazyCodex-codex%20for%20no--brainers-111111?style=for-the-badge&logo=github&logoColor=white" alt="LazyCodex banner" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
-    <img src="https://img.shields.io/badge/Gajae--Code-red--claw%20agent%20harness-B22222?style=for-the-badge&logo=github&logoColor=white" alt="Gajae-Code banner" />
+    <img src="https://img.shields.io/badge/Gajae--Code-red--gi%20agent%20harness-B22222?style=for-the-badge&logo=github&logoColor=white" alt="Gajae-Code banner" />
   </a>
 </p>
 
@@ -52,12 +52,12 @@
 </p>
 
 > [!IMPORTANT]
-> **Claw Code is not the serious production project here.**
+> **Gi Code is not the serious production project here.**
 > This repository is closer to a museum exhibit than a product pitch, a crustacean-run artifact kept alive by clawed gajaes, swept and labeled by agents, and automatically maintained according to the harnesses above.
 >
 > As already described in the project philosophy, this is not meant to be hand-operated like a normal product repo. It is an **agent-managed exhibit**: the harnesses plan, execute, verify, label, and preserve the artifact while the crabs keep the tank running.
 >
-> If you want to actually run work, start with **[LazyCodex](https://github.com/code-yeongyu/lazycodex)** or **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. If you want to inspect the strange little fossil of the Claw Code moment, continue below.
+> If you want to actually run work, start with **[LazyCodex](https://github.com/code-yeongyu/lazycodex)** or **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. If you want to inspect the strange little fossil of the Gi Code moment, continue below.
 >
 > For the longer public explanation behind this philosophy, see [here](https://x.com/realsigridjin/status/2039472968624185713).
 
@@ -90,20 +90,20 @@
 </p>
 
 <p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
+  <img src="assets/gi-hero.jpeg" alt="Gi Code" width="300" />
 </p>
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
+Gi Code is the public Rust implementation of the `gi` CLI agent harness.
 The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `gi doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
+> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `gi acp` (or `gi --acp`) for the current status instead of guessing from source layout; `gi acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`rust/`** — canonical Rust workspace and the `gi` CLI binary
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
@@ -114,7 +114,7 @@ The canonical implementation lives in [`rust/`](./rust), and the current source 
 
 > [!NOTE]
 > [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `gi`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
 > ```bash
 > cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
 > ```
@@ -130,17 +130,17 @@ cargo build --workspace
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 3. Verify everything is wired correctly
-./target/debug/claw doctor
+./target/debug/gi doctor
 
 # 4. Run a prompt
-./target/debug/claw prompt "say hello"
+./target/debug/gi prompt "say hello"
 
 # 5. Start an interactive session
-./target/debug/claw
+./target/debug/gi
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** the binary is `gi.exe`, not `gi`. Use `.\target\debug\gi.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
 
 ### Windows setup
 
@@ -161,7 +161,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 4. **Run** (PowerShell — note `.exe` and backslash):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
+   .\target\debug\gi.exe prompt "say hello"
    ```
 
 For release ZIPs, PATH setup, provider switching, and notification smoke checks, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
@@ -170,19 +170,19 @@ For release ZIPs, PATH setup, provider switching, and notification smoke checks,
 
 ## Post-build: locate the binary and verify
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+After running `cargo build --workspace`, the `gi` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
 
 ### Binary location
 
 After `cargo build --workspace` in `claw-code/rust/`:
 
 **Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
+- **macOS/Linux:** `rust/target/debug/gi`
+- **Windows:** `rust/target/debug/gi.exe`
 
 **Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
+- **macOS/Linux:** `rust/target/release/gi`
+- **Windows:** `rust/target/release/gi.exe`
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
 
@@ -192,39 +192,39 @@ Test the binary directly using its path:
 
 ```bash
 # macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
+./rust/target/debug/gi --help
+./rust/target/debug/gi doctor
 
 # Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\gi.exe --help
+.\rust\target\debug\gi.exe doctor
 ```
 
 PowerShell smoke commands that do not require live credentials:
 
 ```powershell
-$env:CLAW_CONFIG_HOME = Join-Path $env:TEMP "claw config home"
-New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
+$env:GI_CONFIG_HOME = Join-Path $env:TEMP "gi config home"
+New-Item -ItemType Directory -Force -Path $env:GI_CONFIG_HOME | Out-Null
 Remove-Item Env:\ANTHROPIC_API_KEY, Env:\ANTHROPIC_AUTH_TOKEN, Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\rust\target\debug\claw.exe help
-.\rust\target\debug\claw.exe status
-.\rust\target\debug\claw.exe config env
-.\rust\target\debug\claw.exe doctor
+.\rust\target\debug\gi.exe help
+.\rust\target\debug\gi.exe status
+.\rust\target\debug\gi.exe config env
+.\rust\target\debug\gi.exe doctor
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+If these commands succeed, the build is working. `gi doctor` is your first health check — it validates your API key, model access, and tool configuration.
 
 ### Optional: Add to PATH
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
+If you want to run `gi` from any directory without the full path, choose one of these approaches:
 
 **Option 1: Symlink (macOS/Linux)**
 ```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
+ln -s $(pwd)/rust/target/debug/gi /usr/local/bin/gi
 ```
 Then reload your shell and test:
 ```bash
-claw --help
+gi --help
 ```
 
 **Option 2: Use `cargo install` (all platforms)**
@@ -235,7 +235,7 @@ Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually
 cargo install --path . --force
 
 # Then from anywhere
-claw --help
+gi --help
 ```
 
 **Option 3: Update shell profile (bash/zsh)**
@@ -248,17 +248,17 @@ export PATH="$(pwd)/rust/target/debug:$PATH"
 Reload your shell:
 ```bash
 source ~/.bashrc  # or source ~/.zshrc
-claw --help
+gi --help
 ```
 
 ### Troubleshooting
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
+- **"command not found: gi"** — The binary is in `rust/target/debug/gi`, but it's not on your PATH. Use the full path `./rust/target/debug/gi` or symlink/install as above.
+- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/gi` if the executable bit isn't set (rare).
 - **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
 
 > [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
+> **Auth:** gi requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
 
 Run the workspace test suite after verifying the binary works:
 
@@ -271,7 +271,7 @@ cargo test --workspace
 
 - [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
 - [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
-- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
+- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Gi multi-provider positioning, and local skills install checks
 - [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
 - [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
 - [`PARITY.md`](./PARITY.md) — parity status for the Rust port
@@ -284,7 +284,7 @@ cargo test --workspace
 
 ## Ecosystem
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+Gi Code is built in the open alongside the broader UltraWorkers toolchain:
 
 - [clawhip](https://github.com/Yeachan-Heo/clawhip)
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)

@@ -1613,12 +1613,12 @@ mod tests {
     #[test]
     fn lane_ownership_binding_includes_workflow_scope() {
         let ownership = LaneOwnership {
-            owner: "claw-1".to_string(),
+            owner: "gi-1".to_string(),
             workflow_scope: "claw-code-dogfood".to_string(),
             watcher_action: WatcherAction::Act,
         };
 
-        assert_eq!(ownership.owner, "claw-1");
+        assert_eq!(ownership.owner, "gi-1");
         assert_eq!(ownership.workflow_scope, "claw-code-dogfood");
         assert_eq!(ownership.watcher_action, WatcherAction::Act);
     }

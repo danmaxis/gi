@@ -13,7 +13,7 @@ PRE_PUSH_HOOK = REPO_ROOT / '.github' / 'hooks' / 'pre-push'
 class PrePushHookContractTests(unittest.TestCase):
     def test_skip_escape_hatch_exits_successfully_with_stderr_notice(self) -> None:
         env = os.environ.copy()
-        env['SKIP_CLAW_PRE_PUSH_BUILD'] = '1'
+        env['SKIP_GI_PRE_PUSH_BUILD'] = '1'
 
         result = subprocess.run(
             ['bash', str(PRE_PUSH_HOOK)],
@@ -25,7 +25,7 @@ class PrePushHookContractTests(unittest.TestCase):
         )
 
         self.assertEqual('', result.stdout)
-        self.assertIn('SKIP_CLAW_PRE_PUSH_BUILD=1', result.stderr)
+        self.assertIn('SKIP_GI_PRE_PUSH_BUILD=1', result.stderr)
         self.assertIn('skipping cargo workspace build', result.stderr)
 
     def test_default_build_gate_uses_workspace_locked_cargo_build(self) -> None:

@@ -1,6 +1,6 @@
-# Contributing to Claw Code
+# Contributing to Gi Code
 
-Thanks for helping improve Claw Code. This repository is a Rust-first CLI
+Thanks for helping improve Gi Code. This repository is a Rust-first CLI
 workspace with supporting docs and compatibility fixtures.
 
 ## Ground rules
@@ -30,7 +30,7 @@ with the `.exe` suffix:
 ```powershell
 cd claw-code\rust
 cargo build --workspace
-.\target\debug\claw.exe --help
+.\target\debug\gi.exe --help
 ```
 
 ## Local pre-push build gate
@@ -46,7 +46,7 @@ custom `core.hooksPath`, copy or chain `.github/hooks/pre-push` instead. The hoo
 runs the ROADMAP id guard, then runs
 `cargo build --manifest-path rust/Cargo.toml --workspace --locked` from the
 repository root. If you must bypass the cargo build for a docs-only push, set
-`SKIP_CLAW_PRE_PUSH_BUILD=1`; the hook still runs the ROADMAP guard and prints
+`SKIP_GI_PRE_PUSH_BUILD=1`; the hook still runs the ROADMAP guard and prints
 when the cargo-build escape hatch is used.
 
 ## ROADMAP id allocation

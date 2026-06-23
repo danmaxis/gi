@@ -34,16 +34,16 @@ impl Default for TimeoutConfig {
 
 impl TimeoutConfig {
     /// Read timeout settings from the process environment.
-    /// - `CLAW_API_CONNECT_TIMEOUT` — connect timeout in seconds
-    /// - `CLAW_API_REQUEST_TIMEOUT` — overall request timeout in seconds
+    /// - `GI_API_CONNECT_TIMEOUT` — connect timeout in seconds
+    /// - `GI_API_REQUEST_TIMEOUT` — overall request timeout in seconds
     #[must_use]
     pub fn from_env() -> Self {
-        let connect_timeout = std::env::var("CLAW_API_CONNECT_TIMEOUT")
+        let connect_timeout = std::env::var("GI_API_CONNECT_TIMEOUT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(30));
-        let request_timeout = std::env::var("CLAW_API_REQUEST_TIMEOUT")
+        let request_timeout = std::env::var("GI_API_REQUEST_TIMEOUT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)

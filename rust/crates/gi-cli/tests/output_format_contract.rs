@@ -3200,9 +3200,16 @@ fn short_p_flag_swallows_no_flags_755() {
     // missing_credentials (not missing_prompt), proving --output-format json was parsed.
     let output = Command::new(bin)
         .current_dir(&root)
-        .args(["-p", "hello", "--output-format", "json"])
+        // Isolate config home so a developer's saved provider (applied via
+        // apply_saved_provider_env) can't make this run succeed.
+        .env("GI_CONFIG_HOME", &root)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("OLLAMA_HOST")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("XAI_API_KEY")
+        .args(["-p", "hello", "--output-format", "json"])
         .output()
         .expect("gi -p should run");
     assert!(

@@ -95,7 +95,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "models",
-        aliases: &["providers"],
+        aliases: &[],
         summary: "Scan providers and pick a default model",
         argument_hint: None,
         resume_supported: false,
@@ -1364,7 +1364,7 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
-        "models" | "providers" => SlashCommand::Models,
+        "models" => SlashCommand::Models,
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },

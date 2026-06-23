@@ -28,6 +28,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -2517,7 +2518,6 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "prompt"
             | "export"
             | "models"
-            | "providers"
     ) {
         return None;
     }
@@ -8141,13 +8141,26 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        spinner.tick(
-            "🥋 Thinking...",
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        // Animate the "thinking" indicator on a background thread while the turn
+        // runs (it otherwise sits frozen during generation). A shared lock keeps
+        // it from clashing with permission prompts. TTY-only, so scripted/piped
+        // runs stay clean.
+        let anim_stop = Arc::new(AtomicBool::new(false));
+        let anim_lock = Arc::new(Mutex::new(()));
+        let animation = if stdout.is_terminal() {
+            Some(start_thinking_animation(&anim_stop, &anim_lock))
+        } else {
+            None
+        };
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        if animation.is_some() {
+            permission_prompter = permission_prompter.with_anim_lock(Arc::clone(&anim_lock));
+        }
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        anim_stop.store(true, Ordering::Relaxed);
+        if let Some(animation) = animation {
+            let _ = animation.join();
+        }
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -12869,13 +12882,58 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
     }
 }
 
+/// Spawn a background thread that animates a "thinking" spinner on one line
+/// until `stop` is set. Each frame is drawn while holding `lock`, so a permission
+/// prompt (which takes the same lock) never interleaves with the animation.
+fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> JoinHandle<()> {
+    let stop = Arc::clone(stop);
+    let lock = Arc::clone(lock);
+    let theme = render::ColorTheme::default();
+    thread::spawn(move || {
+        const PHRASES: [&str; 5] = ["Thinking", "Pondering", "Reasoning", "Working", "Crunching"];
+        let mut spinner = Spinner::new();
+        let mut out = io::stdout();
+        let mut frame: usize = 0;
+        while !stop.load(Ordering::Relaxed) {
+            {
+                let _guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let phrase = PHRASES[(frame / 16) % PHRASES.len()];
+                let dots = ".".repeat(1 + (frame / 4) % 3);
+                let _ = spinner.tick(&format!("🥋 {phrase}{dots}"), &theme, &mut out);
+            }
+            frame = frame.wrapping_add(1);
+            thread::sleep(Duration::from_millis(90));
+        }
+        // Clear the spinner line so the caller can render the result cleanly.
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = io::stdout();
+        let _ = write!(out, "\r\x1b[2K");
+        let _ = out.flush();
+    })
+}
+
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    /// When set, held while prompting so the background "thinking" animation is
+    /// paused and the spinner line is cleared first.
+    anim_lock: Option<Arc<Mutex<()>>>,
 }
 
 impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            anim_lock: None,
+        }
+    }
+
+    fn with_anim_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
+        self.anim_lock = Some(lock);
+        self
     }
 }
 
@@ -12884,6 +12942,14 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Pause the thinking animation (and clear its line) for the prompt.
+        let _anim_guard = self.anim_lock.as_ref().map(|lock| {
+            lock.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if _anim_guard.is_some() {
+            print!("\r\x1b[2K");
+        }
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);

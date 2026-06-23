@@ -94,6 +94,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "models",
+        aliases: &["providers"],
+        summary: "Scan providers and pick a default model",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "permissions",
         aliases: &[],
         summary: "Show or switch the active permission mode",
@@ -1070,6 +1077,7 @@ pub enum SlashCommand {
     Model {
         model: Option<String>,
     },
+    Models,
     Permissions {
         mode: Option<String>,
     },
@@ -1249,6 +1257,7 @@ impl SlashCommand {
             Self::DebugToolCall { .. } => "/debug-tool-call",
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
+            Self::Models => "/models",
             Self::Permissions { .. } => "/permissions",
             Self::Session { .. } => "/session",
             Self::Plugins { .. } => "/plugins",
@@ -1355,6 +1364,7 @@ pub fn validate_slash_command_input(
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
+        "models" | "providers" => SlashCommand::Models,
         "permissions" => SlashCommand::Permissions {
             mode: parse_permissions_mode(&args)?,
         },
@@ -5560,6 +5570,7 @@ pub fn handle_slash_command(
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
+        | SlashCommand::Models
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -6235,7 +6246,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 141);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

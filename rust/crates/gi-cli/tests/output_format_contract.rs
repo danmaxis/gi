@@ -281,7 +281,7 @@ fn version_emits_json_when_requested() {
     assert!(
         parsed["human_readable"]
             .as_str()
-            .is_some_and(|text| text.contains("Gi Code")),
+            .is_some_and(|text| text.contains("Gi · the coding harness")),
         "version JSON should keep text output only in human_readable: {parsed}"
     );
     let git_sha = parsed["git_sha"]

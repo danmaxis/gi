@@ -20,6 +20,10 @@ pub use prompt_cache::{
     PromptCacheStats,
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
+pub use providers::discovery::{
+    detect_available_providers, fetch_ollama_models, fetch_openai_compat_models, DetectedProvider,
+    ListStyle,
+};
 pub use providers::openai_compat::{
     build_chat_completion_request, check_request_body_size, estimate_request_body_size,
     flatten_tool_result_content, is_reasoning_model, model_rejects_is_error_field,

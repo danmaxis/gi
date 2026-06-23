@@ -247,6 +247,37 @@ the env var is currently pinning the rendered theme. The effective theme and its
 source are reported by `gi status --output-format json` (under `theme`) and by
 `gi doctor`. JSON and non-TTY output never emit ANSI theme color codes.
 
+## Providers and models
+
+`gi` is not hardcoded to Anthropic. Run `gi models` to scan the environment for
+configured providers and offer their models; in a terminal it lets you pick a
+default that persists to `~/.gi/settings.json`. On a fresh install (no provider
+configured) the interactive REPL runs this automatically. Inside the REPL the same
+flow is `/models`.
+
+```bash
+gi models                       # scan + interactively pick a default model
+gi models --output-format json  # machine-readable provider/model inventory
+```
+
+Detected providers and their API-key env vars:
+
+| Provider | Env var(s) | Notes |
+| --- | --- | --- |
+| Anthropic | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` | default; `opus`/`sonnet`/`haiku` aliases |
+| OpenAI | `OPENAI_API_KEY` (`OPENAI_BASE_URL`) | live `/v1/models` |
+| xAI | `XAI_API_KEY` | grok models |
+| DashScope | `DASHSCOPE_API_KEY` | Qwen |
+| Sakana AI | `SAKANA_API_KEY` | OpenAI-compatible |
+| Kimi (Moonshot) | `KIMI_API_KEY` / `MOONSHOT_API_KEY` | OpenAI-compatible |
+| GLM (Zhipu) | `GLM_API_KEY` / `ZHIPUAI_API_KEY` | OpenAI-compatible |
+| Ollama | `OLLAMA_HOST` | local; live `/api/tags` |
+
+For Ollama and OpenAI-compatible endpoints, `gi models` live-queries the model list;
+otherwise it suggests the built-in models. A picked provider is applied to `gi`'s own
+process at startup (it never touches your global shell or other tools), so plain
+`gi` then routes to it. Override per run with `gi --model <provider/model>`.
+
 ## Authentication
 
 ### API key

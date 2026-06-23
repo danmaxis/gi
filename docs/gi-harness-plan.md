@@ -263,3 +263,18 @@ Implementation notes:
 - The timeout field is included now to stabilize the schema, but real timeout behavior needs careful terminal handling.
 - Memory should remain boring and inspectable: markdown first, optional LLM consolidation later, no mandatory vector database.
 - Opencode compatibility should be proven through generated config and handoff workflows before importing any implementation code.
+
+## Post-dogfood slice: brand polish + provider/model discovery + command UX (done 2026-06-23)
+
+- [x] Replace residual Claw art: `🦀`→`🥋` spinner; startup splash rewritten to the
+  "Cyber Dojo" logo (block `GI` + kanji `技` + scanline + small-caps `harness`, Outrun
+  gradient, NO_COLOR-safe) via `startup_logo()`.
+- [x] Provider/model discovery: `gi models` + `/models` + first-run scan of provider env
+  vars with live model queries (Ollama `/api/tags`, OpenAI-compatible `/v1/models`).
+  Providers: Anthropic, OpenAI, xAI, DashScope, **Sakana AI, Kimi (Moonshot), GLM (Zhipu)**,
+  Ollama. `apply_saved_provider_env()` applies a persisted provider to the process env at
+  startup (in-process only) so a saved pick actually routes.
+- [x] Command UX (enhanced rustyline): fuzzy command-name completion + descriptions +
+  candidate highlighting; colorized, grouped `/help`.
+- [ ] Follow-up: full provider *diagnostics* in `doctor` (Slice 7 health probes); finer
+  command sub-grouping; "don't ask again" for first-run.

@@ -23,6 +23,7 @@ pub enum ReadOutcome {
 struct SlashCommandHelper {
     completions: Vec<String>,
     current_line: RefCell<String>,
+    color: bool,
 }
 
 impl SlashCommandHelper {
@@ -30,6 +31,7 @@ impl SlashCommandHelper {
         Self {
             completions: normalize_completions(completions),
             current_line: RefCell::new(String::new()),
+            color: std::env::var_os("NO_COLOR").is_none(),
         }
     }
 
@@ -65,12 +67,29 @@ impl Completer for SlashCommandHelper {
             return Ok((0, Vec::new()));
         };
 
-        let matches = self
+        // Argument completion (the query already has a space) stays a strict
+        // prefix match; bare command names get crush/opencode-style fuzzy
+        // matching so `/mdl` finds `/model`.
+        let completing_args = prefix.contains(' ');
+        let mut scored: Vec<(i64, &String)> = self
             .completions
             .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
-            .map(|candidate| Pair {
-                display: candidate.clone(),
+            .filter_map(|candidate| {
+                let score = if completing_args {
+                    starts_with_ci(candidate, prefix).then_some(0)
+                } else {
+                    fuzzy_score(candidate, prefix)
+                };
+                score.map(|score| (score, candidate))
+            })
+            .collect();
+        // Stable sort by descending score keeps insertion order within ties.
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let matches = scored
+            .into_iter()
+            .map(|(_, candidate)| Pair {
+                display: format_candidate(candidate),
                 replacement: candidate.clone(),
             })
             .collect();
@@ -92,6 +111,23 @@ impl Highlighter for SlashCommandHelper {
     fn highlight_char(&self, line: &str, _pos: usize, _kind: CmdKind) -> bool {
         self.set_current_line(line);
         false
+    }
+
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        _completion: CompletionType,
+    ) -> Cow<'c, str> {
+        if !self.color {
+            return Cow::Borrowed(candidate);
+        }
+        // Color the command in cyan and the trailing description dim.
+        if let Some(index) = candidate.find(CANDIDATE_SEP) {
+            let (command, rest) = candidate.split_at(index);
+            Cow::Owned(format!("\x1b[1;36m{command}\x1b[0m\x1b[2m{rest}\x1b[0m"))
+        } else {
+            Cow::Owned(format!("\x1b[1;36m{candidate}\x1b[0m"))
+        }
     }
 }
 
@@ -210,6 +246,54 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
+/// Separator between a completion candidate and its description.
+const CANDIDATE_SEP: &str = "  —  ";
+
+fn starts_with_ci(candidate: &str, query: &str) -> bool {
+    candidate
+        .to_ascii_lowercase()
+        .starts_with(&query.to_ascii_lowercase())
+}
+
+/// Fuzzy score for a candidate against a query: a case-insensitive prefix wins
+/// (shorter candidates rank higher), then a subsequence match, else `None`.
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+    let cand = candidate.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    if cand.starts_with(&query) {
+        return Some(2000 - candidate.chars().count() as i64);
+    }
+    let mut chars = cand.chars().enumerate();
+    let mut first = None;
+    for needle in query.chars() {
+        match chars.by_ref().find(|(_, ch)| *ch == needle) {
+            Some((index, _)) => first.get_or_insert(index),
+            None => return None,
+        };
+    }
+    Some(1000 - first.unwrap_or(0) as i64)
+}
+
+/// The one-line summary for a completion candidate (by its base command name).
+fn describe_completion(candidate: &str) -> Option<&'static str> {
+    let base = candidate
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()?;
+    commands::slash_command_specs()
+        .iter()
+        .find(|spec| spec.name == base || spec.aliases.contains(&base))
+        .map(|spec| spec.summary)
+}
+
+/// Build the display string for a candidate: `"/cmd  —  description"`.
+fn format_candidate(candidate: &str) -> String {
+    match describe_completion(candidate) {
+        Some(description) => format!("{candidate}{CANDIDATE_SEP}{description}"),
+        None => candidate.to_string(),
+    }
+}
+
 fn normalize_completions(completions: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     completions
@@ -260,6 +344,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/help".to_string(), "/hello".to_string()]
         );
+    }
+
+    #[test]
+    fn fuzzy_matches_command_names_by_subsequence() {
+        let helper = SlashCommandHelper::new(vec![
+            "/model".to_string(),
+            "/models".to_string(),
+            "/status".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        // `/mdl` is a subsequence of `/model` and `/models`, not `/status`.
+        let (_, matches) = helper.complete("/mdl", 4, &ctx).expect("completion");
+        let replacements: Vec<_> = matches
+            .into_iter()
+            .map(|candidate| candidate.replacement)
+            .collect();
+        assert!(replacements.contains(&"/model".to_string()));
+        assert!(replacements.contains(&"/models".to_string()));
+        assert!(!replacements.contains(&"/status".to_string()));
     }
 
     #[test]

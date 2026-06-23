@@ -16,6 +16,7 @@
 )]
 mod init;
 mod input;
+mod models_cmd;
 mod render;
 mod setup_wizard;
 
@@ -1004,6 +1005,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
     seed_runtime_theme_from_config();
+    apply_saved_provider_env();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -2514,6 +2516,8 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
             | "init"
             | "prompt"
             | "export"
+            | "models"
+            | "providers"
     ) {
         return None;
     }
@@ -3135,6 +3139,57 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
+/// The "Cyber Dojo" startup splash: block `GI` (ANSI-Shadow) beside the kanji
+/// 技 (gi = "technique/skill"), a neon scanline, and a small-caps `harness`
+/// tagline. With `use_color`, each `GI` row gets an Outrun sunset gradient
+/// (magenta → violet → cyan); without it, plain monospace is returned.
+fn startup_logo(use_color: bool) -> String {
+    const GI: [&str; 6] = [
+        " ██████╗ ██╗",
+        "██╔════╝ ██║",
+        "██║  ███╗██║",
+        "██║   ██║██║",
+        "╚██████╔╝██║",
+        " ╚═════╝ ╚═╝",
+    ];
+    // Per-row Outrun gradient for the GI glyphs.
+    const GRADIENT: [(u8, u8, u8); 6] = [
+        (255, 78, 168),
+        (228, 84, 206),
+        (188, 96, 238),
+        (132, 118, 250),
+        (74, 178, 250),
+        (40, 216, 255),
+    ];
+    // Right-column accents, aligned row-for-row with the GI block.
+    const ACCENT: [&str; 6] = [
+        " 技",
+        "",
+        " the coding",
+        "      ʜᴀʀɴᴇss",
+        "",
+        "▂▂▂▂▂▂▂▂▂▂▂▂",
+    ];
+    let mut out = String::new();
+    for row in 0..GI.len() {
+        if use_color {
+            let (r, g, b) = GRADIENT[row];
+            let accent = match row {
+                0 => format!("\x1b[38;2;255;82;66m{}\x1b[0m", ACCENT[row]), // 技 vermilion
+                5 => format!("\x1b[38;2;96;104;124m{}\x1b[0m", ACCENT[row]), // scanline dim
+                _ => format!("\x1b[2m{}\x1b[0m", ACCENT[row]),
+            };
+            out.push_str(&format!(
+                "\x1b[38;2;{r};{g};{b}m{}\x1b[0m   \x1b[38;2;96;104;124m▏\x1b[0m{accent}\n",
+                GI[row]
+            ));
+        } else {
+            out.push_str(&format!("{}   ▏{}\n", GI[row], ACCENT[row]));
+        }
+    }
+    out
+}
+
 /// Canonical theme names the `/theme` command accepts and advertises.
 const AVAILABLE_THEMES: [&str; 2] = ["gi-dark", "gi-light"];
 
@@ -3149,6 +3204,60 @@ fn seed_runtime_theme_from_config() {
         if let Some(theme) = config.theme() {
             render::set_runtime_theme(theme);
         }
+    }
+}
+
+/// Apply a persisted `provider` config (written by `gi models` / setup) to this
+/// process's environment so the env-driven provider selection honors it. Only
+/// sets a variable when it is unset (explicit env always wins), and all changes
+/// are in-process — they never leak to the parent shell or other tools.
+fn apply_saved_provider_env() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let provider = config.provider();
+    let Some(kind) = provider.kind() else {
+        return;
+    };
+    let set_if_unset = |key: &str, value: Option<&str>| {
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            if env::var_os(key).is_none() {
+                env::set_var(key, value);
+            }
+        }
+    };
+    match kind {
+        "ollama" => {
+            if let Some(base) = provider.base_url() {
+                let host = base
+                    .trim_end_matches('/')
+                    .trim_end_matches("/v1")
+                    .trim_end_matches('/');
+                set_if_unset("OLLAMA_HOST", Some(host));
+            }
+        }
+        // OpenAI-compatible brands (incl. Sakana/Kimi/GLM) route through the
+        // generic OpenAI-compatible client via OPENAI_BASE_URL/OPENAI_API_KEY.
+        "openai" | "sakana" | "kimi" | "glm" => {
+            set_if_unset("OPENAI_BASE_URL", provider.base_url());
+            set_if_unset("OPENAI_API_KEY", provider.api_key());
+        }
+        "xai" => {
+            set_if_unset("XAI_BASE_URL", provider.base_url());
+            set_if_unset("XAI_API_KEY", provider.api_key());
+        }
+        "dashscope" => {
+            set_if_unset("DASHSCOPE_BASE_URL", provider.base_url());
+            set_if_unset("DASHSCOPE_API_KEY", provider.api_key());
+        }
+        "anthropic" => {
+            set_if_unset("ANTHROPIC_BASE_URL", provider.base_url());
+            set_if_unset("ANTHROPIC_API_KEY", provider.api_key());
+        }
+        _ => {}
     }
 }
 
@@ -7056,6 +7165,7 @@ fn run_resume_command(
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Models
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -7221,6 +7331,13 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
+    // First run with no configured provider: scan + offer a model before prompting.
+    if models_cmd::is_first_run() && io::stdin().is_terminal() {
+        println!("Welcome to Gi — no model provider is configured yet. Let's pick one:\n");
+        let _ = models_cmd::run_models_command(CliOutputFormat::Text, true);
+        apply_saved_provider_env();
+        println!();
+    }
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
@@ -7955,14 +8072,8 @@ impl LiveCli {
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
         );
-        format!(
-            "\x1b[38;5;196m\
- ██████╗██╗      █████╗ ██╗    ██╗\n\
-██╔════╝██║     ██╔══██╗██║    ██║\n\
-██║     ██║     ███████║██║ █╗ ██║\n\
-██║     ██║     ██╔══██║██║███╗██║\n\
-╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
- ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+        let banner = format!(
+            "{}\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
@@ -7971,6 +8082,7 @@ impl LiveCli {
   \x1b[2mSession\x1b[0m          {}\n\
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+            startup_logo(true),
             self.model,
             self.permission_mode.as_str(),
             git_branch,
@@ -7978,7 +8090,12 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
-        )
+        );
+        if env::var_os("NO_COLOR").is_some() {
+            render::strip_ansi(&banner)
+        } else {
+            banner
+        }
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -8025,7 +8142,7 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            "🥋 Thinking...",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -8383,6 +8500,10 @@ impl LiveCli {
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
+            SlashCommand::Models => {
+                models_cmd::run_models_command(CliOutputFormat::Text, true)?;
+                false
+            }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
@@ -9764,7 +9885,7 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
 }
 
 fn render_repl_help() -> String {
-    [
+    let body = [
         "REPL".to_string(),
         "  /exit                Quit the REPL".to_string(),
         "  /quit                Quit the REPL".to_string(),
@@ -9784,7 +9905,39 @@ fn render_repl_help() -> String {
     .join(
         "
 ",
-    )
+    );
+    colorize_command_help(&body)
+}
+
+/// Add crush/opencode-style highlighting to a command listing: command tokens in
+/// cyan, descriptions dim, and section headers bold. No-op when `NO_COLOR` is set
+/// or stdout is not a TTY, so piped/JSON output stays plain.
+fn colorize_command_help(text: &str) -> String {
+    if env::var_os("NO_COLOR").is_some() || !io::stdout().is_terminal() {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent_len = line.len() - trimmed.len();
+            if trimmed.starts_with('/') {
+                let indent = &line[..indent_len];
+                match trimmed.split_once(char::is_whitespace) {
+                    Some((command, _)) => {
+                        let rest = &trimmed[command.len()..];
+                        format!("{indent}\x1b[1;36m{command}\x1b[0m\x1b[2m{rest}\x1b[0m")
+                    }
+                    None => format!("{indent}\x1b[1;36m{trimmed}\x1b[0m"),
+                }
+            } else if indent_len == 0 && !trimmed.is_empty() {
+                // Section header (e.g. "Session", "Interactive slash commands:").
+                format!("\x1b[1m{line}\x1b[0m")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn print_status_snapshot(
@@ -10601,54 +10754,9 @@ fn print_models(
         .into());
     }
 
-    let configured_model = config_model_for_current_dir();
-    let resolved_config_model = configured_model
-        .as_deref()
-        .map(resolve_model_alias_with_config);
-
-    match output_format {
-        CliOutputFormat::Text => {
-            println!("Models");
-            println!("  Default          {DEFAULT_MODEL}");
-            println!("  Built-in aliases opus, sonnet, haiku");
-            if let Some(raw) = configured_model.as_deref() {
-                println!(
-                    "  Config model     {raw}{}",
-                    resolved_config_model
-                        .as_deref()
-                        .filter(|resolved| *resolved != raw)
-                        .map(|resolved| format!(" -> {resolved}"))
-                        .unwrap_or_default()
-                );
-            } else {
-                println!("  Config model     <unset>");
-            }
-            println!("  Usage            gi --model <provider/model> prompt <text>");
-        }
-        CliOutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "kind": "models",
-                    "action": "list",
-                    "status": "ok",
-                    "default_model": DEFAULT_MODEL,
-                    "aliases": [
-                        {"name": "opus", "model": resolve_model_alias("opus")},
-                        {"name": "sonnet", "model": resolve_model_alias("sonnet")},
-                        {"name": "haiku", "model": resolve_model_alias("haiku")}
-                    ],
-                    "configured_model": configured_model,
-                    "resolved_configured_model": resolved_config_model,
-                    "local_only": true,
-                    "requires_credentials": false,
-                    "requires_provider_request": false,
-                    "message": "Use --model <provider/model> or configure a model in gi settings."
-                }))?
-            );
-        }
-    }
-    Ok(())
+    // Scan the environment for configured providers and offer their models
+    // (live-queried where possible), persisting an interactive pick.
+    models_cmd::run_models_command(output_format, true)
 }
 
 fn render_export_help_json() -> serde_json::Value {
@@ -11846,7 +11954,7 @@ fn render_version_report() -> String {
     let branch = GIT_BRANCH.unwrap_or("unknown");
     let dirty = GIT_DIRTY.unwrap_or("unknown");
     format!(
-        "Gi Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Branch           {branch}\n  Dirty            {dirty}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Gi · the coding harness\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Branch           {branch}\n  Dirty            {dirty}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -19662,6 +19770,22 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn startup_logo_shows_gi_brand_not_claw() {
+        let plain = super::startup_logo(false);
+        assert!(plain.contains("██"), "logo should render block GI: {plain}");
+        assert!(plain.contains('技'), "logo should include the kanji accent");
+        assert!(
+            plain.contains("ʜᴀʀɴᴇss"),
+            "logo should include the harness tagline"
+        );
+        assert!(!plain.contains("CLAW") && !plain.contains('🦞'));
+        // No-color logo must carry no ANSI escapes.
+        assert!(!plain.contains('\u{1b}'));
+        // Colored logo applies a truecolor gradient.
+        assert!(super::startup_logo(true).contains("\u{1b}[38;2;"));
     }
 
     #[test]

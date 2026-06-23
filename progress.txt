@@ -495,3 +495,42 @@ interactive_required result. Added libc->nix(poll) dep to gi-cli. Plan doc Slice
 + Slice 2 stdin box ticked.
 
 Verification: fmt clean; gi-cli ask_user unit tests + mock_parity_harness green.
+
+Iteration 2026-06-23 - Brand polish + provider/model discovery + richer command UX
+-----------------------------------------------------------------------------------
+Post-dogfood slice (binary at ~/.local/bin/gi).
+
+Part A - Branding:
+- Spinner 🦀 -> 🥋 (martial-arts gi); startup splash rewritten from the old CLAW
+  block art + 🦞 to the "Cyber Dojo" logo: block GI (ANSI-Shadow) + kanji 技 + neon
+  scanline + small-caps ʜᴀʀɴᴇss, with a truecolor Outrun gradient (startup_logo(),
+  NO_COLOR-safe). Version header "Gi Code" -> "Gi · the coding harness".
+
+Part B - Provider/model discovery:
+- crates/api/src/providers/discovery.rs: detect_available_providers() +
+  fetch_ollama_models(/api/tags) + fetch_openai_compat_models(/v1/models), static
+  fallback. Providers: anthropic, openai, xai, dashscope, SAKANA, KIMI(Moonshot),
+  GLM(Zhipu), ollama (Sakana/Kimi/GLM added per user request; OpenAI-compatible).
+- crates/gi-cli/src/models_cmd.rs: discover -> live-query -> list/pick -> persist
+  flow. `gi models` (upgraded print_models), `/models` REPL command, and first-run
+  auto-run when no provider is configured. Non-TTY prints suggestions; --output-format
+  json emits {providers:[{kind,label,base_url,credentialed,models_source,models}]}.
+- apply_saved_provider_env(): applies a persisted provider section to this process's
+  env at startup (in-process only) so detect_provider_kind honors it; Sakana/Kimi/GLM
+  route via the generic OPENAI_BASE_URL/OPENAI_API_KEY path.
+
+Part C - Command UX (enhanced rustyline):
+- input.rs: hybrid completer - fuzzy (subsequence) for bare command names
+  (/mdl -> /model), strict prefix for arguments; Pair.display carries the command
+  summary; highlight_candidate colors command cyan + description dim.
+- render_repl_help colorized via colorize_command_help() (TTY/NO_COLOR-gated):
+  command tokens cyan, descriptions dim, section headers bold.
+
+Tests: discovery (8 providers + tags/models JSON parse), fuzzy completer, startup
+logo (GI/技/harness, NO_COLOR-clean, gradient). Updated: command count 140->141,
+models contract (requires_provider_request stays false), bare `gi models` excluded
+from the slash-command interactive_only guard, version-header assertion.
+
+Verification: fmt/build/clippy(CI) clean; cargo test --workspace fails only on the
+known pre-existing/flaky cases (sandbox #831, pwsh stub, repl python, plugin
+discovery - all pass in isolation).

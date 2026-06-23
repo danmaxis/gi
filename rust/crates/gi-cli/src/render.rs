@@ -1131,7 +1131,7 @@ fn visible_width(input: &str) -> usize {
     strip_ansi(input).chars().count()
 }
 
-fn strip_ansi(input: &str) -> String {
+pub(crate) fn strip_ansi(input: &str) -> String {
     let mut output = String::new();
     let mut chars = input.chars().peekable();
 

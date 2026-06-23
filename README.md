@@ -26,6 +26,9 @@ prefix.
 - **`SKILL.md` extensions** — optional `version`, `tags`, `required_tools`,
   `provider_hints`, and `references` frontmatter, with missing-reference
   diagnostics surfaced in `gi skills list --output-format json`.
+- **Provider/model discovery** — `gi models` (and a first-run prompt) scans your
+  environment for configured providers (Anthropic, OpenAI, xAI, DashScope, Sakana,
+  Kimi, GLM, Ollama), live-queries their model lists, and persists your pick.
 - **Operating principles** baked into the system prompt: compare approaches, prefer
   the smallest verifiable change, stay provider-agnostic, and keep risky actions
   behind explicit approval.

@@ -281,9 +281,8 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-// TODO(owner): set these to the real Gi repository before release.
-const OFFICIAL_REPO_URL: &str = "https://github.com/owner/gi";
-const OFFICIAL_REPO_SLUG: &str = "owner/gi";
+const OFFICIAL_REPO_URL: &str = "https://github.com/danmaxis/gi";
+const OFFICIAL_REPO_SLUG: &str = "danmaxis/gi";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install gi";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
@@ -18036,7 +18035,7 @@ mod tests {
         assert!(help.contains("gi mcp"));
         assert!(help.contains("gi skills"));
         assert!(help.contains("gi /skills"));
-        assert!(help.contains("owner/gi"));
+        assert!(help.contains("danmaxis/gi"));
         assert!(help.contains("cargo install gi"));
         assert!(!help.contains("gi login"));
         assert!(!help.contains("gi logout"));

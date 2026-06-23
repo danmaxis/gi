@@ -1517,7 +1517,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .expect("install source check");
     assert_eq!(
         install_source["official_repo"],
-        "https://github.com/owner/gi"
+        "https://github.com/danmaxis/gi"
     );
     assert_eq!(install_source["deprecated_install"], "cargo install gi");
 

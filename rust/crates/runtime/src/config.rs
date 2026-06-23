@@ -880,6 +880,15 @@ impl RuntimeConfig {
         self.feature_config.model.as_deref()
     }
 
+    /// The persisted terminal theme name, if any (top-level `"theme"` key).
+    ///
+    /// This is the configured default; the `SAKANA_GI_THEME` environment
+    /// variable still overrides it at render time.
+    #[must_use]
+    pub fn theme(&self) -> Option<&str> {
+        self.merged.get("theme").and_then(JsonValue::as_str)
+    }
+
     #[must_use]
     pub fn aliases(&self) -> &BTreeMap<String, String> {
         &self.feature_config.aliases
@@ -1160,6 +1169,23 @@ pub fn save_user_provider_settings(
     }
 
     Ok(())
+}
+
+/// Persist the selected terminal theme to the user-level
+/// `~/.claw/settings.json` under the top-level `"theme"` key, preserving other
+/// settings. Unlike provider settings this holds no secret, so the default file
+/// mode is left untouched.
+pub fn save_user_theme(theme: &str) -> Result<(), ConfigError> {
+    let config_home = default_config_home();
+    fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
+    let settings_path = config_home.join("settings.json");
+
+    let mut root = read_settings_root(&settings_path);
+    root.insert(
+        "theme".to_string(),
+        serde_json::Value::String(theme.to_string()),
+    );
+    write_settings_root(&settings_path, &root)
 }
 
 /// Remove the `provider` section from the user-level `~/.claw/settings.json`.
@@ -2626,6 +2652,57 @@ mod tests {
         assert!(error
             .to_string()
             .contains("top-level settings value must be a JSON object"));
+
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn surfaces_persisted_theme_without_unknown_key_warning() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"model":"sonnet","theme":"sakana-light"}"#,
+        )
+        .expect("write settings");
+
+        let (loaded, warnings) = ConfigLoader::new(&cwd, &home)
+            .load_collecting_warnings()
+            .expect("config should load");
+        assert_eq!(loaded.theme(), Some("sakana-light"));
+        assert_eq!(loaded.model(), Some("sonnet"));
+        assert!(
+            !warnings.iter().any(|w| w.contains("theme")),
+            "theme is a known key and must not warn, got: {warnings:?}"
+        );
+
+        if root.exists() {
+            fs::remove_dir_all(root).expect("cleanup temp dir");
+        }
+    }
+
+    #[test]
+    fn save_user_theme_persists_and_preserves_other_keys() {
+        let root = temp_dir();
+        let config_home = root.join(".claw");
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::write(config_home.join("settings.json"), r#"{"model":"opus"}"#).expect("seed settings");
+
+        // `save_user_theme` resolves the config home via CLAW_CONFIG_HOME; this is
+        // the only test that touches that variable, so there is no cross-test race.
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        super::save_user_theme("sakana-dark").expect("persist theme");
+        std::env::remove_var("CLAW_CONFIG_HOME");
+
+        let written = fs::read_to_string(config_home.join("settings.json")).expect("read back");
+        let value: serde_json::Value = serde_json::from_str(&written).expect("valid json");
+        assert_eq!(value["theme"], "sakana-dark");
+        assert_eq!(value["model"], "opus", "existing keys must be preserved");
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");

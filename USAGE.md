@@ -221,6 +221,32 @@ Model aliases currently supported by the CLI:
 - `sonnet` → `claude-sonnet-4-6`
 - `haiku` → `claude-haiku-4-5-20251213`
 
+## Terminal themes
+
+Sakana-GI ships two expressive terminal palettes, `sakana-dark` and `sakana-light`.
+
+Select a theme for a single run with the `SAKANA_GI_THEME` environment variable:
+
+```bash
+cd rust
+SAKANA_GI_THEME=sakana-dark ./target/debug/claw "explain this module"
+SAKANA_GI_THEME=sakana-light ./target/debug/claw "explain this module"
+```
+
+Persist a default across runs from inside the interactive REPL:
+
+```text
+/theme              # show the effective theme, its source, and available names
+/theme sakana-light # switch live and save to ~/.claw/settings.json ("theme" key)
+```
+
+Precedence is `SAKANA_GI_THEME` (highest) → the persisted `theme` setting → the
+built-in default. Because the env var always wins, scripted and CI runs stay
+deterministic; when it is set, `/theme` still saves your choice but warns that
+the env var is currently pinning the rendered theme. The effective theme and its
+source are reported by `claw status --output-format json` (under `theme`) and by
+`claw doctor`. JSON and non-TTY output never emit ANSI theme color codes.
+
 ## Authentication
 
 ### API key

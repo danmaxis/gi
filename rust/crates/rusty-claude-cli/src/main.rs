@@ -1003,6 +1003,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
+    seed_runtime_theme_from_config();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -1130,6 +1131,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        CliAction::Theme {
+            name,
+            output_format,
+        } => {
+            let result = run_theme_command(name.as_deref());
+            match output_format {
+                CliOutputFormat::Text => println!("{}", result.message),
+                CliOutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&result.json)?);
+                }
+            }
+        }
         CliAction::Export {
             session_reference,
             output_path,
@@ -1254,6 +1267,10 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Diff {
+        output_format: CliOutputFormat,
+    },
+    Theme {
+        name: Option<String>,
         output_format: CliOutputFormat,
     },
     Export {
@@ -2595,6 +2612,10 @@ fn parse_direct_slash_cli_action(
         }),
         Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
         Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
+        Ok(Some(SlashCommand::Theme { name })) => Ok(CliAction::Theme {
+            name,
+            output_format,
+        }),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
         Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor {
             output_format,
@@ -3112,6 +3133,109 @@ fn config_model_for_current_dir() -> Option<String> {
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     loader.load().ok()?.model().map(ToOwned::to_owned)
+}
+
+/// Canonical theme names the `/theme` command accepts and advertises.
+const AVAILABLE_THEMES: [&str; 2] = ["sakana-dark", "sakana-light"];
+
+/// Seed the process-wide runtime theme slot from persisted user/project config
+/// so the configured default applies to all rendering. `SAKANA_GI_THEME` still
+/// overrides it at render time, and an invalid persisted value is ignored.
+fn seed_runtime_theme_from_config() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    if let Ok(config) = ConfigLoader::default_for(&cwd).load() {
+        if let Some(theme) = config.theme() {
+            render::set_runtime_theme(theme);
+        }
+    }
+}
+
+/// Outcome of a `/theme` invocation, usable from both the interactive REPL and
+/// the resume-safe command path.
+struct ThemeCommandResult {
+    message: String,
+    json: serde_json::Value,
+}
+
+/// Shared `/theme` logic: with no argument it reports the effective theme; with
+/// a valid name it updates the process-wide runtime theme and persists it to
+/// the user-level settings. `SAKANA_GI_THEME` still overrides the rendered
+/// theme, so a warning is surfaced when it is set.
+fn run_theme_command(name: Option<&str>) -> ThemeCommandResult {
+    let env_pinned = env::var("SAKANA_GI_THEME")
+        .ok()
+        .filter(|value| render::canonical_theme_name(value).is_some());
+
+    let Some(requested) = name else {
+        let (current, source) = render::effective_theme();
+        let message = format!(
+            "Theme\n  Current        {current} ({})\n  Available      {}",
+            source.as_str(),
+            AVAILABLE_THEMES.join(", ")
+        );
+        return ThemeCommandResult {
+            message,
+            json: serde_json::json!({
+                "kind": "theme",
+                "action": "show",
+                "status": "ok",
+                "current": current,
+                "source": source.as_str(),
+                "available": AVAILABLE_THEMES,
+            }),
+        };
+    };
+
+    let Some(canonical) = render::canonical_theme_name(requested) else {
+        let message = format!(
+            "Unknown theme '{requested}'. Available themes: {}.",
+            AVAILABLE_THEMES.join(", ")
+        );
+        return ThemeCommandResult {
+            message,
+            json: serde_json::json!({
+                "kind": "theme",
+                "action": "set",
+                "status": "error",
+                "requested": requested,
+                "available": AVAILABLE_THEMES,
+                "error": "unknown_theme",
+            }),
+        };
+    };
+
+    render::set_runtime_theme(canonical);
+    let persist_error = runtime::save_user_theme(canonical)
+        .err()
+        .map(|error| error.to_string());
+
+    let settings_path = runtime::default_config_home().join("settings.json");
+    let mut message = format!("Theme set to {canonical}.");
+    match &persist_error {
+        None => message.push_str(&format!(" Saved to {}.", settings_path.display())),
+        Some(error) => message.push_str(&format!(" (could not persist: {error})")),
+    }
+    if let Some(env_value) = &env_pinned {
+        message.push_str(&format!(
+            "\n  Note           SAKANA_GI_THEME={env_value} is set and overrides the rendered theme until unset."
+        ));
+    }
+
+    ThemeCommandResult {
+        message,
+        json: serde_json::json!({
+            "kind": "theme",
+            "action": "set",
+            "status": if persist_error.is_some() { "degraded" } else { "ok" },
+            "selected": canonical,
+            "persisted": persist_error.is_none(),
+            "persist_error": persist_error,
+            "env_override": env_pinned,
+            "available": AVAILABLE_THEMES,
+        }),
+    }
 }
 
 fn resolve_repl_model(cli_model: String) -> Result<String, String> {
@@ -3637,6 +3761,39 @@ fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
     lines.join("\n")
 }
 
+fn check_theme_health(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let (name, source) = render::effective_theme();
+    let persisted = config.and_then(runtime::RuntimeConfig::theme);
+    let env_pinned = env::var("SAKANA_GI_THEME")
+        .ok()
+        .filter(|value| render::canonical_theme_name(value).is_some());
+
+    let mut details = vec![
+        format!("Effective        {name} ({})", source.as_str()),
+        format!("Persisted        {}", persisted.unwrap_or("<unset>")),
+        format!("Available        {}", AVAILABLE_THEMES.join(", ")),
+    ];
+    if let Some(env_value) = &env_pinned {
+        details.push(format!(
+            "Env override     SAKANA_GI_THEME={env_value} (overrides persisted theme)"
+        ));
+    }
+
+    DiagnosticCheck::new(
+        "Theme",
+        DiagnosticLevel::Ok,
+        format!("terminal theme {name} (source: {})", source.as_str()),
+    )
+    .with_details(details)
+    .with_data(Map::from_iter([
+        ("effective".to_string(), json!(name)),
+        ("source".to_string(), json!(source.as_str())),
+        ("persisted".to_string(), json!(persisted)),
+        ("env_override".to_string(), json!(env_pinned)),
+        ("available".to_string(), json!(AVAILABLE_THEMES)),
+    ]))
+}
+
 fn render_doctor_report(
     config_warning_mode: ConfigWarningMode,
     permission_mode: PermissionModeProvenance,
@@ -3721,6 +3878,7 @@ fn render_doctor_report(
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
+            check_theme_health(config.as_ref().ok()),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
     })
@@ -6880,6 +7038,15 @@ fn run_resume_command(
                 })),
             })
         }
+        // #US: /theme is resume-safe — reports or persists the terminal theme.
+        SlashCommand::Theme { name } => {
+            let result = run_theme_command(name.as_deref());
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(result.message),
+                json: Some(result.json),
+            })
+        }
         SlashCommand::Bughunter { .. }
         | SlashCommand::Commit { .. }
         | SlashCommand::Pr { .. }
@@ -6911,7 +7078,6 @@ fn run_resume_command(
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
-        | SlashCommand::Theme { .. }
         | SlashCommand::Voice { .. }
         | SlashCommand::Usage { .. }
         | SlashCommand::Rename { .. }
@@ -7256,6 +7422,30 @@ struct McpToolRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct AskUserRequest {
+    question: String,
+    choices: Option<Vec<AskUserChoice>>,
+    #[serde(default)]
+    allow_free_text: bool,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskUserChoice {
+    id: String,
+    label: String,
+    description: Option<String>,
+    #[serde(default)]
+    recommended: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AskUserAnswer {
+    answer: String,
+    choice_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ListMcpResourcesRequest {
     server: Option<String>,
 }
@@ -7464,15 +7654,19 @@ impl RuntimeMcpState {
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
+    let local_runtime_tools = local_runtime_tool_definitions();
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
-        return Ok((None, Vec::new()));
+        return Ok((None, local_runtime_tools));
     };
 
-    let mut runtime_tools = discovery
-        .tools
-        .iter()
-        .map(mcp_runtime_tool_definition)
-        .collect::<Vec<_>>();
+    let mut runtime_tools = local_runtime_tools;
+    runtime_tools.extend(
+        discovery
+            .tools
+            .iter()
+            .map(mcp_runtime_tool_definition)
+            .collect::<Vec<_>>(),
+    );
     if !mcp_state.server_names().is_empty() {
         runtime_tools.extend(mcp_wrapper_tool_definitions());
     }
@@ -7546,6 +7740,41 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
             required_permission: PermissionMode::ReadOnly,
         },
     ]
+}
+
+fn local_runtime_tool_definitions() -> Vec<RuntimeToolDefinition> {
+    vec![RuntimeToolDefinition {
+        name: "ask_user".to_string(),
+        description: Some(
+            "Ask the user a concrete interactive question when their preference or approval is required to continue. Use choices for mutually exclusive options and allow_free_text when a short custom answer is acceptable."
+                .to_string(),
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "choices": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "description": { "type": "string" },
+                            "recommended": { "type": "boolean" }
+                        },
+                        "required": ["id", "label"],
+                        "additionalProperties": false
+                    }
+                },
+                "allow_free_text": { "type": "boolean" },
+                "timeout_ms": { "type": "integer", "minimum": 1000 }
+            },
+            "required": ["question"],
+            "additionalProperties": false
+        }),
+        required_permission: PermissionMode::ReadOnly,
+    }]
 }
 
 fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
@@ -8203,6 +8432,12 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Theme { name } => {
+                // The runtime theme slot is process-global, so updating it here
+                // takes effect for every subsequent `TerminalRenderer::new()`.
+                println!("{}", run_theme_command(name.as_deref()).message);
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -8226,7 +8461,6 @@ impl LiveCli {
             | SlashCommand::Plan { .. }
             | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
-            | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
@@ -9606,6 +9840,7 @@ fn status_json_value(
     let model_env_var = provenance.and_then(|p| p.env_var.clone());
     let permission_mode_source = permission_provenance.map(|p| p.source.as_str());
     let permission_mode_env_var = permission_provenance.and_then(|p| p.env_var);
+    let (theme_name, theme_source) = render::effective_theme();
     let tool_registry = GlobalToolRegistry::builtin();
     let available_tool_names = tool_registry.canonical_allowed_tool_names();
     let tool_aliases = allowed_tool_aliases_json(&tool_registry);
@@ -9633,6 +9868,10 @@ fn status_json_value(
         "permission_mode": permission_mode,
         "permission_mode_source": permission_mode_source,
         "permission_mode_env_var": permission_mode_env_var,
+        "theme": {
+            "name": theme_name,
+            "source": theme_source.as_str(),
+        },
         "allowed_tools": {
             "source": if allowed_tools.is_some() { "flag" } else { "default" },
             "restricted": allowed_tools.is_some(),
@@ -9889,11 +10128,14 @@ fn format_status_report(
             format!("\n  Permission source {}{env_suffix}", p.source.as_str())
         })
         .unwrap_or_default();
+    let (theme_name, theme_source) = render::effective_theme();
+    let theme_source = theme_source.as_str();
     blocks.extend([
         format!(
             "{status_line}
   Model            {model}{model_source_line}
   Permission mode  {permission_mode}{permission_source_line}
+  Theme            {theme_name} ({theme_source})
   Messages         {}
   Turns            {}
   Estimated tokens {}",
@@ -10428,7 +10670,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "system"],
+        "check_names": ["auth", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "theme", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -13902,6 +14144,10 @@ impl CliToolExecutor {
         tool_name: &str,
         value: serde_json::Value,
     ) -> Result<String, ToolError> {
+        if tool_name == "ask_user" {
+            return self.execute_ask_user(value);
+        }
+
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
                 "runtime tool `{tool_name}` is unavailable without configured MCP servers"
@@ -13936,6 +14182,96 @@ impl CliToolExecutor {
             }
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
+    }
+
+    fn execute_ask_user(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        let input: AskUserRequest = serde_json::from_value(value)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let question = input.question.trim();
+        if question.is_empty() {
+            return Err(ToolError::new("ask_user requires a non-empty question"));
+        }
+
+        let choices = input.choices.unwrap_or_default();
+        let recommended = choices
+            .iter()
+            .position(|choice| choice.recommended)
+            .or_else(|| (!choices.is_empty()).then_some(0));
+
+        println!();
+        println!("Question");
+        println!("  {question}");
+        if let Some(timeout_ms) = input.timeout_ms {
+            println!("  Timeout requested: {timeout_ms}ms");
+        }
+        for (index, choice) in choices.iter().enumerate() {
+            let marker = if Some(index) == recommended {
+                " (default)"
+            } else {
+                ""
+            };
+            println!("  {}. {}{}", index + 1, choice.label, marker);
+            if let Some(description) = choice
+                .description
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                println!("     {description}");
+            }
+        }
+        if input.allow_free_text {
+            println!("  You may also type a short custom answer.");
+        }
+        print!("Answer: ");
+        let _ = io::stdout().flush();
+
+        let mut response = String::new();
+        io::stdin()
+            .read_line(&mut response)
+            .map_err(|error| ToolError::new(format!("failed to read user answer: {error}")))?;
+        let answer = response.trim();
+
+        match resolve_ask_user_answer(answer, &choices, recommended, input.allow_free_text) {
+            Ok(resolved) => serde_json::to_string_pretty(&json!({
+                "answer": resolved.answer,
+                "choice_id": resolved.choice_id,
+                "timed_out": false,
+            }))
+            .map_err(|error| ToolError::new(error.to_string())),
+            Err(error) => Err(ToolError::new(error)),
+        }
+    }
+}
+
+fn resolve_ask_user_answer(
+    answer: &str,
+    choices: &[AskUserChoice],
+    recommended: Option<usize>,
+    allow_free_text: bool,
+) -> Result<AskUserAnswer, String> {
+    let answer = answer.trim();
+    let selected = if answer.is_empty() {
+        recommended.and_then(|index| choices.get(index))
+    } else if let Ok(index) = answer.parse::<usize>() {
+        index.checked_sub(1).and_then(|index| choices.get(index))
+    } else {
+        choices
+            .iter()
+            .find(|choice| choice.id == answer || choice.label.eq_ignore_ascii_case(answer))
+    };
+
+    if let Some(choice) = selected {
+        Ok(AskUserAnswer {
+            answer: choice.label.clone(),
+            choice_id: Some(choice.id.clone()),
+        })
+    } else if allow_free_text {
+        Ok(AskUserAnswer {
+            answer: answer.to_string(),
+            choice_id: None,
+        })
+    } else {
+        Err("answer did not match an available choice and free text is disabled".to_string())
     }
 }
 
@@ -14276,17 +14612,18 @@ mod tests {
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
+        local_runtime_tool_definitions, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_ask_user_answer, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt,
+        validate_no_args, write_mcp_server_fixture, AskUserAnswer, AskUserChoice, CliAction,
         CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
         PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
@@ -19167,6 +19504,98 @@ UU conflicted.rs",
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(source_root);
+    }
+
+    #[test]
+    fn local_runtime_tools_include_ask_user() {
+        let tools = local_runtime_tool_definitions();
+        let ask_user = tools
+            .iter()
+            .find(|tool| tool.name == "ask_user")
+            .expect("ask_user runtime tool should be registered");
+
+        assert_eq!(ask_user.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(
+            ask_user.input_schema["required"][0].as_str(),
+            Some("question")
+        );
+        assert!(ask_user
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("interactive question")));
+    }
+
+    fn ask_user_choices() -> Vec<AskUserChoice> {
+        vec![
+            AskUserChoice {
+                id: "minimal".to_string(),
+                label: "Minimal".to_string(),
+                description: None,
+                recommended: true,
+            },
+            AskUserChoice {
+                id: "complete".to_string(),
+                label: "Complete".to_string(),
+                description: Some("Broader implementation".to_string()),
+                recommended: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn ask_user_answer_resolution_supports_default_choice() {
+        let resolved = resolve_ask_user_answer("", &ask_user_choices(), Some(0), false)
+            .expect("default should resolve");
+
+        assert_eq!(
+            resolved,
+            AskUserAnswer {
+                answer: "Minimal".to_string(),
+                choice_id: Some("minimal".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn ask_user_answer_resolution_supports_number_id_label_and_free_text() {
+        let choices = ask_user_choices();
+
+        assert_eq!(
+            resolve_ask_user_answer("2", &choices, Some(0), false)
+                .expect("numeric choice should resolve")
+                .choice_id
+                .as_deref(),
+            Some("complete")
+        );
+        assert_eq!(
+            resolve_ask_user_answer("complete", &choices, Some(0), false)
+                .expect("id should resolve")
+                .answer,
+            "Complete"
+        );
+        assert_eq!(
+            resolve_ask_user_answer("minimal", &choices, Some(0), false)
+                .expect("case-insensitive label should resolve")
+                .choice_id
+                .as_deref(),
+            Some("minimal")
+        );
+        assert_eq!(
+            resolve_ask_user_answer("custom", &choices, Some(0), true)
+                .expect("free text should resolve"),
+            AskUserAnswer {
+                answer: "custom".to_string(),
+                choice_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ask_user_answer_resolution_rejects_invalid_choice_without_free_text() {
+        let error = resolve_ask_user_answer("unknown", &ask_user_choices(), Some(0), false)
+            .expect_err("invalid answer should fail");
+
+        assert!(error.contains("free text is disabled"));
     }
 
     #[test]

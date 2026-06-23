@@ -331,6 +331,102 @@ fn write_session(root: &Path, label: &str) -> PathBuf {
     session_path
 }
 
+#[test]
+fn status_json_reports_persisted_theme_without_ansi() {
+    // given a user config that persists a theme
+    let temp_dir = unique_temp_dir("status-theme-config");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"theme":"sakana-light"}"#,
+    )
+    .expect("write user settings");
+
+    // when status is requested as JSON without the env override
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env_remove("SAKANA_GI_THEME")
+        .args(["--output-format", "json", "status"])
+        .output()
+        .expect("claw should launch");
+
+    // then the theme is reported from config and the JSON carries no ANSI escapes
+    assert_success(&output);
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "status JSON must not contain ANSI escape bytes"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("status json");
+    assert_eq!(parsed["theme"]["name"], "sakana-light");
+    assert_eq!(parsed["theme"]["source"], "config");
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn status_json_theme_env_overrides_persisted_config() {
+    // given a persisted theme that the env var should override
+    let temp_dir = unique_temp_dir("status-theme-env");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::write(
+        config_home.join("settings.json"),
+        r#"{"theme":"sakana-light"}"#,
+    )
+    .expect("write user settings");
+
+    // when SAKANA_GI_THEME is set
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env("SAKANA_GI_THEME", "sakana-dark")
+        .args(["--output-format", "json", "status"])
+        .output()
+        .expect("claw should launch");
+
+    // then the env var wins and the source is reported as env
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("status json");
+    assert_eq!(parsed["theme"]["name"], "sakana-dark");
+    assert_eq!(parsed["theme"]["source"], "env");
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
+fn direct_theme_command_persists_selection_and_emits_json() {
+    // given an isolated user config home
+    let temp_dir = unique_temp_dir("direct-theme");
+    let config_home = temp_dir.join("home").join(".claw");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+
+    // when `/theme <name>` is run directly (no REPL, no --resume)
+    let output = command_in(&temp_dir)
+        .env("CLAW_CONFIG_HOME", &config_home)
+        .env_remove("SAKANA_GI_THEME")
+        .args(["--output-format", "json", "/theme sakana-dark"])
+        .output()
+        .expect("claw should launch");
+
+    // then it routes to a local action, persists, and does not say interactive_only
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("theme json");
+    assert_eq!(parsed["kind"], "theme");
+    assert_eq!(parsed["status"], "ok");
+    assert_eq!(parsed["selected"], "sakana-dark");
+    assert_eq!(parsed["persisted"], true);
+    assert_ne!(parsed["error_kind"], "interactive_only");
+
+    let persisted = fs::read_to_string(config_home.join("settings.json")).expect("settings.json");
+    let value: serde_json::Value = serde_json::from_str(&persisted).expect("valid json");
+    assert_eq!(value["theme"], "sakana-dark");
+
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),

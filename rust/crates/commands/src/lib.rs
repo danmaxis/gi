@@ -2199,6 +2199,12 @@ struct SkillSummary {
     path: Option<PathBuf>,
     // #445: directory name for detecting name/dir mismatch
     dir_name: Option<String>,
+    // Sakana-GI SKILL.md extensions (optional, legacy-safe).
+    version: Option<String>,
+    tags: Vec<String>,
+    required_tools: Vec<String>,
+    provider_local_ok: Option<bool>,
+    references: Vec<String>,
 }
 
 /// A skill where the frontmatter name differs from the directory name.
@@ -2209,11 +2215,20 @@ pub(crate) struct SkillMetadataDrift {
     pub(crate) path: PathBuf,
 }
 
-/// Loaded skill definitions plus any metadata drift entries.
+/// A skill that references a file which is missing on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillReferenceDiagnostic {
+    pub(crate) skill_name: String,
+    pub(crate) reference: String,
+    pub(crate) path: PathBuf,
+}
+
+/// Loaded skill definitions plus any metadata drift and reference diagnostics.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SkillCollection {
     pub(crate) skills: Vec<SkillSummary>,
     pub(crate) metadata_drift: Vec<SkillMetadataDrift>,
+    pub(crate) reference_diagnostics: Vec<SkillReferenceDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2870,9 +2885,15 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 .into_iter()
                 .filter(|s| s.name.to_lowercase().contains(&filter))
                 .collect();
+            let filtered_reference_diagnostics = collection
+                .reference_diagnostics
+                .into_iter()
+                .filter(|d| filtered_skills.iter().any(|s| s.name == d.skill_name))
+                .collect();
             let filtered_collection = SkillCollection {
                 skills: filtered_skills,
                 metadata_drift: collection.metadata_drift,
+                reference_diagnostics: filtered_reference_diagnostics,
             };
             Ok(render_skills_report_json_with_action(
                 &filtered_collection,
@@ -2919,6 +2940,11 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
                 .into_iter()
                 .filter(|s| s.name.to_lowercase() == name)
                 .collect();
+            let matched_reference_diagnostics: Vec<_> = collection
+                .reference_diagnostics
+                .into_iter()
+                .filter(|d| matched.iter().any(|s| s.name == d.skill_name))
+                .collect();
             // #706: return typed error when named skill is not found instead of silent empty list
             if matched.is_empty() {
                 return Ok(json!({
@@ -2935,6 +2961,7 @@ pub fn handle_skills_slash_command_json(args: Option<&str>, cwd: &Path) -> std::
             let matched_collection = SkillCollection {
                 skills: matched,
                 metadata_drift: collection.metadata_drift,
+                reference_diagnostics: matched_reference_diagnostics,
             };
             Ok(render_skills_report_json_with_action(
                 &matched_collection,
@@ -4111,6 +4138,7 @@ fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSumma
 fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<SkillCollection> {
     let mut skills = Vec::new();
     let mut metadata_drift = Vec::new();
+    let mut reference_diagnostics = Vec::new();
     let mut active_sources = BTreeMap::<String, DefinitionSource>::new();
 
     for root in roots {
@@ -4128,9 +4156,9 @@ fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<Ski
                     }
                     let contents = fs::read_to_string(skill_path)?;
                     let dir_name = entry.file_name().to_string_lossy().to_string();
-                    let (name, description) = parse_skill_frontmatter(&contents);
+                    let frontmatter = parse_skill_frontmatter_full(&contents);
                     // #445: detect name/dir mismatch
-                    if let Some(ref frontmatter_name) = name {
+                    if let Some(ref frontmatter_name) = frontmatter.name {
                         if frontmatter_name != &dir_name {
                             metadata_drift.push(SkillMetadataDrift {
                                 dir_name: dir_name.clone(),
@@ -4139,14 +4167,27 @@ fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<Ski
                             });
                         }
                     }
+                    let effective_name =
+                        frontmatter.name.clone().unwrap_or_else(|| dir_name.clone());
+                    collect_missing_references(
+                        &effective_name,
+                        &entry.path(),
+                        &frontmatter.references,
+                        &mut reference_diagnostics,
+                    );
                     root_skills.push(SkillSummary {
-                        name: name.unwrap_or_else(|| dir_name.clone()),
-                        description,
+                        name: effective_name,
+                        description: frontmatter.description,
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
                         path: Some(entry.path()),
                         dir_name: Some(dir_name),
+                        version: frontmatter.version,
+                        tags: frontmatter.tags,
+                        required_tools: frontmatter.required_tools,
+                        provider_local_ok: frontmatter.provider_local_ok,
+                        references: frontmatter.references,
                     });
                 }
                 SkillOrigin::LegacyCommandsDir => {
@@ -4171,15 +4212,30 @@ fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<Ski
                         || entry.file_name().to_string_lossy().to_string(),
                         |stem| stem.to_string_lossy().to_string(),
                     );
-                    let (name, description) = parse_skill_frontmatter(&contents);
+                    let frontmatter = parse_skill_frontmatter_full(&contents);
+                    let effective_name = frontmatter.name.clone().unwrap_or(fallback_name);
+                    let base_dir = markdown_path
+                        .parent()
+                        .map_or_else(|| markdown_path.clone(), Path::to_path_buf);
+                    collect_missing_references(
+                        &effective_name,
+                        &base_dir,
+                        &frontmatter.references,
+                        &mut reference_diagnostics,
+                    );
                     root_skills.push(SkillSummary {
-                        name: name.unwrap_or(fallback_name),
-                        description,
+                        name: effective_name,
+                        description: frontmatter.description,
                         source: root.source,
                         shadowed_by: None,
                         origin: root.origin,
                         path: Some(markdown_path),
                         dir_name: None,
+                        version: frontmatter.version,
+                        tags: frontmatter.tags,
+                        required_tools: frontmatter.required_tools,
+                        provider_local_ok: frontmatter.provider_local_ok,
+                        references: frontmatter.references,
                     });
                 }
             }
@@ -4200,7 +4256,28 @@ fn load_skills_from_roots_with_drift(roots: &[SkillRoot]) -> std::io::Result<Ski
     Ok(SkillCollection {
         skills,
         metadata_drift,
+        reference_diagnostics,
     })
+}
+
+/// Record a diagnostic for every `references:` entry that does not resolve to a
+/// file on disk, relative to the skill's directory.
+fn collect_missing_references(
+    skill_name: &str,
+    base_dir: &Path,
+    references: &[String],
+    diagnostics: &mut Vec<SkillReferenceDiagnostic>,
+) {
+    for reference in references {
+        let resolved = base_dir.join(reference);
+        if !resolved.is_file() {
+            diagnostics.push(SkillReferenceDiagnostic {
+                skill_name: skill_name.to_string(),
+                reference: reference.clone(),
+                path: resolved,
+            });
+        }
+    }
 }
 
 fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
@@ -4227,35 +4304,165 @@ fn parse_toml_string(contents: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Parsed SKILL.md frontmatter. `name`/`description` remain compatible with
+/// legacy skills; the remaining fields are Sakana-GI extensions and default to
+/// empty/None when absent so old skills keep working.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct SkillFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    version: Option<String>,
+    tags: Vec<String>,
+    required_tools: Vec<String>,
+    provider_local_ok: Option<bool>,
+    references: Vec<String>,
+}
+
+/// Which list a YAML block-list item (`- value`) should be appended to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontmatterListTarget {
+    Tags,
+    RequiredTools,
+    References,
+}
+
+/// Active multi-line parsing context inside the frontmatter block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontmatterBlock {
+    None,
+    List(FrontmatterListTarget),
+    ProviderHints,
+}
+
+/// Backward-compatible accessor returning only `(name, description)`.
 fn parse_skill_frontmatter(contents: &str) -> (Option<String>, Option<String>) {
+    let frontmatter = parse_skill_frontmatter_full(contents);
+    (frontmatter.name, frontmatter.description)
+}
+
+/// Parse the full SKILL.md frontmatter, tolerating both inline lists
+/// (`tags: [a, b]`) and YAML block lists, plus the nested `provider_hints`
+/// object. Unknown keys are ignored so legacy and future skills both load.
+fn parse_skill_frontmatter_full(contents: &str) -> SkillFrontmatter {
+    let mut frontmatter = SkillFrontmatter::default();
     let mut lines = contents.lines();
     if lines.next().map(str::trim) != Some("---") {
-        return (None, None);
+        return frontmatter;
     }
 
-    let mut name = None;
-    let mut description = None;
+    let mut block = FrontmatterBlock::None;
     for line in lines {
         let trimmed = line.trim();
         if trimmed == "---" {
             break;
         }
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Continue an active block when the line is a list item or a nested
+        // provider-hints key; otherwise fall through and reset the block.
+        match block {
+            FrontmatterBlock::List(target) if trimmed.starts_with('-') => {
+                let value = unquote_frontmatter_value(trimmed[1..].trim());
+                if !value.is_empty() {
+                    push_frontmatter_list_item(&mut frontmatter, target, value);
+                }
+                continue;
+            }
+            FrontmatterBlock::ProviderHints => {
+                if let Some(value) = trimmed.strip_prefix("local_ok:") {
+                    frontmatter.provider_local_ok = parse_frontmatter_bool(value.trim());
+                    continue;
+                }
+            }
+            FrontmatterBlock::List(_) | FrontmatterBlock::None => {}
+        }
+
+        block = FrontmatterBlock::None;
         if let Some(value) = trimmed.strip_prefix("name:") {
             let value = unquote_frontmatter_value(value.trim());
             if !value.is_empty() {
-                name = Some(value);
+                frontmatter.name = Some(value);
             }
-            continue;
-        }
-        if let Some(value) = trimmed.strip_prefix("description:") {
+        } else if let Some(value) = trimmed.strip_prefix("description:") {
             let value = unquote_frontmatter_value(value.trim());
             if !value.is_empty() {
-                description = Some(value);
+                frontmatter.description = Some(value);
             }
+        } else if let Some(value) = trimmed.strip_prefix("version:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                frontmatter.version = Some(value);
+            }
+        } else if let Some(value) = trimmed.strip_prefix("tags:") {
+            let inline = parse_frontmatter_list(value.trim());
+            if inline.is_empty() {
+                block = FrontmatterBlock::List(FrontmatterListTarget::Tags);
+            } else {
+                frontmatter.tags = inline;
+            }
+        } else if let Some(value) = trimmed.strip_prefix("required_tools:") {
+            let inline = parse_frontmatter_list(value.trim());
+            if inline.is_empty() {
+                block = FrontmatterBlock::List(FrontmatterListTarget::RequiredTools);
+            } else {
+                frontmatter.required_tools = inline;
+            }
+        } else if let Some(value) = trimmed.strip_prefix("references:") {
+            let inline = parse_frontmatter_list(value.trim());
+            if inline.is_empty() {
+                block = FrontmatterBlock::List(FrontmatterListTarget::References);
+            } else {
+                frontmatter.references = inline;
+            }
+        } else if trimmed.strip_prefix("provider_hints:").is_some() {
+            block = FrontmatterBlock::ProviderHints;
         }
     }
 
-    (name, description)
+    frontmatter
+}
+
+fn push_frontmatter_list_item(
+    frontmatter: &mut SkillFrontmatter,
+    target: FrontmatterListTarget,
+    value: String,
+) {
+    match target {
+        FrontmatterListTarget::Tags => frontmatter.tags.push(value),
+        FrontmatterListTarget::RequiredTools => frontmatter.required_tools.push(value),
+        FrontmatterListTarget::References => frontmatter.references.push(value),
+    }
+}
+
+/// Parse an inline YAML list (`[a, b, c]`). Returns an empty vector when the
+/// value is empty (signalling that a block list follows) or contains no items.
+fn parse_frontmatter_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|item| unquote_frontmatter_value(item.trim()))
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn parse_frontmatter_bool(value: &str) -> Option<bool> {
+    match unquote_frontmatter_value(value)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn unquote_frontmatter_value(value: &str) -> String {
@@ -4529,12 +4736,18 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
 fn render_skills_report_json_with_action(collection: &SkillCollection, action: &str) -> Value {
     let skills = &collection.skills;
     let metadata_drift = &collection.metadata_drift;
+    let reference_diagnostics = &collection.reference_diagnostics;
     let active = skills
         .iter()
         .filter(|skill| skill.shadowed_by.is_none())
         .count();
     let has_drift = !metadata_drift.is_empty();
-    let status = if has_drift { "degraded" } else { "ok" };
+    let has_missing_references = !reference_diagnostics.is_empty();
+    let status = if has_drift || has_missing_references {
+        "degraded"
+    } else {
+        "ok"
+    };
     // #410: add `count` field for polymorphic consumption parity with agents list
     json!({
         "kind": "skills",
@@ -4543,6 +4756,7 @@ fn render_skills_report_json_with_action(collection: &SkillCollection, action: &
         "count": skills.len(),
         "valid_count": skills.len(),
         "metadata_drift_count": metadata_drift.len(),
+        "reference_diagnostics_count": reference_diagnostics.len(),
         "summary": {
             "total": skills.len(),
             "active": active,
@@ -4553,6 +4767,11 @@ fn render_skills_report_json_with_action(collection: &SkillCollection, action: &
             "dir_name": &drift.dir_name,
             "frontmatter_name": &drift.frontmatter_name,
             "path": drift.path.display().to_string(),
+        })).collect::<Vec<_>>(),
+        "reference_diagnostics": reference_diagnostics.iter().map(|diagnostic| json!({
+            "skill": &diagnostic.skill_name,
+            "reference": &diagnostic.reference,
+            "path": diagnostic.path.display().to_string(),
         })).collect::<Vec<_>>(),
     })
 }
@@ -5194,6 +5413,12 @@ fn skill_summary_json(skill: &SkillSummary) -> Value {
         "shadowed_by": skill.shadowed_by.map(definition_source_json),
         // #729: path parity with agent_summary_json
         "path": skill.path.as_ref().map(|p| p.display().to_string()),
+        // Sakana-GI SKILL.md extensions (null/empty when not declared).
+        "version": &skill.version,
+        "tags": &skill.tags,
+        "required_tools": &skill.required_tools,
+        "provider_hints": { "local_ok": skill.provider_local_ok },
+        "references": &skill.references,
     })
 }
 
@@ -6562,6 +6787,7 @@ mod tests {
             &super::SkillCollection {
                 skills: load_skills_from_roots(&roots).expect("skills should load"),
                 metadata_drift: Vec::new(),
+                reference_diagnostics: Vec::new(),
             },
             "list",
         );
@@ -7027,6 +7253,114 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn legacy_skill_frontmatter_leaves_extensions_empty() {
+        let contents = "---\nname: hud\ndescription: A skill\n---\n";
+        let frontmatter = super::parse_skill_frontmatter_full(contents);
+        assert_eq!(frontmatter.name.as_deref(), Some("hud"));
+        assert_eq!(frontmatter.description.as_deref(), Some("A skill"));
+        assert_eq!(frontmatter.version, None);
+        assert!(frontmatter.tags.is_empty());
+        assert!(frontmatter.required_tools.is_empty());
+        assert_eq!(frontmatter.provider_local_ok, None);
+        assert!(frontmatter.references.is_empty());
+    }
+
+    #[test]
+    fn parses_extended_skill_frontmatter_fields() {
+        let contents = "---\n\
+name: refactor-review\n\
+description: Use when reviewing a refactor.\n\
+version: 1.2.0\n\
+tags: [review, refactor]\n\
+required_tools: [read_file, grep_search]\n\
+provider_hints:\n\
+  local_ok: true\n\
+references:\n\
+  - references/checklist.md\n\
+  - references/notes.md\n\
+---\n";
+        let frontmatter = super::parse_skill_frontmatter_full(contents);
+        assert_eq!(frontmatter.name.as_deref(), Some("refactor-review"));
+        assert_eq!(frontmatter.version.as_deref(), Some("1.2.0"));
+        assert_eq!(frontmatter.tags, vec!["review", "refactor"]);
+        assert_eq!(frontmatter.required_tools, vec!["read_file", "grep_search"]);
+        assert_eq!(frontmatter.provider_local_ok, Some(true));
+        assert_eq!(
+            frontmatter.references,
+            vec!["references/checklist.md", "references/notes.md"]
+        );
+    }
+
+    #[test]
+    fn malformed_skill_frontmatter_degrades_without_panicking() {
+        // Unterminated list, stray indentation, and an unknown key must not panic.
+        let contents = "---\n\
+name: broken\n\
+tags: [unclosed, list\n\
+  - orphaned item\n\
+unknown_field: whatever\n\
+provider_hints:\n\
+  local_ok: maybe\n\
+---\n";
+        let frontmatter = super::parse_skill_frontmatter_full(contents);
+        assert_eq!(frontmatter.name.as_deref(), Some("broken"));
+        // `maybe` is not a recognized boolean, so it stays unset.
+        assert_eq!(frontmatter.provider_local_ok, None);
+    }
+
+    #[test]
+    fn missing_skill_reference_reports_degraded_status() {
+        let _guard = env_guard();
+        let workspace = temp_dir("skills-references");
+        let isolated_home = temp_dir("skills-references-home");
+        let config_home = temp_dir("skills-references-config");
+        let codex_home = temp_dir("skills-references-codex");
+        let claude_config = temp_dir("skills-references-claude");
+        for dir in [&isolated_home, &config_home, &codex_home, &claude_config] {
+            fs::create_dir_all(dir).expect("isolation dir");
+        }
+        let original_home = std::env::var_os("HOME");
+        let original_claw_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        let original_codex_home = std::env::var_os("CODEX_HOME");
+        let original_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", &isolated_home);
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
+
+        let skills_root = workspace.join(".claw").join("skills").join("review");
+        fs::create_dir_all(&skills_root).expect("skill dir");
+        fs::write(
+            skills_root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review skill\nreferences:\n  - references/missing.md\n---\n",
+        )
+        .expect("write skill");
+
+        let report =
+            handle_skills_slash_command_json(Some("list"), &workspace).expect("skills list json");
+        assert_eq!(report["status"], "degraded");
+        assert_eq!(report["reference_diagnostics_count"], 1);
+        assert_eq!(report["reference_diagnostics"][0]["skill"], "review");
+        assert_eq!(
+            report["reference_diagnostics"][0]["reference"],
+            "references/missing.md"
+        );
+        let review = &report["skills"][0];
+        assert_eq!(review["name"], "review");
+        assert_eq!(review["references"][0], "references/missing.md");
+
+        restore_env_var("HOME", original_home);
+        restore_env_var("CLAW_CONFIG_HOME", original_claw_config_home);
+        restore_env_var("CODEX_HOME", original_codex_home);
+        restore_env_var("CLAUDE_CONFIG_DIR", original_claude_config_dir);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(isolated_home);
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(codex_home);
+        let _ = fs::remove_dir_all(claude_config);
     }
 
     #[test]

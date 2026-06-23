@@ -1,5 +1,6 @@
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::RwLock;
 
 use crossterm::cursor::{MoveToColumn, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
@@ -26,8 +27,110 @@ pub struct ColorTheme {
     spinner_failed: Color,
 }
 
+/// Process-wide runtime theme override, stored as a canonical theme name.
+///
+/// Seeded from persisted config at startup and updated live by the `/theme`
+/// slash command. `ColorTheme::default()` consults it *after* the
+/// `SAKANA_GI_THEME` environment variable so env selection always wins (keeping
+/// CI and scripted runs deterministic).
+static RUNTIME_THEME: RwLock<Option<String>> = RwLock::new(None);
+
+/// Where the effective theme came from, for `status`/`doctor` reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSource {
+    /// Pinned by the `SAKANA_GI_THEME` environment variable.
+    Env,
+    /// Selected via `/theme` and/or persisted in `~/.claw/settings.json`.
+    Config,
+    /// Built-in fallback palette (no env var, no override).
+    Default,
+}
+
+impl ThemeSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeSource::Env => "env",
+            ThemeSource::Config => "config",
+            ThemeSource::Default => "default",
+        }
+    }
+}
+
+/// Map any accepted alias to its canonical theme name, or `None` if unknown.
+#[must_use]
+pub fn canonical_theme_name(name: &str) -> Option<&'static str> {
+    match normalize_theme_name(name).as_str() {
+        "sakana-dark" | "sakana" | "dark" => Some("sakana-dark"),
+        "sakana-light" | "light" => Some("sakana-light"),
+        _ => None,
+    }
+}
+
+/// Pure precedence resolver: env over runtime override over built-in default.
+/// Returns the canonical theme name (`None` means the built-in fallback) and
+/// the source it was selected from.
+fn resolve_theme(env: Option<&str>, runtime: Option<&str>) -> (Option<&'static str>, ThemeSource) {
+    if let Some(name) = env.and_then(canonical_theme_name) {
+        return (Some(name), ThemeSource::Env);
+    }
+    if let Some(name) = runtime.and_then(canonical_theme_name) {
+        return (Some(name), ThemeSource::Config);
+    }
+    (None, ThemeSource::Default)
+}
+
+fn env_theme_var() -> Option<String> {
+    std::env::var("SAKANA_GI_THEME").ok()
+}
+
+fn runtime_theme_name() -> Option<String> {
+    RUNTIME_THEME.read().ok().and_then(|slot| slot.clone())
+}
+
+/// Set the process-wide runtime theme override by (aliased) name.
+///
+/// Returns `true` when the name resolves to a known theme and the override was
+/// stored; `false` for an unknown name (the override is left unchanged).
+pub fn set_runtime_theme(name: &str) -> bool {
+    match canonical_theme_name(name) {
+        Some(canonical) => {
+            if let Ok(mut slot) = RUNTIME_THEME.write() {
+                *slot = Some(canonical.to_string());
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Clear the process-wide runtime theme override (falls back to env/default).
+pub fn clear_runtime_theme() {
+    if let Ok(mut slot) = RUNTIME_THEME.write() {
+        *slot = None;
+    }
+}
+
+/// The effective theme name and where it was resolved from, honoring the same
+/// precedence as [`ColorTheme::default`]. The name is `"default"` for the
+/// built-in fallback palette.
+#[must_use]
+pub fn effective_theme() -> (&'static str, ThemeSource) {
+    let env = env_theme_var();
+    let runtime = runtime_theme_name();
+    match resolve_theme(env.as_deref(), runtime.as_deref()) {
+        (Some(name), source) => (name, source),
+        (None, source) => ("default", source),
+    }
+}
+
 impl Default for ColorTheme {
     fn default() -> Self {
+        match effective_theme() {
+            ("sakana-dark", _) => return Self::sakana_dark(),
+            ("sakana-light", _) => return Self::sakana_light(),
+            _ => {}
+        }
         Self {
             heading: Color::Cyan,
             emphasis: Color::Magenta,
@@ -42,6 +145,146 @@ impl Default for ColorTheme {
             spinner_failed: Color::Red,
         }
     }
+}
+
+impl ColorTheme {
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        match canonical_theme_name(name)? {
+            "sakana-dark" => Some(Self::sakana_dark()),
+            "sakana-light" => Some(Self::sakana_light()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn sakana_dark() -> Self {
+        Self {
+            heading: Color::Rgb {
+                r: 113,
+                g: 187,
+                b: 226,
+            },
+            emphasis: Color::Rgb {
+                r: 242,
+                g: 154,
+                b: 180,
+            },
+            strong: Color::Rgb {
+                r: 245,
+                g: 184,
+                b: 92,
+            },
+            inline_code: Color::Rgb {
+                r: 131,
+                g: 201,
+                b: 168,
+            },
+            link: Color::Rgb {
+                r: 139,
+                g: 170,
+                b: 247,
+            },
+            quote: Color::Rgb {
+                r: 151,
+                g: 164,
+                b: 181,
+            },
+            table_border: Color::Rgb {
+                r: 79,
+                g: 169,
+                b: 185,
+            },
+            code_block_border: Color::Rgb {
+                r: 92,
+                g: 105,
+                b: 128,
+            },
+            spinner_active: Color::Rgb {
+                r: 96,
+                g: 202,
+                b: 212,
+            },
+            spinner_done: Color::Rgb {
+                r: 129,
+                g: 206,
+                b: 157,
+            },
+            spinner_failed: Color::Rgb {
+                r: 235,
+                g: 111,
+                b: 146,
+            },
+        }
+    }
+
+    #[must_use]
+    pub const fn sakana_light() -> Self {
+        Self {
+            heading: Color::Rgb {
+                r: 26,
+                g: 92,
+                b: 140,
+            },
+            emphasis: Color::Rgb {
+                r: 169,
+                g: 71,
+                b: 105,
+            },
+            strong: Color::Rgb {
+                r: 171,
+                g: 91,
+                b: 24,
+            },
+            inline_code: Color::Rgb {
+                r: 54,
+                g: 119,
+                b: 85,
+            },
+            link: Color::Rgb {
+                r: 52,
+                g: 85,
+                b: 161,
+            },
+            quote: Color::Rgb {
+                r: 103,
+                g: 105,
+                b: 110,
+            },
+            table_border: Color::Rgb {
+                r: 57,
+                g: 137,
+                b: 147,
+            },
+            code_block_border: Color::Rgb {
+                r: 146,
+                g: 140,
+                b: 127,
+            },
+            spinner_active: Color::Rgb {
+                r: 0,
+                g: 124,
+                b: 139,
+            },
+            spinner_done: Color::Rgb {
+                r: 68,
+                g: 134,
+                b: 91,
+            },
+            spinner_failed: Color::Rgb {
+                r: 188,
+                g: 69,
+                b: 86,
+            },
+        }
+    }
+}
+
+fn normalize_theme_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .replace(' ', "-")
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -912,7 +1155,65 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{
+        clear_runtime_theme, effective_theme, resolve_theme, set_runtime_theme, strip_ansi,
+        ColorTheme, MarkdownStreamState, Spinner, TerminalRenderer, ThemeSource,
+    };
+
+    #[test]
+    fn resolves_sakana_theme_names() {
+        assert_eq!(
+            ColorTheme::named("sakana-dark"),
+            Some(ColorTheme::sakana_dark())
+        );
+        assert_eq!(
+            ColorTheme::named("sakana_light"),
+            Some(ColorTheme::sakana_light())
+        );
+        assert_eq!(ColorTheme::named("unknown"), None);
+    }
+
+    #[test]
+    fn theme_precedence_prefers_env_then_runtime_then_default() {
+        // Env wins over a runtime override.
+        assert_eq!(
+            resolve_theme(Some("sakana-light"), Some("sakana-dark")),
+            (Some("sakana-light"), ThemeSource::Env)
+        );
+        // Runtime override applies when no env var is set.
+        assert_eq!(
+            resolve_theme(None, Some("sakana-dark")),
+            (Some("sakana-dark"), ThemeSource::Config)
+        );
+        // Unknown names are ignored and fall through to the built-in default.
+        assert_eq!(
+            resolve_theme(Some("bogus"), None),
+            (None, ThemeSource::Default)
+        );
+        // Aliases normalize to their canonical names.
+        assert_eq!(
+            resolve_theme(None, Some("light")),
+            (Some("sakana-light"), ThemeSource::Config)
+        );
+    }
+
+    #[test]
+    fn runtime_override_changes_default_theme() {
+        // This test mutates a process-global slot; clear it on every exit path.
+        assert!(set_runtime_theme("sakana-light"));
+        assert_eq!(ColorTheme::default(), ColorTheme::sakana_light());
+        assert_eq!(effective_theme(), ("sakana-light", ThemeSource::Config));
+
+        assert!(set_runtime_theme("dark"));
+        assert_eq!(ColorTheme::default(), ColorTheme::sakana_dark());
+
+        // Unknown names leave the override untouched and report failure.
+        assert!(!set_runtime_theme("nope"));
+        assert_eq!(ColorTheme::default(), ColorTheme::sakana_dark());
+
+        clear_runtime_theme();
+        assert_eq!(effective_theme().1, ThemeSource::Default);
+    }
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {

@@ -376,3 +376,62 @@ Iteration 2026-04-29 - ROADMAP #96 COMPLETED
 - Targeted verification: `cargo test -p rusty-claude-cli stub_commands_absent_from_resume_safe_help -- --nocapture` passed; `cargo test -p rusty-claude-cli parses_direct_cli_actions -- --nocapture` passed.
 - Format/check verification: `cargo fmt --all --check`, `git diff --check`, and `cargo check -p rusty-claude-cli` passed.
 - Broader clippy note: `cargo clippy -p rusty-claude-cli --all-targets -- -D warnings` is blocked by pre-existing `clippy::unnecessary_wraps` failures in `rust/crates/commands/src/lib.rs` (`render_mcp_report_for`, `render_mcp_report_json_for`), outside this diff.
+
+Iteration 2026-06-23 - Slice 3 (Persistent Themes) + start Slice 5 (SKILL.md)
+----------------------------------------------------------------------------
+Continued docs/sakana-gi-harness-plan.md: finished Slice 3 and started Slice 5.
+
+Slice 3 - Persistent Themes (DONE):
+- rust/crates/rusty-claude-cli/src/render.rs: added a process-global RUNTIME_THEME
+  slot + ThemeSource, set_runtime_theme/clear_runtime_theme/effective_theme, and a
+  pure resolve_theme() precedence helper (env SAKANA_GI_THEME > runtime slot > built-in
+  default). ColorTheme::default() now consults the slot; canonical_theme_name() is public.
+- rust/crates/runtime/src/config.rs: save_user_theme() (reuses read/write_settings_root)
+  and RuntimeConfig::theme() accessor for the top-level "theme" key.
+- rust/crates/runtime/src/config_validate.rs: registered "theme" as a known top-level
+  settings key (no spurious unknown-key warning).
+- rust/crates/runtime/src/lib.rs: re-export save_user_theme.
+- rust/crates/rusty-claude-cli/src/main.rs: real /theme handler (interactive + resume-safe
+  paths) via shared run_theme_command(); seed_runtime_theme_from_config() at startup;
+  "theme" {name, source} in status_json_value() and the rich status report;
+  check_theme_health() doctor check; updated doctor --help check_names preview.
+
+Slice 5 - SKILL.md frontmatter (STARTED):
+- rust/crates/commands/src/lib.rs: SkillFrontmatter + parse_skill_frontmatter_full()
+  parsing version/tags/required_tools/provider_hints.local_ok/references (inline lists,
+  YAML block lists, nested object; unknown keys ignored). parse_skill_frontmatter() kept
+  as a thin (name, description) wrapper. SkillSummary carries the new fields;
+  SkillReferenceDiagnostic + SkillCollection.reference_diagnostics record missing
+  referenced files; collect_missing_references() resolves refs per skill dir. JSON output
+  adds per-skill metadata + top-level reference_diagnostics(+count), folded into degraded
+  status. Read-before-use enforcement in execute_skill is the documented next increment.
+
+Docs: ticked Slice 3 + started Slice 5 boxes in the plan; added a "Terminal themes"
+section to USAGE.md (SAKANA_GI_THEME, /theme, precedence, status/doctor reporting).
+
+Tests added (all passing):
+- render.rs: theme_precedence_prefers_env_then_runtime_then_default,
+  runtime_override_changes_default_theme.
+- config.rs: surfaces_persisted_theme_without_unknown_key_warning,
+  save_user_theme_persists_and_preserves_other_keys.
+- cli_flags_and_config_defaults.rs: status_json_reports_persisted_theme_without_ansi,
+  status_json_theme_env_overrides_persisted_config.
+- commands/lib.rs: legacy_skill_frontmatter_leaves_extensions_empty,
+  parses_extended_skill_frontmatter_fields, malformed_skill_frontmatter_degrades_without_panicking,
+  missing_skill_reference_reports_degraded_status.
+- Updated output_format_contract.rs doctor expectations (12 -> 13 checks; added "theme").
+
+Verification (full workspace gate):
+- scripts/fmt.sh --check: PASS.
+- cargo build --workspace: PASS.
+- cargo clippy --workspace (CI-equivalent, what rust-ci.yml runs): PASS (exit 0). The new
+  code adds zero clippy findings.
+- cargo clippy --workspace --all-targets -- -D warnings (stricter, per rust/CLAUDE.md):
+  fails ONLY on pre-existing lint debt in crates/runtime/src/trident.rs and
+  crates/claw-rag-service/src/ingest.rs - neither touched by this change.
+- cargo test --workspace --no-fail-fast: all pass EXCEPT two pre-existing,
+  environment-dependent failures unrelated to this change:
+  - direct_resume_safe_slash_commands_route_to_local_json_actions_831 (sandbox reports
+    "ok" not "warn" on this VM; confirmed failing on a clean tree without these changes).
+  - tools::powershell_runs_via_stub_shell (no pwsh/powershell installed in this env;
+    the documented Slice 2 blocker).

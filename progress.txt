@@ -556,3 +556,26 @@ Slice 7 (Provider Diagnostics):
   (doctor output, safe-probe rules, credential fallback, OpenRouter gateways).
 - Tests: is_local_base_url (loopback/private-LAN/.local vs remote), OLLAMA_HOST routing
   precedence (client.rs), doctor check list updated to 14 (+providers), check_names preview.
+
+Iteration 2026-06-23 (c) - Slice 6: Local Memory (full ai-memory)
+-----------------------------------------------------------------
+Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project root).
+
+- Config: RuntimeMemoryConfig {enabled, autoCapture, storeRoot} in runtime/config.rs
+  (+ config_validate top-level "memory"); RuntimeConfig::memory()/feature_config.memory().
+- Store engine: crates/runtime/src/memory.rs MemoryStore — write_note(+pin)/write_handoff/
+  capture_event/query/list_notes/summary. notes/<id>.md (frontmatter id,created_at,pinned,
+  tags), handoffs/<id>.md, events.jsonl. Confined to project root; ids sanitized vs traversal.
+- Model tools (gated on memory.enabled): memory_query (ReadOnly) + memory_write advertised
+  via local_runtime_tool_definitions(memory_enabled); dispatched in execute_runtime_tool.
+  Writes confined to .gi/memory → opt-in IS the consent (no per-call prompt).
+- Auto-capture: maybe_capture_memory_turn() appends a one-line observation after each turn
+  (run_turn + run_turn_with_output) when enabled && autoCapture.
+- Commands: /memory gains subcommands (files|note|handoff|search|pin|unpin|list) via a shared
+  memory_command(); instruction-file view preserved as /memory files. New `gi memory <sub>`
+  CLI (CliAction::Memory) + --output-format json. SlashCommand::Memory now carries args.
+- Diagnostics: doctor "Memory store" check (check_memory_store_health); status memory_store
+  object (enabled, auto_capture, counts).
+- Docs: docs/memory.md (ai-memory interop, handoff conventions, privacy/opt-in), USAGE.md
+  section. Tests: memory.rs (3: note/pin/query, handoff/event, traversal-safe), config parse,
+  tool gating; doctor check list 14→15 (+memory store).

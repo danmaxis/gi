@@ -278,6 +278,32 @@ otherwise it suggests the built-in models. A picked provider is applied to `gi`'
 process at startup (it never touches your global shell or other tools), so plain
 `gi` then routes to it. Override per run with `gi --model <provider/model>`.
 
+## Local project memory
+
+Gi can keep a local, file-backed project memory under `.gi/memory/` — **opt-in and
+disabled by default**. Enable it in `.gi/settings.json`:
+
+```json
+{ "memory": { "enabled": true, "autoCapture": false } }
+```
+
+Then record and search durable context, in the REPL or from scripts:
+
+```bash
+gi memory note "Provider routing is env-driven; OLLAMA_HOST wins"
+gi memory search routing
+gi memory list
+gi memory handoff "Slice 6 done; tests next"
+```
+
+In the REPL the same lives under `/memory` (`/memory note|handoff|search|pin|list`;
+`/memory files` keeps the instruction-file view). When enabled, the model also gets
+`memory_query` / `memory_write` tools (writes confined to `.gi/memory`, so enabling
+memory is the consent — no per-call prompt). `autoCapture` additionally logs a
+one-line observation of each turn. `gi doctor` reports a **Memory store** check and
+`gi status --output-format json` a `memory_store` object. Full details:
+[`docs/memory.md`](./docs/memory.md).
+
 ## Authentication
 
 ### API key

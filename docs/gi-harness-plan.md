@@ -222,14 +222,19 @@ Implementation notes:
 
 ### Slice 6: Local Memory Plugins
 
-- [ ] Define `.sakana/memory/plugin.toml`.
-- [ ] Implement local file-backed memory event capture.
-- [ ] Implement handoff markdown generation.
-- [ ] Implement project memory query over markdown files.
-- [ ] Implement pinned durable notes.
-- [ ] Add memory diagnostics to `status` and `doctor`.
-- [ ] Add config to enable/disable memory plugins.
-- [ ] Document ai-memory interoperability and handoff conventions.
+- [x] Define the local memory store layout under `.gi/memory/` (notes / handoffs / events).
+- [x] Implement local file-backed memory event capture (`events.jsonl`, opt-in auto-capture).
+- [x] Implement handoff markdown generation (`handoffs/<id>.md`).
+- [x] Implement project memory query over markdown files (notes + handoffs + events).
+- [x] Implement pinned durable notes (`/memory pin`, surfaced first in search).
+- [x] Add memory diagnostics to `status` (`memory_store`) and `doctor` ("Memory store" check).
+- [x] Add config to enable/disable memory (`RuntimeMemoryConfig`, opt-in, disabled by default).
+- [x] Document ai-memory interoperability and handoff conventions (`docs/memory.md`).
+
+Done 2026-06-23: opt-in store in `crates/runtime/src/memory.rs`; model-callable
+`memory_query`/`memory_write` tools (gated, writes confined to `.gi/memory`); opt-in
+per-turn auto-capture; `/memory` REPL subcommands + a `gi memory` CLI (instruction-file
+view preserved under `/memory files`).
 
 ### Slice 7: Provider Diagnostics
 

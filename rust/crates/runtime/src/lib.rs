@@ -27,6 +27,7 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod memory;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -72,8 +73,8 @@ pub use config::{
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
-    RuntimeInvalidHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    RuntimeProviderConfig, ScopedMcpServerConfig, GI_SETTINGS_SCHEMA_NAME,
+    RuntimeInvalidHookConfig, RuntimeMemoryConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, GI_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

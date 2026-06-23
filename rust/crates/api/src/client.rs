@@ -177,6 +177,13 @@ mod tests {
 
     #[test]
     fn provider_detection_prefers_model_family() {
+        // Hold the env lock and clear the higher-priority routing vars so this
+        // asserts pure model-family routing regardless of the ambient env (and
+        // of concurrent env-mutating tests like the OLLAMA_HOST one).
+        let _lock = env_lock();
+        let _ollama = EnvVarGuard::set("OLLAMA_HOST", None);
+        let _openai_base = EnvVarGuard::set("OPENAI_BASE_URL", None);
+
         assert_eq!(detect_provider_kind("grok-3"), ProviderKind::Xai);
         assert_eq!(
             detect_provider_kind("claude-sonnet-4-6"),

@@ -163,6 +163,7 @@ pub struct RuntimeFeatureConfig {
     api_timeout: ApiTimeoutConfig,
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
+    memory: RuntimeMemoryConfig,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -222,6 +223,37 @@ impl RuntimeProviderConfig {
     #[must_use]
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+}
+
+/// Local project-memory configuration. Opt-in and disabled by default; when
+/// enabled, the memory store lives under `.gi/memory/` at the project root.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeMemoryConfig {
+    enabled: bool,
+    auto_capture: bool,
+    store_root: Option<String>,
+}
+
+impl RuntimeMemoryConfig {
+    /// Whether the memory subsystem (store, `memory_*` tools, `/memory` store
+    /// subcommands) is active. Default `false`.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Whether each completed turn appends an observation to the event log.
+    /// Default `false`; only consulted when [`enabled`](Self::enabled) is true.
+    #[must_use]
+    pub fn auto_capture(&self) -> bool {
+        self.auto_capture
+    }
+
+    /// Optional override for the store directory (defaults to `.gi/memory`).
+    #[must_use]
+    pub fn store_root(&self) -> Option<&str> {
+        self.store_root.as_deref()
     }
 }
 
@@ -801,6 +833,7 @@ fn build_runtime_config(
         api_timeout: parse_optional_api_timeout_config(&merged_value)?,
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
+        memory: parse_optional_memory_config(&merged_value)?,
     };
 
     Ok(RuntimeConfig {
@@ -929,6 +962,11 @@ impl RuntimeConfig {
         &self.feature_config.provider
     }
 
+    #[must_use]
+    pub fn memory(&self) -> &RuntimeMemoryConfig {
+        &self.feature_config.memory
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -947,6 +985,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider(&self) -> &RuntimeProviderConfig {
         &self.provider
+    }
+
+    /// Parsed local-memory configuration (enabled, autoCapture, storeRoot).
+    #[must_use]
+    pub fn memory(&self) -> &RuntimeMemoryConfig {
+        &self.memory
     }
 
     #[must_use]
@@ -2179,6 +2223,23 @@ fn parse_optional_rules_import(root: &JsonValue) -> Result<RulesImportConfig, Co
     }
 }
 
+fn parse_optional_memory_config(root: &JsonValue) -> Result<RuntimeMemoryConfig, ConfigError> {
+    let Some(memory_value) = root.as_object().and_then(|object| object.get("memory")) else {
+        return Ok(RuntimeMemoryConfig::default());
+    };
+    let Some(object) = memory_value.as_object() else {
+        return Ok(RuntimeMemoryConfig::default());
+    };
+    let enabled = optional_bool(object, "enabled", "memory")?.unwrap_or(false);
+    let auto_capture = optional_bool(object, "autoCapture", "memory")?.unwrap_or(false);
+    let store_root = optional_string(object, "storeRoot", "memory")?.map(str::to_string);
+    Ok(RuntimeMemoryConfig {
+        enabled,
+        auto_capture,
+        store_root,
+    })
+}
+
 fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
     let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
         return Ok(RuntimeProviderConfig::default());
@@ -3009,6 +3070,35 @@ mod tests {
             &["grok-3".to_string(), "grok-3-mini".to_string()]
         );
         assert!(!chain.is_empty());
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_memory_config_and_defaults_to_disabled() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        // Unset → disabled by default.
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(!loaded.memory().enabled());
+        assert!(!loaded.memory().auto_capture());
+        assert_eq!(loaded.memory().store_root(), None);
+
+        // Explicit memory block is parsed.
+        fs::write(
+            home.join("settings.json"),
+            r#"{ "memory": { "enabled": true, "autoCapture": true, "storeRoot": ".gi/mem" } }"#,
+        )
+        .expect("write memory settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(loaded.memory().enabled());
+        assert!(loaded.memory().auto_capture());
+        assert_eq!(loaded.memory().store_root(), Some(".gi/mem"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

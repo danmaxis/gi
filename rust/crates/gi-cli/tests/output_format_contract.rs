@@ -1476,7 +1476,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
         .is_some_and(|available| available.iter().any(|name| name == "web_fetch")));
 
     let checks = doctor["checks"].as_array().expect("doctor checks");
-    assert_eq!(checks.len(), 14);
+    assert_eq!(checks.len(), 15);
     let check_names = checks
         .iter()
         .map(|check| {
@@ -1504,6 +1504,7 @@ fn doctor_and_resume_status_emit_json_when_requested() {
             "install source",
             "workspace",
             "memory",
+            "memory store",
             "boot preflight",
             "sandbox",
             "permissions",
@@ -3781,18 +3782,18 @@ fn session_with_unknown_subcommand_returns_interactive_only_not_credentials_767(
 
 #[test]
 fn slash_only_verbs_with_args_return_interactive_only_not_credentials_770() {
-    // #770: `gi cost breakdown`, `gi clear --force`, `gi memory reset`,
-    // and `gi ultraplan bogus` all fell through to CliAction::Prompt and
-    // reached the credential gate, returning error_kind:"missing_credentials".
-    // These remain slash-only commands; multi-token invocations should return
-    // interactive_only guidance. `model` is now a local bounded surface (#807).
+    // #770: `gi cost breakdown`, `gi clear --force`, and `gi ultraplan bogus`
+    // all fell through to CliAction::Prompt and reached the credential gate,
+    // returning error_kind:"missing_credentials". These remain slash-only
+    // commands; multi-token invocations should return interactive_only guidance.
+    // `model` is now a local bounded surface (#807); `memory` is now a local CLI
+    // subcommand (Slice 6) and no longer slash-only.
     let root = unique_temp_dir("slash-verbs-770");
     fs::create_dir_all(&root).expect("temp dir should exist");
 
     let cases: &[&[&str]] = &[
         &["cost", "breakdown"],
         &["clear", "--force"],
-        &["memory", "reset"],
         &["ultraplan", "bogus"],
     ];
 
@@ -3966,7 +3967,6 @@ fn interactive_only_guard_batch_769_to_771() {
         // #770: slash-only verbs with trailing args
         &["cost", "breakdown"],
         &["clear", "--force"],
-        &["memory", "reset"],
         &["ultraplan", "bogus"],
         // #771: usage/stats/fork
         &["usage", "extra"],

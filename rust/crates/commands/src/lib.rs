@@ -145,8 +145,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
-        argument_hint: None,
+        summary: "Project memory: files | note | handoff | search | pin | list",
+        argument_hint: Some("[files | note <text> | handoff [text] | search <q> | pin <id> | list]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1095,7 +1095,9 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
-    Memory,
+    Memory {
+        args: Option<String>,
+    },
     Init,
     Diff,
     Version,
@@ -1382,10 +1384,7 @@ pub fn validate_slash_command_input(
             section: parse_config_section(&args)?,
         },
         "mcp" => parse_mcp_command(&args)?,
-        "memory" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Memory
-        }
+        "memory" => SlashCommand::Memory { args: remainder },
         "init" => {
             validate_no_args(command, &args)?;
             SlashCommand::Init
@@ -5577,7 +5576,7 @@ pub fn handle_slash_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
-        | SlashCommand::Memory
+        | SlashCommand::Memory { .. }
         | SlashCommand::Init
         | SlashCommand::Diff
         | SlashCommand::Version
@@ -5900,7 +5899,7 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/memory"),
-            Ok(Some(SlashCommand::Memory))
+            Ok(Some(SlashCommand::Memory { args: None }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));

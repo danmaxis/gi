@@ -213,6 +213,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "memory",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "rulesImport",
         expected: FieldType::RulesImport,
     },

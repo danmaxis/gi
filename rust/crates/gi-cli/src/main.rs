@@ -1093,6 +1093,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             permission_mode,
         } => run_doctor(output_format, permission_mode)?,
+        CliAction::Memory {
+            args,
+            output_format,
+        } => {
+            let (text, json) = memory_command(args.as_deref())?;
+            match output_format {
+                CliOutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                CliOutputFormat::Text => println!("{text}"),
+            }
+        }
         CliAction::Acp { output_format } => {
             print_acp_status(output_format)?;
             std::process::exit(2);
@@ -1246,6 +1258,10 @@ enum CliAction {
     Doctor {
         output_format: CliOutputFormat,
         permission_mode: PermissionModeProvenance,
+    },
+    Memory {
+        args: Option<String>,
+        output_format: CliOutputFormat,
     },
     Acp {
         output_format: CliOutputFormat,
@@ -2466,7 +2482,7 @@ fn parse_single_word_command_alias(
     }
     // Known CLI subcommands that don't accept additional arguments
     const CLI_SUBCOMMANDS: &[&str] = &[
-        "help", "version", "status", "sandbox", "doctor", "state", "config", "diff",
+        "help", "version", "status", "sandbox", "doctor", "state", "config", "diff", "memory",
     ];
     if rest.len() > 1 && !CLI_SUBCOMMANDS.contains(&rest[0].as_str()) {
         return None;
@@ -2490,6 +2506,13 @@ fn parse_single_word_command_alias(
             permission_mode: permission_mode_override
                 .map(PermissionModeProvenance::from_flag)
                 .unwrap_or_else(permission_mode_provenance_for_current_dir),
+        })),
+        "memory" => Some(Ok(CliAction::Memory {
+            args: rest
+                .get(1..)
+                .map(|tokens| tokens.join(" "))
+                .filter(|joined| !joined.is_empty()),
+            output_format,
         })),
         "setup" => Some(Ok(CliAction::Setup { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
@@ -4165,6 +4188,58 @@ fn check_providers_health() -> DiagnosticCheck {
     check
 }
 
+/// Diagnostics for the opt-in local memory store (distinct from the
+/// instruction-file "Memory" check): enabled state and artifact counts.
+fn check_memory_store_health(cwd: &Path) -> DiagnosticCheck {
+    let config = ConfigLoader::default_for(cwd).load().ok();
+    let enabled = config
+        .as_ref()
+        .is_some_and(|config| config.memory().enabled());
+    let auto_capture = config
+        .as_ref()
+        .is_some_and(|config| config.memory().auto_capture());
+    if !enabled {
+        return DiagnosticCheck::new(
+            "Memory store",
+            DiagnosticLevel::Ok,
+            "disabled (opt-in)".to_string(),
+        )
+        .with_details(vec![
+            "Enabled          false".to_string(),
+            "Enable with      .gi/settings.json → \"memory\": { \"enabled\": true }".to_string(),
+        ])
+        .with_data(Map::from_iter([("enabled".to_string(), json!(false))]));
+    }
+    let store = open_memory_store(cwd);
+    let summary = store.summary();
+    DiagnosticCheck::new(
+        "Memory store",
+        DiagnosticLevel::Ok,
+        format!(
+            "enabled · {} notes, {} handoffs, {} events",
+            summary.notes, summary.handoffs, summary.events
+        ),
+    )
+    .with_details(vec![
+        format!("Enabled          true (auto-capture: {auto_capture})"),
+        format!("Store            {}", store.root().display()),
+        format!(
+            "Notes            {} ({} pinned)",
+            summary.notes, summary.pinned
+        ),
+        format!("Handoffs         {}", summary.handoffs),
+        format!("Events           {}", summary.events),
+    ])
+    .with_data(Map::from_iter([
+        ("enabled".to_string(), json!(true)),
+        ("auto_capture".to_string(), json!(auto_capture)),
+        ("notes".to_string(), json!(summary.notes)),
+        ("pinned".to_string(), json!(summary.pinned)),
+        ("handoffs".to_string(), json!(summary.handoffs)),
+        ("events".to_string(), json!(summary.events)),
+    ]))
+}
+
 fn render_doctor_report(
     config_warning_mode: ConfigWarningMode,
     permission_mode: PermissionModeProvenance,
@@ -4247,6 +4322,7 @@ fn render_doctor_report(
             check_install_source_health(),
             check_workspace_health(&context),
             check_memory_health(&context),
+            check_memory_store_health(&cwd),
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
@@ -7179,11 +7255,14 @@ fn run_resume_command(
                 json: Some(handle_mcp_slash_command_json(args.as_deref(), &cwd)?),
             })
         }
-        SlashCommand::Memory => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(render_memory_report()?),
-            json: Some(render_memory_json()?),
-        }),
+        SlashCommand::Memory { args } => {
+            let (text, json) = memory_command(args.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(text),
+                json: Some(json),
+            })
+        }
         SlashCommand::Init => {
             // #142: run the init once, then render both text + structured JSON
             // from the same InitReport so both surfaces stay in sync.
@@ -8077,7 +8156,7 @@ impl RuntimeMcpState {
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let local_runtime_tools = local_runtime_tool_definitions();
+    let local_runtime_tools = local_runtime_tool_definitions(runtime_config.memory().enabled());
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, local_runtime_tools));
     };
@@ -8165,8 +8244,8 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     ]
 }
 
-fn local_runtime_tool_definitions() -> Vec<RuntimeToolDefinition> {
-    vec![RuntimeToolDefinition {
+fn local_runtime_tool_definitions(memory_enabled: bool) -> Vec<RuntimeToolDefinition> {
+    let mut tools = vec![RuntimeToolDefinition {
         name: "ask_user".to_string(),
         description: Some(
             "Ask the user a concrete interactive question when their preference or approval is required to continue. Use choices for mutually exclusive options and allow_free_text when a short custom answer is acceptable."
@@ -8197,7 +8276,139 @@ fn local_runtime_tool_definitions() -> Vec<RuntimeToolDefinition> {
             "additionalProperties": false
         }),
         required_permission: PermissionMode::ReadOnly,
-    }]
+    }];
+
+    // Memory tools are only advertised to the model when memory is enabled
+    // (opt-in). Writes are confined to `.gi/memory`, so enabling memory in
+    // config is the consent — no per-call permission prompt.
+    if memory_enabled {
+        tools.push(RuntimeToolDefinition {
+            name: "memory_query".to_string(),
+            description: Some(
+                "Search the local project memory (durable notes, session handoffs, and the event log) for relevant prior context. Use it before asking the user about decisions or conventions that may already be recorded."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        });
+        tools.push(RuntimeToolDefinition {
+            name: "memory_write".to_string(),
+            description: Some(
+                "Record durable project memory. kind=note for a lasting decision or convention, kind=handoff for a session summary to continue later, kind=event for a brief observation. Only record genuinely reusable facts, never transient details or secrets."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["note", "handoff", "event"] },
+                    "text": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["kind", "text"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        });
+    }
+    tools
+}
+
+/// Open the project memory store for `cwd`, honoring a configured `storeRoot`.
+fn open_memory_store(cwd: &Path) -> runtime::memory::MemoryStore {
+    let store_root = ConfigLoader::default_for(cwd)
+        .load()
+        .ok()
+        .and_then(|config| config.memory().store_root().map(str::to_string));
+    runtime::memory::MemoryStore::discover(cwd, store_root.as_deref())
+}
+
+/// `memory_query` tool: search project memory and return ranked hits.
+fn execute_memory_query(value: &serde_json::Value) -> Result<String, ToolError> {
+    let query = value
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if query.is_empty() {
+        return Err(ToolError::new("memory_query requires a non-empty `query`"));
+    }
+    let limit = value
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(10, |limit| limit as usize);
+    let cwd = env::current_dir().map_err(|error| ToolError::new(error.to_string()))?;
+    let hits = open_memory_store(&cwd)
+        .query(query, limit)
+        .map_err(|error| ToolError::new(error.to_string()))?;
+    serde_json::to_string_pretty(&json!({
+        "query": query,
+        "count": hits.len(),
+        "hits": hits.iter().map(|hit| json!({
+            "kind": hit.kind,
+            "id": hit.id,
+            "pinned": hit.pinned,
+            "snippet": hit.snippet,
+        })).collect::<Vec<_>>(),
+    }))
+    .map_err(|error| ToolError::new(error.to_string()))
+}
+
+/// `memory_write` tool: record a note / handoff / event.
+fn execute_memory_write(value: &serde_json::Value) -> Result<String, ToolError> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if text.is_empty() {
+        return Err(ToolError::new("memory_write requires non-empty `text`"));
+    }
+    let tags: Vec<String> = value
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = env::current_dir().map_err(|error| ToolError::new(error.to_string()))?;
+    let store = open_memory_store(&cwd);
+    let id = match kind {
+        "note" => store
+            .write_note(text, &tags)
+            .map_err(|error| ToolError::new(error.to_string()))?,
+        "handoff" => store
+            .write_handoff(text)
+            .map_err(|error| ToolError::new(error.to_string()))?,
+        "event" => {
+            store
+                .capture_event(text)
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            String::new()
+        }
+        other => {
+            return Err(ToolError::new(format!(
+                "memory_write: unknown kind `{other}` (expected note | handoff | event)"
+            )))
+        }
+    };
+    serde_json::to_string(&json!({ "status": "ok", "kind": kind, "id": id }))
+        .map_err(|error| ToolError::new(error.to_string()))
 }
 
 fn permission_mode_for_mcp_tool(tool: &McpTool) -> PermissionMode {
@@ -8444,6 +8655,7 @@ impl LiveCli {
                         format_auto_compaction_notice(event.removed_message_count)
                     );
                 }
+                maybe_capture_memory_turn(input, &summary);
                 self.persist_session()?;
                 Ok(())
             }
@@ -8656,6 +8868,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
+        maybe_capture_memory_turn(input, &summary);
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
@@ -8801,8 +9014,9 @@ impl LiveCli {
                 Self::print_mcp(args.as_deref(), CliOutputFormat::Text)?;
                 false
             }
-            SlashCommand::Memory => {
-                Self::print_memory()?;
+            SlashCommand::Memory { args } => {
+                let (text, _) = memory_command(args.as_deref())?;
+                println!("{text}");
                 false
             }
             SlashCommand::Init => {
@@ -10335,6 +10549,28 @@ fn status_json_value(
                 matches!(caps.tool_calls, api::ProviderFeatureSupport::Supported),
         })
     });
+    // Opt-in local memory store summary (distinct from instruction `memory_files`).
+    let memory_store_block = {
+        let memory_config = ConfigLoader::default_for(&context.cwd).load().ok();
+        if memory_config
+            .as_ref()
+            .is_some_and(|config| config.memory().enabled())
+        {
+            let summary = open_memory_store(&context.cwd).summary();
+            json!({
+                "enabled": true,
+                "auto_capture": memory_config
+                    .as_ref()
+                    .is_some_and(|config| config.memory().auto_capture()),
+                "notes": summary.notes,
+                "pinned": summary.pinned,
+                "handoffs": summary.handoffs,
+                "events": summary.events,
+            })
+        } else {
+            json!({ "enabled": false })
+        }
+    };
     let permission_mode_source = permission_provenance.map(|p| p.source.as_str());
     let permission_mode_env_var = permission_provenance.and_then(|p| p.env_var);
     let (theme_name, theme_source) = render::effective_theme();
@@ -10437,6 +10673,7 @@ fn status_json_value(
             "memory_file_count": context.memory_file_count,
             "memory_files": memory_files_json(&context.memory_files),
             "unloaded_memory_files": context.unloaded_memory_files,
+            "memory_store": memory_store_block,
             "mcp_validation": context.mcp_validation.json_value(),
             "hook_validation": context.hook_validation.json_value(),
         },
@@ -11132,7 +11369,7 @@ fn render_doctor_help_json() -> serde_json::Value {
         "requires_session_resume": false,
         "mutates_workspace": false,
         "output_fields": ["kind", "action", "status", "message", "report", "has_failures", "summary", "checks", "allowed_tools"],
-        "check_names": ["auth", "providers", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "boot preflight", "sandbox", "permissions", "theme", "system"],
+        "check_names": ["auth", "providers", "config", "mcp validation", "hook validation", "install source", "workspace", "memory", "memory store", "boot preflight", "sandbox", "permissions", "theme", "system"],
         "status_values": ["ok", "warn", "fail"],
         "options": [
             {
@@ -11656,6 +11893,159 @@ fn config_file_report_json(file: &ConfigFileReport) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(object)
+}
+
+/// Shared handler for `/memory [subcommand]`. Returns `(text, json)`. With no
+/// subcommand (or `files`) it shows the loaded instruction files (existing
+/// behavior); the store subcommands (`note`/`handoff`/`search`/`pin`/`unpin`/
+/// `list`) operate on the opt-in `.gi/memory` store.
+fn memory_command(
+    args: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let raw = args.map(str::trim).unwrap_or("");
+    let (sub, rest) = raw
+        .split_once(char::is_whitespace)
+        .map_or((raw, ""), |(sub, rest)| (sub, rest.trim()));
+
+    if sub.is_empty() || sub == "files" {
+        let mut text = render_memory_report()?;
+        let json = render_memory_json()?;
+        if sub.is_empty() {
+            let cwd = env::current_dir()?;
+            let enabled = ConfigLoader::default_for(&cwd)
+                .load()
+                .ok()
+                .is_some_and(|config| config.memory().enabled());
+            if enabled {
+                let summary = open_memory_store(&cwd).summary();
+                text.push_str(&format!(
+                    "\n\nMemory store     enabled · {} notes ({} pinned), {} handoffs, {} events  ·  /memory list",
+                    summary.notes, summary.pinned, summary.handoffs, summary.events
+                ));
+            } else {
+                text.push_str(
+                    "\n\nMemory store     disabled (opt-in) · enable in .gi/settings.json → \"memory\": { \"enabled\": true }",
+                );
+            }
+        }
+        return Ok((text, json));
+    }
+
+    let cwd = env::current_dir()?;
+    let enabled = ConfigLoader::default_for(&cwd)
+        .load()
+        .ok()
+        .is_some_and(|config| config.memory().enabled());
+    if !enabled {
+        let message = "Local memory is disabled (opt-in). Enable it in .gi/settings.json:\n  \"memory\": { \"enabled\": true }".to_string();
+        return Ok((message, json!({ "kind": "memory", "status": "disabled" })));
+    }
+    let store = open_memory_store(&cwd);
+    match sub {
+        "list" => {
+            let notes = store.list_notes()?;
+            let mut text = format!("Memory notes ({})", notes.len());
+            for note in &notes {
+                text.push_str(&format!(
+                    "\n  {} {}  {}",
+                    if note.pinned { "📌" } else { "  " },
+                    note.id,
+                    truncate_for_memory(&note.text, 80)
+                ));
+            }
+            if notes.is_empty() {
+                text.push_str("\n  (none yet — /memory note <text>)");
+            }
+            let json = json!({
+                "kind": "memory", "action": "list",
+                "notes": notes.iter().map(|note| json!({
+                    "id": note.id, "pinned": note.pinned, "tags": note.tags, "text": note.text,
+                })).collect::<Vec<_>>(),
+            });
+            Ok((text, json))
+        }
+        "note" => {
+            if rest.is_empty() {
+                return Ok((
+                    "Usage: /memory note <text>".to_string(),
+                    json!({ "kind": "memory", "status": "error", "message": "note requires text" }),
+                ));
+            }
+            let id = store.write_note(rest, &[])?;
+            Ok((
+                format!("Saved note {id}."),
+                json!({ "kind": "memory", "action": "note", "id": id }),
+            ))
+        }
+        "handoff" => {
+            let summary = if rest.is_empty() {
+                "(no summary provided)"
+            } else {
+                rest
+            };
+            let id = store.write_handoff(summary)?;
+            Ok((
+                format!("Saved handoff {id}."),
+                json!({ "kind": "memory", "action": "handoff", "id": id }),
+            ))
+        }
+        "search" => {
+            if rest.is_empty() {
+                return Ok((
+                    "Usage: /memory search <query>".to_string(),
+                    json!({ "kind": "memory", "status": "error", "message": "search requires a query" }),
+                ));
+            }
+            let hits = store.query(rest, 20)?;
+            let mut text = format!("Memory search \"{rest}\" ({} hits)", hits.len());
+            for hit in &hits {
+                text.push_str(&format!(
+                    "\n  [{}] {}{}",
+                    hit.kind,
+                    if hit.pinned { "📌 " } else { "" },
+                    hit.snippet
+                ));
+            }
+            if hits.is_empty() {
+                text.push_str("\n  (no matches)");
+            }
+            let json = json!({
+                "kind": "memory", "action": "search", "query": rest,
+                "hits": hits.iter().map(|hit| json!({
+                    "kind": hit.kind, "id": hit.id, "pinned": hit.pinned, "snippet": hit.snippet,
+                })).collect::<Vec<_>>(),
+            });
+            Ok((text, json))
+        }
+        "pin" | "unpin" => {
+            if rest.is_empty() {
+                return Ok((
+                    format!("Usage: /memory {sub} <note-id>"),
+                    json!({ "kind": "memory", "status": "error" }),
+                ));
+            }
+            let pinned = sub == "pin";
+            let ok = store.pin(rest, pinned)?;
+            let text = if ok {
+                format!(
+                    "{} note {rest}.",
+                    if pinned { "Pinned" } else { "Unpinned" }
+                )
+            } else {
+                format!("No note with id {rest}.")
+            };
+            Ok((
+                text,
+                json!({ "kind": "memory", "action": sub, "id": rest, "ok": ok }),
+            ))
+        }
+        other => Ok((
+            format!(
+                "Unknown /memory subcommand `{other}`. Try: files | note | handoff | search | pin | unpin | list"
+            ),
+            json!({ "kind": "memory", "status": "error", "message": format!("unknown subcommand {other}") }),
+        )),
+    }
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -13786,6 +14176,57 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
     lines.join("\n")
 }
 
+fn truncate_for_memory(text: &str, max: usize) -> String {
+    let cleaned = text.trim().split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > max {
+        cleaned.chars().take(max).collect::<String>() + "…"
+    } else {
+        cleaned
+    }
+}
+
+fn turn_tool_names(summary: &runtime::TurnSummary) -> Vec<String> {
+    let mut names = Vec::new();
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            if let ContentBlock::ToolResult { tool_name, .. } = block {
+                if !names.contains(tool_name) {
+                    names.push(tool_name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// When memory auto-capture is enabled, append a one-line observation of the
+/// completed turn to the event log. Best-effort: never fails a turn.
+fn maybe_capture_memory_turn(input: &str, summary: &runtime::TurnSummary) {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let memory = config.memory();
+    if !memory.enabled() || !memory.auto_capture() {
+        return;
+    }
+    let store = runtime::memory::MemoryStore::discover(&cwd, memory.store_root());
+    let tools = turn_tool_names(summary);
+    let observation = format!(
+        "user: {} · assistant: {} · tools: {}",
+        truncate_for_memory(input, 200),
+        truncate_for_memory(&final_assistant_text(summary), 200),
+        if tools.is_empty() {
+            "none".to_string()
+        } else {
+            tools.join(", ")
+        },
+    );
+    let _ = store.capture_event(&observation);
+}
+
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -14661,6 +15102,12 @@ impl CliToolExecutor {
     ) -> Result<String, ToolError> {
         if tool_name == "ask_user" {
             return self.execute_ask_user(value);
+        }
+        if tool_name == "memory_query" {
+            return execute_memory_query(&value);
+        }
+        if tool_name == "memory_write" {
+            return execute_memory_write(&value);
         }
 
         let Some(mcp_state) = &self.mcp_state else {
@@ -19267,7 +19714,7 @@ UU conflicted.rs",
         );
         assert_eq!(
             SlashCommand::parse("/memory"),
-            Ok(Some(SlashCommand::Memory))
+            Ok(Some(SlashCommand::Memory { args: None }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(
@@ -20174,7 +20621,7 @@ UU conflicted.rs",
 
     #[test]
     fn local_runtime_tools_include_ask_user() {
-        let tools = local_runtime_tool_definitions();
+        let tools = local_runtime_tool_definitions(false);
         let ask_user = tools
             .iter()
             .find(|tool| tool.name == "ask_user")
@@ -20189,6 +20636,27 @@ UU conflicted.rs",
             .description
             .as_deref()
             .is_some_and(|description| description.contains("interactive question")));
+    }
+
+    #[test]
+    fn memory_tools_are_gated_on_the_memory_flag() {
+        // Disabled (default): no memory tools advertised to the model.
+        let off = local_runtime_tool_definitions(false);
+        assert!(!off.iter().any(|tool| tool.name.starts_with("memory_")));
+
+        // Enabled: both query + write appear, ReadOnly (opt-in is the consent).
+        let on = local_runtime_tool_definitions(true);
+        let query = on
+            .iter()
+            .find(|tool| tool.name == "memory_query")
+            .expect("memory_query should be advertised when memory is enabled");
+        let write = on
+            .iter()
+            .find(|tool| tool.name == "memory_write")
+            .expect("memory_write should be advertised when memory is enabled");
+        assert_eq!(query.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(write.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(write.input_schema["required"][0].as_str(), Some("kind"));
     }
 
     fn ask_user_choices() -> Vec<AskUserChoice> {

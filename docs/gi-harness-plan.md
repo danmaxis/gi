@@ -251,10 +251,20 @@ gained a `provider` object. Shipped with the new karateka `「技」` splash.
 
 ### Slice 8: Opencode Compatibility
 
-- [ ] Document supported opencode-style config/hook handoff paths.
-- [ ] Generate opencode-compatible memory/plugin snippets.
-- [ ] Add import/export commands only after the local memory plugin contract is stable.
-- [ ] Defer code vendoring until license/API review is complete.
+- [x] Document supported opencode-style config/hook handoff paths.
+- [x] Generate opencode-compatible memory/plugin snippets.
+- [x] Add import/export commands only after the local memory plugin contract is stable.
+- [x] Defer code vendoring until license/API review is complete.
+
+Done 2026-06-24: `gi opencode export | import | status` (and `/opencode`) translate
+config between gi and opencode with a warn-and-skip contract — `model` provider-slug
+add/strip, `mcpServers` ⇄ `mcp`, `permissions.defaultMode` → opencode `permission`,
+instruction files → `instructions`. `AGENTS.md` and MCP were already natively
+interoperable. Export can emit a generated `.opencode/plugin/gi-memory.js` bridge
+(read-only `gi_memory` tool over `.gi/memory/`) when memory is enabled. No opencode
+source is vendored; shell-hook ↔ TS-plugin handoff is documented, not auto-translated.
+Pure translation core in `crates/gi-cli/src/opencode_interop.rs`; mapping reference in
+`docs/opencode-compat.md`.
 
 ## Acceptance Criteria
 

@@ -304,6 +304,26 @@ one-line observation of each turn. `gi doctor` reports a **Memory store** check 
 `gi status --output-format json` a `memory_store` object. Full details:
 [`docs/memory.md`](./docs/memory.md).
 
+## Opencode compatibility
+
+Gi can translate config to and from [opencode](https://opencode.ai). `AGENTS.md`
+and MCP servers are already interoperable; `gi opencode` handles the rest:
+
+```bash
+gi opencode export                 # build an opencode.json from gi's config (stdout)
+gi opencode export --out ./        # write opencode.json (+ AGENTS.md, + memory bridge)
+gi opencode import opencode.json   # translate an opencode.json into gi settings
+gi opencode status                 # detect opencode artifacts in this directory
+```
+
+Translation is warn-and-skip: `model` gains/loses its provider slug,
+`mcpServers` ⇄ `mcp`, and permission mode maps to opencode's per-tool
+`permission` object; gi-specific keys (hooks, theme, sandbox, …) and
+opencode-only keys are listed as skipped rather than dropped silently. With
+memory enabled, export also writes a generated `.opencode/plugin/gi-memory.js`
+bridge. No opencode code is vendored. The same verbs are available in the REPL as
+`/opencode`. Full mapping: [`docs/opencode-compat.md`](./docs/opencode-compat.md).
+
 ## Authentication
 
 ### API key

@@ -579,3 +579,25 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - Docs: docs/memory.md (ai-memory interop, handoff conventions, privacy/opt-in), USAGE.md
   section. Tests: memory.rs (3: note/pin/query, handoff/event, traversal-safe), config parse,
   tool gating; doctor check list 14→15 (+memory store).
+
+## Slice 8 — Opencode Compatibility (2026-06-24)
+- New `crates/gi-cli/src/opencode_interop.rs`: pure, I/O-free gi↔opencode translation over
+  serde_json::Value with a warn-and-skip contract (gi_to_opencode/opencode_to_gi). Helpers:
+  model provider-slug add/strip (via api::provider_diagnostics_for_model), mcpServers⇄mcp
+  (stdio↔local, sse/http↔remote), permissions.defaultMode/permissionMode → opencode
+  permission object, strip_jsonc_comments (string-aware), render_memory_bridge_plugin
+  (generated gi-memory.js opencode plugin exposing a read-only gi_memory tool over .gi/memory).
+  9 unit tests.
+- CLI: `gi opencode export | import <path> | status` (CliAction::Opencode + opencode_command),
+  added "opencode" to CLI_SUBCOMMANDS. export → opencode.json (stdout, or --out <dir> writes
+  opencode.json + AGENTS.md-if-absent + .opencode/plugin/gi-memory.js when memory enabled);
+  import strips JSONC comments → gi settings (stdout or --out); status detects artifacts.
+  Load errors surface as a warning instead of silently emptying.
+- Slash: /opencode (SlashCommand::Opencode) mirrors /memory; resume-safe; help category Config;
+  spec count 141→142.
+- Native interop confirmed: gi already reads AGENTS.md (prompt.rs) and speaks MCP — no work
+  needed there. Shell-hook ↔ TS-plugin handoff is documented, not auto-translated. No opencode
+  source vendored.
+- Docs: docs/opencode-compat.md (mapping table, hook handoff, memory bridge, scope), USAGE.md
+  "Opencode compatibility" section, gi-harness-plan.md Slice 8 ticked. Tests: opencode_interop
+  unit (9) + output_format_contract opencode_export_import_status_emit_translated_json.

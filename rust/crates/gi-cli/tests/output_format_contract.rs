@@ -1363,6 +1363,84 @@ fn memory_files_load_claude_gi_agents_and_surface_json_438() {
 }
 
 #[test]
+fn opencode_export_import_status_emit_translated_json() {
+    // Slice 8: `gi opencode` export/import/status JSON contract.
+    let root = unique_temp_dir("opencode-interop");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".gi")).expect("gi dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        root.join(".gi").join("settings.json"),
+        r#"{ "model": "claude-opus-4-8", "permissions": { "defaultMode": "read-only" }, "mcpServers": { "fs": { "command": "uvx", "args": ["mcp-server-fs"] } } }"#,
+    )
+    .expect("write gi settings");
+    let envs = [
+        (
+            "GI_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+
+    // export: gi config → opencode.json shape.
+    let export = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "opencode", "export"],
+        &envs,
+    );
+    assert_eq!(export["kind"], "opencode");
+    assert_eq!(export["action"], "export");
+    let oc = &export["opencode"];
+    assert_eq!(oc["$schema"], "https://opencode.ai/config.json");
+    assert!(
+        oc["model"].as_str().expect("model string").contains('/'),
+        "exported model must be provider-qualified: {oc}"
+    );
+    assert_eq!(oc["mcp"]["fs"]["type"], "local");
+    assert_eq!(oc["mcp"]["fs"]["command"][0], "uvx");
+    assert_eq!(oc["permission"]["edit"], "deny");
+    assert!(export["warnings"].is_array());
+
+    // status: no opencode artifacts present yet.
+    let status = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "opencode", "status"],
+        &envs,
+    );
+    assert_eq!(status["action"], "status");
+    assert_eq!(status["agents_md"], false);
+    assert_eq!(status["opencode_json"], false);
+
+    // import: opencode.json (with a JSONC comment) → gi settings shape.
+    let oc_path = root.join("incoming.json");
+    fs::write(
+        &oc_path,
+        "{\n  // sample opencode config\n  \"model\": \"anthropic/claude-x\",\n  \"mcp\": { \"svc\": { \"type\": \"remote\", \"url\": \"https://x/y\" } }\n}",
+    )
+    .expect("write opencode fixture");
+    let import = assert_json_command_with_env(
+        &root,
+        &[
+            "--output-format",
+            "json",
+            "opencode",
+            "import",
+            oc_path.to_str().expect("utf8 path"),
+        ],
+        &envs,
+    );
+    assert_eq!(import["action"], "import");
+    assert_eq!(import["settings"]["model"], "claude-x");
+    assert_eq!(import["settings"]["mcpServers"]["svc"]["type"], "http");
+    assert_eq!(
+        import["settings"]["mcpServers"]["svc"]["url"],
+        "https://x/y"
+    );
+}
+
+#[test]
 fn memory_discovery_stops_at_git_root_and_reports_origins_439() {
     let root = unique_temp_dir("memory-boundary-439");
     let repo = root.join("repo");

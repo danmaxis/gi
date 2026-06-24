@@ -17,6 +17,7 @@
 mod init;
 mod input;
 mod models_cmd;
+mod opencode_interop;
 mod render;
 mod setup_wizard;
 
@@ -1105,6 +1106,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CliOutputFormat::Text => println!("{text}"),
             }
         }
+        CliAction::Opencode {
+            args,
+            output_format,
+        } => {
+            let (text, json) = opencode_command(args.as_deref())?;
+            match output_format {
+                CliOutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                CliOutputFormat::Text => println!("{text}"),
+            }
+        }
         CliAction::Acp { output_format } => {
             print_acp_status(output_format)?;
             std::process::exit(2);
@@ -1260,6 +1273,10 @@ enum CliAction {
         permission_mode: PermissionModeProvenance,
     },
     Memory {
+        args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Opencode {
         args: Option<String>,
         output_format: CliOutputFormat,
     },
@@ -2483,6 +2500,7 @@ fn parse_single_word_command_alias(
     // Known CLI subcommands that don't accept additional arguments
     const CLI_SUBCOMMANDS: &[&str] = &[
         "help", "version", "status", "sandbox", "doctor", "state", "config", "diff", "memory",
+        "opencode",
     ];
     if rest.len() > 1 && !CLI_SUBCOMMANDS.contains(&rest[0].as_str()) {
         return None;
@@ -2508,6 +2526,13 @@ fn parse_single_word_command_alias(
                 .unwrap_or_else(permission_mode_provenance_for_current_dir),
         })),
         "memory" => Some(Ok(CliAction::Memory {
+            args: rest
+                .get(1..)
+                .map(|tokens| tokens.join(" "))
+                .filter(|joined| !joined.is_empty()),
+            output_format,
+        })),
+        "opencode" => Some(Ok(CliAction::Opencode {
             args: rest
                 .get(1..)
                 .map(|tokens| tokens.join(" "))
@@ -7263,6 +7288,14 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
+        SlashCommand::Opencode { args } => {
+            let (text, json) = opencode_command(args.as_deref())?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(text),
+                json: Some(json),
+            })
+        }
         SlashCommand::Init => {
             // #142: run the init once, then render both text + structured JSON
             // from the same InitReport so both surfaces stay in sync.
@@ -9016,6 +9049,11 @@ impl LiveCli {
             }
             SlashCommand::Memory { args } => {
                 let (text, _) = memory_command(args.as_deref())?;
+                println!("{text}");
+                false
+            }
+            SlashCommand::Opencode { args } => {
+                let (text, _) = opencode_command(args.as_deref())?;
                 println!("{text}");
                 false
             }
@@ -12045,6 +12083,243 @@ fn memory_command(
             ),
             json!({ "kind": "memory", "status": "error", "message": format!("unknown subcommand {other}") }),
         )),
+    }
+}
+
+/// Shared handler for `gi opencode [subcommand]` and `/opencode [subcommand]`.
+/// Returns `(text, json)`. Subcommands: `export` (gi → opencode.json),
+/// `import <path>` (opencode.json → gi settings), `status` (detect artifacts).
+/// Translation is warn-and-skip; see `docs/opencode-compat.md`.
+fn opencode_command(
+    args: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let raw = args.map(str::trim).unwrap_or("");
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let sub = tokens.first().copied().unwrap_or("status");
+
+    // Shared `--out <path>` flag parse; remaining positionals collected too.
+    let mut out_path: Option<String> = None;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut i = 1;
+    while i < tokens.len() {
+        if tokens[i] == "--out" {
+            out_path = tokens.get(i + 1).map(|s| (*s).to_string());
+            i += 2;
+        } else {
+            positionals.push(tokens[i]);
+            i += 1;
+        }
+    }
+
+    let cwd = env::current_dir()?;
+    match sub {
+        "export" => opencode_export(&cwd, out_path.as_deref()),
+        "import" => {
+            let Some(path) = positionals.first() else {
+                return Ok((
+                    "Usage: gi opencode import <opencode.json> [--out <gi-settings.json>]"
+                        .to_string(),
+                    json!({ "kind": "opencode", "status": "error", "message": "import requires a path" }),
+                ));
+            };
+            opencode_import(path, out_path.as_deref())
+        }
+        "status" => opencode_status(&cwd),
+        other => Ok((
+            format!("Unknown opencode subcommand `{other}`. Try: export | import <path> | status"),
+            json!({ "kind": "opencode", "status": "error", "message": format!("unknown subcommand {other}") }),
+        )),
+    }
+}
+
+/// `gi opencode export` — translate the active gi config into an `opencode.json`.
+/// Default prints to stdout; `--out <dir>` writes `opencode.json`, an `AGENTS.md`
+/// if absent, and (when memory is enabled) `.opencode/plugin/gi-memory.js`.
+fn opencode_export(
+    cwd: &Path,
+    out_dir: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let resolved_model = ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL).map_or_else(
+        |_| DEFAULT_MODEL.to_string(),
+        |provenance| provenance.resolved,
+    );
+
+    let (runtime_config, load_warning) = match ConfigLoader::default_for(cwd).load() {
+        Ok(config) => (config, None),
+        Err(error) => (
+            runtime::RuntimeConfig::empty(),
+            Some(format!(
+                "gi config did not fully load ({error}); exported only what could be read"
+            )),
+        ),
+    };
+    let merged: serde_json::Value =
+        serde_json::from_str(&runtime_config.as_json().render()).unwrap_or(json!({}));
+    let memory_enabled = runtime_config.memory().enabled();
+
+    let instruction_files = instruction_file_rel_paths(cwd)?;
+    let (opencode, mut warnings) =
+        opencode_interop::gi_to_opencode(&merged, &resolved_model, &instruction_files);
+    if let Some(warning) = load_warning {
+        warnings.insert(0, warning);
+    }
+    let pretty = serde_json::to_string_pretty(&opencode)?;
+
+    let mut written: Vec<String> = Vec::new();
+    if let Some(dir) = out_dir {
+        let base = cwd.join(dir);
+        std::fs::create_dir_all(&base)?;
+        let oc_path = base.join("opencode.json");
+        std::fs::write(&oc_path, format!("{pretty}\n"))?;
+        written.push(oc_path.display().to_string());
+
+        // AGENTS.md is interoperable both ways; seed one only if absent.
+        let agents = base.join("AGENTS.md");
+        if !agents.exists() {
+            std::fs::write(
+                &agents,
+                "# Agent instructions\n\nShared by gi and opencode. Add project build/test commands, conventions, and architecture notes here.\n",
+            )?;
+            written.push(agents.display().to_string());
+        }
+
+        if memory_enabled {
+            let plugin_dir = base.join(".opencode").join("plugin");
+            std::fs::create_dir_all(&plugin_dir)?;
+            let plugin_path = plugin_dir.join("gi-memory.js");
+            std::fs::write(
+                &plugin_path,
+                opencode_interop::render_memory_bridge_plugin(),
+            )?;
+            written.push(plugin_path.display().to_string());
+        }
+    }
+
+    let mut text = if written.is_empty() {
+        pretty.clone()
+    } else {
+        format!("Wrote opencode artifacts:\n  {}", written.join("\n  "))
+    };
+    if !warnings.is_empty() {
+        text.push_str("\n\nSkipped (no opencode counterpart):");
+        for warning in &warnings {
+            text.push_str(&format!("\n  - {warning}"));
+        }
+    }
+
+    let json = json!({
+        "kind": "opencode",
+        "action": "export",
+        "model": resolved_model,
+        "memory_bridge": memory_enabled,
+        "opencode": opencode,
+        "written": written,
+        "warnings": warnings,
+    });
+    Ok((text, json))
+}
+
+/// `gi opencode import <path>` — translate an `opencode.json`/`.jsonc` into gi
+/// settings. Default prints to stdout; `--out <path>` writes the translated JSON.
+fn opencode_import(
+    path: &str,
+    out_path: Option<&str>,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let source =
+        std::fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let cleaned = opencode_interop::strip_jsonc_comments(&source);
+    let opencode: serde_json::Value = serde_json::from_str(&cleaned)
+        .map_err(|error| format!("{path} is not valid JSON/JSONC: {error}"))?;
+
+    let (gi, warnings) = opencode_interop::opencode_to_gi(&opencode);
+    let pretty = serde_json::to_string_pretty(&gi)?;
+
+    let mut written: Option<String> = None;
+    if let Some(target) = out_path {
+        if let Some(parent) = Path::new(target).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(target, format!("{pretty}\n"))?;
+        written = Some(target.to_string());
+    }
+
+    let mut text = match &written {
+        Some(target) => format!("Wrote gi settings to {target} (review before committing)."),
+        None => pretty.clone(),
+    };
+    if !warnings.is_empty() {
+        text.push_str("\n\nSkipped (no gi counterpart):");
+        for warning in &warnings {
+            text.push_str(&format!("\n  - {warning}"));
+        }
+    }
+
+    let json = json!({
+        "kind": "opencode",
+        "action": "import",
+        "source": path,
+        "settings": gi,
+        "written": written,
+        "warnings": warnings,
+    });
+    Ok((text, json))
+}
+
+/// `gi opencode status` — report which opencode/interop artifacts exist in the
+/// working directory and which translate.
+fn opencode_status(cwd: &Path) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let opencode_json = cwd.join("opencode.json").exists();
+    let opencode_jsonc = cwd.join("opencode.jsonc").exists();
+    let agents_md = cwd.join("AGENTS.md").exists();
+    let opencode_dir = cwd.join(".opencode").is_dir();
+
+    let mut text = format!(
+        "Opencode interop · {}\n  opencode.json   {}\n  opencode.jsonc  {}\n  AGENTS.md       {}\n  .opencode/      {}",
+        cwd.display(),
+        yes_no(opencode_json),
+        yes_no(opencode_jsonc),
+        yes_no(agents_md),
+        yes_no(opencode_dir),
+    );
+    text.push_str(
+        "\n\nAGENTS.md is read natively by gi. Run `gi opencode export` to generate an opencode.json from gi's config, or `gi opencode import <opencode.json>` to translate one in.",
+    );
+
+    let json = json!({
+        "kind": "opencode",
+        "action": "status",
+        "opencode_json": opencode_json,
+        "opencode_jsonc": opencode_jsonc,
+        "agents_md": agents_md,
+        "opencode_dir": opencode_dir,
+    });
+    Ok((text, json))
+}
+
+/// Repo-relative paths of discovered instruction files, for opencode's
+/// `instructions` array.
+fn instruction_file_rel_paths(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let project_context = ProjectContext::discover(cwd, DEFAULT_DATE)?;
+    Ok(project_context
+        .instruction_files
+        .iter()
+        .map(|file| {
+            file.path
+                .strip_prefix(cwd)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "present"
+    } else {
+        "—"
     }
 }
 

@@ -150,6 +150,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "opencode",
+        aliases: &[],
+        summary: "Opencode interop: export | import | status",
+        argument_hint: Some("[export | import <path> | status]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "init",
         aliases: &[],
         summary: "Create a starter CLAUDE.md for this repo",
@@ -1098,6 +1105,9 @@ pub enum SlashCommand {
     Memory {
         args: Option<String>,
     },
+    Opencode {
+        args: Option<String>,
+    },
     Init,
     Diff,
     Version,
@@ -1244,6 +1254,7 @@ impl SlashCommand {
             Self::Setup => "/setup",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
+            Self::Opencode { .. } => "/opencode",
             Self::History { .. } => "/history",
             Self::Diff => "/diff",
             Self::Status => "/status",
@@ -1385,6 +1396,7 @@ pub fn validate_slash_command_input(
         },
         "mcp" => parse_mcp_command(&args)?,
         "memory" => SlashCommand::Memory { args: remainder },
+        "opencode" => SlashCommand::Opencode { args: remainder },
         "init" => {
             validate_no_args(command, &args)?;
             SlashCommand::Init
@@ -1931,12 +1943,12 @@ fn slash_command_category(name: &str) -> &'static str {
         | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
             "Session"
         }
-        "model" | "permissions" | "config" | "memory" | "theme" | "vim" | "voice" | "color"
-        | "effort" | "fast" | "brief" | "output-style" | "keybindings" | "privacy-settings"
-        | "stickers" | "language" | "profile" | "max-tokens" | "temperature" | "system-prompt"
-        | "api-key" | "terminal-setup" | "notifications" | "telemetry" | "providers" | "env"
-        | "project" | "reasoning" | "budget" | "rate-limit" | "workspace" | "reset" | "ide"
-        | "desktop" | "upgrade" | "setup" => "Config",
+        "model" | "permissions" | "config" | "memory" | "opencode" | "theme" | "vim" | "voice"
+        | "color" | "effort" | "fast" | "brief" | "output-style" | "keybindings"
+        | "privacy-settings" | "stickers" | "language" | "profile" | "max-tokens"
+        | "temperature" | "system-prompt" | "api-key" | "terminal-setup" | "notifications"
+        | "telemetry" | "providers" | "env" | "project" | "reasoning" | "budget" | "rate-limit"
+        | "workspace" | "reset" | "ide" | "desktop" | "upgrade" | "setup" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -5577,6 +5589,7 @@ pub fn handle_slash_command(
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory { .. }
+        | SlashCommand::Opencode { .. }
         | SlashCommand::Init
         | SlashCommand::Diff
         | SlashCommand::Version
@@ -5900,6 +5913,12 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/memory"),
             Ok(Some(SlashCommand::Memory { args: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/opencode export"),
+            Ok(Some(SlashCommand::Opencode {
+                args: Some("export".to_string())
+            }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));
@@ -6245,7 +6264,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 141);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

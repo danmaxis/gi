@@ -438,7 +438,13 @@ mod tests {
     use super::*;
 
     fn temp_store() -> MemoryStore {
-        let dir = std::env::temp_dir().join(format!("gi-memory-test-{}", now_ms()));
+        // Unique per call: `now_ms()` alone collides when tests run in parallel
+        // (two stores in the same millisecond would share a directory and
+        // cross-contaminate), so add a process-unique counter.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("gi-memory-test-{}-{unique}", now_ms()));
         MemoryStore::at(dir)
     }
 

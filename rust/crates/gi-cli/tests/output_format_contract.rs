@@ -1441,6 +1441,57 @@ fn opencode_export_import_status_emit_translated_json() {
 }
 
 #[test]
+fn agent_show_and_default_agent_status_emit_json() {
+    // Slice 9: `gi agent show` reports an agent's resolved model/effort, and a
+    // configured `defaultAgent` surfaces in `gi status --output-format json`.
+    let root = unique_temp_dir("agent-profiles");
+    let config_home = root.join("config-home");
+    let home = root.join("home");
+    fs::create_dir_all(root.join(".gi").join("agents")).expect("agents dir should exist");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&home).expect("home should exist");
+    fs::write(
+        root.join(".gi").join("agents").join("reviewer.toml"),
+        "name = \"reviewer\"\ndescription = \"Careful code reviewer.\"\nmodel = \"anthropic/claude-sonnet-4-6\"\nmodel_reasoning_effort = \"high\"\n",
+    )
+    .expect("write agent fixture");
+    let envs = [
+        (
+            "GI_CONFIG_HOME",
+            config_home.to_str().expect("utf8 config home"),
+        ),
+        ("HOME", home.to_str().expect("utf8 home")),
+    ];
+
+    // `gi agent show reviewer` → resolved model + effort.
+    let show = assert_json_command_with_env(
+        &root,
+        &["--output-format", "json", "agent", "show", "reviewer"],
+        &envs,
+    );
+    assert_eq!(show["kind"], "agent");
+    assert_eq!(show["action"], "show");
+    assert_eq!(show["name"], "reviewer");
+    assert_eq!(show["model"], "anthropic/claude-sonnet-4-6");
+    assert_eq!(show["reasoning_effort"], "high");
+
+    // `gi agent list` includes it.
+    let list =
+        assert_json_command_with_env(&root, &["--output-format", "json", "agent", "list"], &envs);
+    assert_eq!(list["action"], "list");
+    assert_eq!(list["agents"][0]["name"], "reviewer");
+
+    // `defaultAgent` in settings → surfaced by `gi status`.
+    fs::write(
+        root.join(".gi").join("settings.json"),
+        r#"{ "defaultAgent": "reviewer" }"#,
+    )
+    .expect("write settings");
+    let status = assert_json_command_with_env(&root, &["--output-format", "json", "status"], &envs);
+    assert_eq!(status["default_agent"], "reviewer");
+}
+
+#[test]
 fn memory_discovery_stops_at_git_root_and_reports_origins_439() {
     let root = unique_temp_dir("memory-boundary-439");
     let repo = root.join("repo");

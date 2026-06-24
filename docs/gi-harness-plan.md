@@ -266,6 +266,63 @@ source is vendored; shell-hook ↔ TS-plugin handoff is documented, not auto-tra
 Pure translation core in `crates/gi-cli/src/opencode_interop.rs`; mapping reference in
 `docs/opencode-compat.md`.
 
+## Roadmap extension: UX & Agents (Slices 9–14)
+
+Goal: make gi feel as polished and capable as more mature terminal agents (opencode,
+Claude Code) — opencode-style agents with easy per-agent model switching and a default
+model, plus a more aesthetically pleasing interface (kanji motion, margins, bounding
+boxes). Sequencing is **agents first**, then a **hybrid** visual track (inline panels
+now; an opt-in full-screen TUI later — the line-stream REPL stays the default).
+
+### Slice 9: Agent profiles — per-agent model, default model, `/agent` switching
+
+- [x] `/agent [<name> | reset | list]` switches the active agent, applying its declared
+  `model` + `model_reasoning_effort` via the existing runtime-switch path.
+- [x] `defaultAgent` config key auto-activates an agent at REPL start (explicit `--model`
+  still wins); `model` config remains the base default model.
+- [x] Surface the active agent in the banner + `/status`; surface `defaultAgent` in
+  `gi status --output-format json`.
+- [x] `gi agent list | show <name>` CLI (read-only preview, `--output-format json`).
+
+Done 2026-06-24: agent definitions (already carrying optional `model`/`model_reasoning_effort`)
+are now *active*. `/agent` reuses `LiveCli::set_model`/`set_reasoning_effort`; a public
+`resolve_agent_profile`/`list_agent_profiles` in the commands crate backs the REPL switch,
+the resume preview, and the `gi agent` CLI. `defaultAgent` lives in `RuntimeFeatureConfig`.
+Docs: `docs/agents.md`.
+
+### Slice 10: Subagent spawn tool (opencode-style)
+
+- [ ] A model-callable tool that runs a *named agent as a subagent* with its own model +
+  prompt to completion and returns the result, building on Slice 9's resolution and the
+  existing `task_registry` / `worker_boot` infra.
+- [ ] Per-spawn model/effort override; result captured back into the parent turn.
+
+### Slice 11: Inline visual panels, margins & command-popup ranking (Phase-1 aesthetics)
+
+- [ ] Width-aware layout via `crossterm::terminal::size`; bordered panels + consistent
+  left margin/gutter for assistant and tool output, reusing `render.rs` box primitives +
+  theme slots; graceful narrow-terminal and `NO_COLOR` fallbacks.
+- [ ] Order the live `/` popup by context/usefulness: with an empty filter, rank by a
+  curated priority list of common commands plus session recency/frequency, and keep
+  answer-style tokens (`/y`, `/n`) out of the initial suggestions (the fuzzy filter takes
+  over once the user types). `crates/gi-cli/src/input.rs`.
+
+### Slice 12: Kanji motion & richer thinking states
+
+- [ ] Animated splash (kanji gradient shimmer / stroke reveal) and per-phase thinking
+  glyphs, building on the `start_thinking_animation` thread + `gi_gradient`; TTY-gated,
+  `NO_COLOR`-safe.
+
+### Slice 13: Theme expansion & status line
+
+- [ ] More palettes beyond dark/light; a persistent status line (model · agent · tokens ·
+  branch) in the inline model; `/theme` preview.
+
+### Slice 14: Opt-in full-screen TUI (`gi --tui`, Phase 2)
+
+- [ ] ratatui-based persistent layout (scrollback pane + input + status regions) reusing
+  the Slice 11–13 theme/panel vocabulary. Strictly opt-in; the line-stream stays default.
+
 ## Acceptance Criteria
 
 - `cargo build --workspace` succeeds.

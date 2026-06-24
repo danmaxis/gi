@@ -259,6 +259,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "agent",
+        aliases: &[],
+        summary: "Switch the active agent (applies its model + reasoning effort)",
+        argument_hint: Some("[<name> | reset | list]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1125,6 +1132,9 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
+    Agent {
+        args: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1255,6 +1265,7 @@ impl SlashCommand {
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::Opencode { .. } => "/opencode",
+            Self::Agent { .. } => "/agent",
             Self::History { .. } => "/history",
             Self::Diff => "/diff",
             Self::Status => "/status",
@@ -1415,6 +1426,7 @@ pub fn validate_slash_command_input(
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
         },
+        "agent" => SlashCommand::Agent { args: remainder },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -1943,8 +1955,8 @@ fn slash_command_category(name: &str) -> &'static str {
         | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
             "Session"
         }
-        "model" | "permissions" | "config" | "memory" | "opencode" | "theme" | "vim" | "voice"
-        | "color" | "effort" | "fast" | "brief" | "output-style" | "keybindings"
+        "model" | "agent" | "permissions" | "config" | "memory" | "opencode" | "theme" | "vim"
+        | "voice" | "color" | "effort" | "fast" | "brief" | "output-style" | "keybindings"
         | "privacy-settings" | "stickers" | "language" | "profile" | "max-tokens"
         | "temperature" | "system-prompt" | "api-key" | "terminal-setup" | "notifications"
         | "telemetry" | "providers" | "env" | "project" | "reasoning" | "budget" | "rate-limit"
@@ -4147,6 +4159,52 @@ fn load_agents_from_roots_with_invalids(
     })
 }
 
+/// A resolved agent profile, exposed for activation (`/agent <name>`,
+/// `defaultAgent`, the `gi agent` CLI). Carries the fields needed to switch the
+/// active model + reasoning effort. Slice 9.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProfile {
+    pub name: String,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// Human-readable scope label (e.g. "project", "user").
+    pub source: String,
+}
+
+impl AgentProfile {
+    fn from_summary(summary: &AgentSummary) -> Self {
+        Self {
+            name: summary.name.clone(),
+            description: summary.description.clone(),
+            model: summary.model.clone(),
+            reasoning_effort: summary.reasoning_effort.clone(),
+            source: summary.source.label().to_string(),
+        }
+    }
+}
+
+/// List the active (non-shadowed) agent profiles discovered from `cwd`, in
+/// discovery order. Reuses the same roots + loader as `/agents`.
+pub fn list_agent_profiles(cwd: &Path) -> std::io::Result<Vec<AgentProfile>> {
+    let roots = discover_definition_roots(cwd, "agents");
+    let agents = load_agents_from_roots(&roots)?;
+    Ok(agents
+        .iter()
+        .filter(|agent| agent.shadowed_by.is_none())
+        .map(AgentProfile::from_summary)
+        .collect())
+}
+
+/// Resolve a single active agent by name (case-insensitive). Returns `None`
+/// when no non-shadowed agent matches.
+pub fn resolve_agent_profile(name: &str, cwd: &Path) -> std::io::Result<Option<AgentProfile>> {
+    let target = name.trim().to_ascii_lowercase();
+    Ok(list_agent_profiles(cwd)?
+        .into_iter()
+        .find(|agent| agent.name.to_ascii_lowercase() == target))
+}
+
 fn load_skills_from_roots(roots: &[SkillRoot]) -> std::io::Result<Vec<SkillSummary>> {
     let collection = load_skills_from_roots_with_drift(roots)?;
     Ok(collection.skills)
@@ -5597,6 +5655,7 @@ pub fn handle_slash_command(
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
+        | SlashCommand::Agent { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
         | SlashCommand::Login
@@ -5918,6 +5977,12 @@ mod tests {
             SlashCommand::parse("/opencode export"),
             Ok(Some(SlashCommand::Opencode {
                 args: Some("export".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/agent reviewer"),
+            Ok(Some(SlashCommand::Agent {
+                args: Some("reviewer".to_string())
             }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
@@ -6264,7 +6329,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -6601,6 +6666,63 @@ mod tests {
 
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(user_home);
+    }
+
+    #[test]
+    fn resolve_agent_profile_returns_model_and_effort() {
+        // Slice 9: the public resolver surfaces an agent's model + effort for
+        // activation, case-insensitively, with isolated env so only the project
+        // root contributes.
+        let _guard = env_guard();
+        let workspace = temp_dir("agent-profile-workspace");
+        let project_agents = workspace.join(".gi").join("agents");
+        let isolated_home = temp_dir("agent-profile-home");
+        let config_home = temp_dir("agent-profile-config-home");
+        let codex_home = temp_dir("agent-profile-codex-home");
+        let claude_config = temp_dir("agent-profile-claude-config");
+        for dir in [&isolated_home, &config_home, &codex_home, &claude_config] {
+            fs::create_dir_all(dir).expect("isolation dir");
+        }
+        let originals = [
+            ("HOME", std::env::var_os("HOME")),
+            ("GI_CONFIG_HOME", std::env::var_os("GI_CONFIG_HOME")),
+            ("CODEX_HOME", std::env::var_os("CODEX_HOME")),
+            ("CLAUDE_CONFIG_DIR", std::env::var_os("CLAUDE_CONFIG_DIR")),
+        ];
+        std::env::set_var("HOME", &isolated_home);
+        std::env::set_var("GI_CONFIG_HOME", &config_home);
+        std::env::set_var("CODEX_HOME", &codex_home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
+
+        write_agent(
+            &project_agents,
+            "reviewer",
+            "Reviewer",
+            "anthropic/x",
+            "high",
+        );
+
+        let profiles = crate::list_agent_profiles(&workspace).expect("list profiles");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "reviewer");
+
+        let resolved = crate::resolve_agent_profile("REVIEWER", &workspace)
+            .expect("resolve")
+            .expect("agent present");
+        assert_eq!(resolved.model.as_deref(), Some("anthropic/x"));
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+
+        assert!(crate::resolve_agent_profile("nope", &workspace)
+            .expect("resolve missing")
+            .is_none());
+
+        for (key, value) in originals {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

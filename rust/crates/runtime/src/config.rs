@@ -164,6 +164,7 @@ pub struct RuntimeFeatureConfig {
     rules_import: RulesImportConfig,
     provider: RuntimeProviderConfig,
     memory: RuntimeMemoryConfig,
+    default_agent: Option<String>,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -834,6 +835,7 @@ fn build_runtime_config(
         rules_import: parse_optional_rules_import(&merged_value)?,
         provider: parse_optional_provider_config(&merged_value)?,
         memory: parse_optional_memory_config(&merged_value)?,
+        default_agent: parse_optional_default_agent(&merged_value),
     };
 
     Ok(RuntimeConfig {
@@ -967,6 +969,12 @@ impl RuntimeConfig {
         &self.feature_config.memory
     }
 
+    /// The agent to auto-activate at session start (`defaultAgent`), if set. Slice 9.
+    #[must_use]
+    pub fn default_agent(&self) -> Option<&str> {
+        self.feature_config.default_agent.as_deref()
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -991,6 +999,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn memory(&self) -> &RuntimeMemoryConfig {
         &self.memory
+    }
+
+    /// The agent to auto-activate at session start (`defaultAgent`), if set.
+    #[must_use]
+    pub fn default_agent(&self) -> Option<&str> {
+        self.default_agent.as_deref()
     }
 
     #[must_use]
@@ -1784,6 +1798,16 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
     root.as_object()
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// The agent (by name) to activate automatically when a session starts. Slice 9.
+fn parse_optional_default_agent(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| object.get("defaultAgent"))
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
 }
 

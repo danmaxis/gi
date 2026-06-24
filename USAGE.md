@@ -324,6 +324,24 @@ memory enabled, export also writes a generated `.opencode/plugin/gi-memory.js`
 bridge. No opencode code is vendored. The same verbs are available in the REPL as
 `/opencode`. Full mapping: [`docs/opencode-compat.md`](./docs/opencode-compat.md).
 
+## Agents
+
+An agent is a named profile (description + optional model + reasoning effort) defined
+under `.gi/agents/<name>.toml` (or `.md`). Switch to one mid-session to apply its model
+and effort:
+
+```
+/agent                 # list agents (active one marked ▸)
+/agent reviewer        # switch — applies the agent's model + reasoning effort
+/agent reset           # back to the base model
+```
+
+Set `"defaultAgent": "reviewer"` in `.gi/settings.json` to auto-activate one at startup
+(an explicit `--model` flag still wins). Preview agents non-interactively with `gi agent
+list` / `gi agent show <name>` (`--output-format json` supported); the active/default
+agent shows in the banner, `/status`, and `gi status --output-format json`. Full details:
+[`docs/agents.md`](./docs/agents.md).
+
 ## Authentication
 
 ### API key

@@ -1118,6 +1118,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 CliOutputFormat::Text => println!("{text}"),
             }
         }
+        CliAction::Agent {
+            args,
+            output_format,
+        } => {
+            let cwd = env::current_dir()?;
+            let (text, json) = agent_command(args.as_deref(), &cwd)?;
+            match output_format {
+                CliOutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                CliOutputFormat::Text => println!("{text}"),
+            }
+        }
         CliAction::Acp { output_format } => {
             print_acp_status(output_format)?;
             std::process::exit(2);
@@ -1277,6 +1290,10 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Opencode {
+        args: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    Agent {
         args: Option<String>,
         output_format: CliOutputFormat,
     },
@@ -2500,7 +2517,7 @@ fn parse_single_word_command_alias(
     // Known CLI subcommands that don't accept additional arguments
     const CLI_SUBCOMMANDS: &[&str] = &[
         "help", "version", "status", "sandbox", "doctor", "state", "config", "diff", "memory",
-        "opencode",
+        "opencode", "agent",
     ];
     if rest.len() > 1 && !CLI_SUBCOMMANDS.contains(&rest[0].as_str()) {
         return None;
@@ -2533,6 +2550,13 @@ fn parse_single_word_command_alias(
             output_format,
         })),
         "opencode" => Some(Ok(CliAction::Opencode {
+            args: rest
+                .get(1..)
+                .map(|tokens| tokens.join(" "))
+                .filter(|joined| !joined.is_empty()),
+            output_format,
+        })),
+        "agent" => Some(Ok(CliAction::Agent {
             args: rest
                 .get(1..)
                 .map(|tokens| tokens.join(" "))
@@ -6730,6 +6754,131 @@ fn format_model_switch_report(previous: &str, next: &str, message_count: usize) 
     )
 }
 
+/// Render the `/agent list` view: each agent, its model/effort, and a marker
+/// for the active one. Slice 9.
+fn format_agent_list(profiles: &[commands::AgentProfile], active: Option<&str>) -> String {
+    if profiles.is_empty() {
+        return "No agents found. Define one under .gi/agents/<name>.toml (or .md).\n".to_string();
+    }
+    let mut out = String::from("Agents\n");
+    for profile in profiles {
+        let marker = if active == Some(profile.name.as_str()) {
+            "▸"
+        } else {
+            " "
+        };
+        let model = profile
+            .model
+            .as_deref()
+            .unwrap_or("(inherits session model)");
+        let effort = profile
+            .reasoning_effort
+            .as_deref()
+            .map(|effort| format!(" · effort {effort}"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {marker} {}  {model}{effort}  [{}]\n",
+            profile.name, profile.source
+        ));
+    }
+    out.push_str("\nUse /agent <name> to switch, /agent reset to revert.\n");
+    out
+}
+
+/// Read-only `agent` handler shared by the `gi agent` CLI and the resume path:
+/// `list` (default) and `show <name>` preview an agent's resolved model/effort
+/// without switching (interactive switching is `/agent` in the REPL). Slice 9.
+fn agent_command(
+    args: Option<&str>,
+    cwd: &Path,
+) -> Result<(String, serde_json::Value), Box<dyn std::error::Error>> {
+    let raw = args.map(str::trim).unwrap_or("");
+    let (sub, rest) = raw
+        .split_once(char::is_whitespace)
+        .map_or((raw, ""), |(sub, rest)| (sub, rest.trim()));
+
+    let show = |profile: &commands::AgentProfile| -> (String, serde_json::Value) {
+        let model = profile
+            .model
+            .clone()
+            .unwrap_or_else(|| "(inherits session model)".to_string());
+        let text = format!(
+            "Agent {}\n  Model   {model}\n  Effort  {}\n  Source  {}\n  {}",
+            profile.name,
+            profile.reasoning_effort.as_deref().unwrap_or("(default)"),
+            profile.source,
+            profile.description.as_deref().unwrap_or(""),
+        );
+        let json = json!({
+            "kind": "agent", "action": "show", "name": profile.name,
+            "model": profile.model, "reasoning_effort": profile.reasoning_effort,
+            "source": profile.source, "description": profile.description,
+        });
+        (text, json)
+    };
+
+    match sub {
+        "" | "list" => {
+            let profiles = commands::list_agent_profiles(cwd)?;
+            let text = format_agent_list(&profiles, None);
+            let json = json!({
+                "kind": "agent", "action": "list",
+                "agents": profiles.iter().map(|profile| json!({
+                    "name": profile.name, "model": profile.model,
+                    "reasoning_effort": profile.reasoning_effort,
+                    "source": profile.source, "description": profile.description,
+                })).collect::<Vec<_>>(),
+            });
+            Ok((text, json))
+        }
+        "show" => {
+            if rest.is_empty() {
+                return Ok((
+                    "Usage: gi agent show <name>".to_string(),
+                    json!({ "kind": "agent", "action": "show", "status": "error" }),
+                ));
+            }
+            match commands::resolve_agent_profile(rest, cwd)? {
+                Some(profile) => Ok(show(&profile)),
+                None => Ok((
+                    format!("No agent named `{rest}`."),
+                    json!({ "kind": "agent", "action": "show", "status": "not_found", "name": rest }),
+                )),
+            }
+        }
+        // Bare `gi agent <name>` → show that agent.
+        name => match commands::resolve_agent_profile(name, cwd)? {
+            Some(profile) => Ok(show(&profile)),
+            None => Ok((
+                format!("Unknown agent subcommand or name `{name}`. Try: list | show <name>"),
+                json!({ "kind": "agent", "action": "list", "status": "error", "message": format!("unknown {name}") }),
+            )),
+        },
+    }
+}
+
+/// Resolve the configured `defaultAgent` (if any) to its profile. Returns `None`
+/// when unset; warns to stderr and returns `None` when the named agent is
+/// missing. Slice 9.
+fn default_agent_profile(
+    cwd: &Path,
+) -> Result<Option<commands::AgentProfile>, Box<dyn std::error::Error>> {
+    let Some(name) = ConfigLoader::default_for(cwd)
+        .load()
+        .ok()
+        .and_then(|config| config.default_agent().map(str::to_string))
+    else {
+        return Ok(None);
+    };
+    match commands::resolve_agent_profile(&name, cwd)? {
+        Some(profile) => Ok(Some(profile)),
+        None => {
+            eprintln!("defaultAgent `{name}` is not defined under .gi/agents/; ignoring.");
+            Ok(None)
+        }
+    }
+}
+
 fn format_permissions_report(mode: &str) -> String {
     let modes = [
         ("read-only", "Read/search tools only", mode == "read-only"),
@@ -7354,6 +7503,17 @@ fn run_resume_command(
                 ),
             })
         }
+        SlashCommand::Agent { args } => {
+            // Resume context has no live runtime to switch the model on, so this
+            // previews agent resolution (read-only) rather than switching.
+            let cwd = env::current_dir()?;
+            let (text, json) = agent_command(args.as_deref(), &cwd)?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(text),
+                json: Some(json),
+            })
+        }
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 // #779: use interactive_only: prefix + \n hint so #776 classify/split emits
@@ -7713,9 +7873,27 @@ fn run_repl(
         apply_saved_provider_env();
         println!();
     }
-    let resolved_model = resolve_repl_model(model)?;
+    // Resolve the model with provenance so an explicit `--model` flag wins over
+    // a configured `defaultAgent`'s model (Slice 9).
+    let provenance = ModelProvenance::from_env_or_config_or_default(&model)?;
+    let model_was_flag = matches!(provenance.source, ModelSource::Flag);
+    let mut resolved_model = provenance.resolved;
+    let mut effort = reasoning_effort;
+    let repl_cwd = env::current_dir()?;
+    let active_agent = default_agent_profile(&repl_cwd)?.map(|profile| {
+        if let Some(agent_model) = profile.model.as_deref() {
+            if !model_was_flag {
+                resolved_model = resolve_model_alias_with_config(agent_model);
+            }
+        }
+        if effort.is_none() {
+            effort.clone_from(&profile.reasoning_effort);
+        }
+        profile.name
+    });
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
-    cli.set_reasoning_effort(reasoning_effort);
+    cli.set_reasoning_effort(effort);
+    cli.active_agent = active_agent;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -7798,6 +7976,9 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Name of the active agent (Slice 9), if one was selected via `/agent` or
+    /// `defaultAgent`. The agent's model already lives in `self.model`.
+    active_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8550,6 +8731,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            active_agent: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -8579,9 +8761,16 @@ impl LiveCli {
             |_| self.session.path.display().to_string(),
             |path| path.display().to_string(),
         );
+        let agent_line = self
+            .active_agent
+            .as_deref()
+            .map_or_else(String::new, |name| {
+                format!("  \x1b[2mAgent\x1b[0m            {name}\n")
+            });
         let banner = format!(
             "{}\n\
   \x1b[2mModel\x1b[0m            {}\n\
+{}\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
@@ -8591,6 +8780,7 @@ impl LiveCli {
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             startup_logo(true),
             self.model,
+            agent_line,
             self.permission_mode.as_str(),
             git_branch,
             workspace,
@@ -9085,6 +9275,12 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Agent { args } => {
+                if let Err(error) = self.handle_agent_command(args.as_deref()) {
+                    eprintln!("{error}");
+                }
+                false
+            }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
                     SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
@@ -9204,6 +9400,9 @@ impl LiveCli {
                 None,
             )
         );
+        if let Some(agent) = self.active_agent.as_deref() {
+            println!("Agent            {agent} · model {}", self.model);
+        }
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -9316,6 +9515,73 @@ impl LiveCli {
             format_model_switch_report(&previous, &model, message_count)
         );
         Ok(true)
+    }
+
+    /// `/agent [<name> | reset | list]` — switch the active agent (Slice 9).
+    /// Selecting an agent applies its declared model + reasoning effort via the
+    /// same runtime-switch path as `/model`; `reset` reverts to the base model.
+    fn handle_agent_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        match args.map(str::trim).unwrap_or("") {
+            "" | "list" => {
+                let profiles = commands::list_agent_profiles(&cwd)?;
+                print!(
+                    "{}",
+                    format_agent_list(&profiles, self.active_agent.as_deref())
+                );
+            }
+            "reset" | "none" | "default" => {
+                if self.active_agent.is_none() {
+                    println!("No active agent.");
+                    return Ok(());
+                }
+                let base = ModelProvenance::from_env_or_config_or_default(DEFAULT_MODEL)
+                    .map_or_else(
+                        |_| DEFAULT_MODEL.to_string(),
+                        |provenance| provenance.resolved,
+                    );
+                self.active_agent = None;
+                self.set_reasoning_effort(None);
+                self.set_model(Some(base))?;
+                println!("Agent cleared — back to the base model.");
+            }
+            name => match commands::resolve_agent_profile(name, &cwd)? {
+                Some(profile) => self.activate_agent(&profile)?,
+                None => {
+                    println!("No agent named `{name}`. Run /agent list to see available agents.")
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Apply a resolved agent: switch model (if it declares one) and reasoning
+    /// effort, then record it as active.
+    fn activate_agent(
+        &mut self,
+        profile: &commands::AgentProfile,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(model) = profile.model.clone() {
+            self.set_model(Some(model))?;
+        }
+        if let Some(effort) = profile.reasoning_effort.clone() {
+            self.set_reasoning_effort(Some(effort));
+        }
+        self.active_agent = Some(profile.name.clone());
+        println!(
+            "▸ Agent {} active · model {}{}",
+            profile.name,
+            self.model,
+            profile
+                .reasoning_effort
+                .as_deref()
+                .map(|effort| format!(" · effort {effort}"))
+                .unwrap_or_default()
+        );
+        Ok(())
     }
 
     fn set_permissions(
@@ -10558,6 +10824,12 @@ fn status_json_value(
     // `config_load_error_kind` is the machine-readable kind token derived from
     // `classify_error_kind` so downstream claws can switch on it directly.
     let degraded = context.config_load_error.is_some();
+    // Slice 9: surface the configured `defaultAgent` (the agent auto-activated
+    // at REPL start), read from merged config.
+    let default_agent = env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .and_then(|config| config.default_agent().map(str::to_string));
     let model_source = provenance.map(|p| p.source.as_str());
     let model_raw = provenance.and_then(|p| p.raw.clone());
     let model_alias_resolved_to = provenance.and_then(|p| p.alias_resolved_to.clone());
@@ -10636,6 +10908,7 @@ fn status_json_value(
         "model_raw": model_raw,
         "model_alias_resolved_to": model_alias_resolved_to,
         "model_env_var": model_env_var,
+        "default_agent": default_agent,
         "provider": provider_block,
         "permission_mode": permission_mode,
         "permission_mode_source": permission_mode_source,

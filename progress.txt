@@ -601,3 +601,25 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - Docs: docs/opencode-compat.md (mapping table, hook handoff, memory bridge, scope), USAGE.md
   "Opencode compatibility" section, gi-harness-plan.md Slice 8 ticked. Tests: opencode_interop
   unit (9) + output_format_contract opencode_export_import_status_emit_translated_json.
+
+## Slice 9 — Agent profiles: per-agent model, default model, /agent switching (2026-06-24)
+- Agent definitions already carried optional model + model_reasoning_effort but were inert;
+  now active. commands crate exposes pub AgentProfile + list_agent_profiles/resolve_agent_profile
+  (reusing discover_definition_roots + load_agents_from_roots; non-shadowed, case-insensitive).
+- /agent [<name>|reset|list] (SlashCommand::Agent) switches the active agent in the REPL via
+  LiveCli::handle_agent_command → reuses set_model + set_reasoning_effort (no new runtime infra);
+  LiveCli.active_agent tracks it. /agent list marks the active one.
+- defaultAgent config (RuntimeFeatureConfig.default_agent + parse_optional_default_agent +
+  RuntimeConfig::default_agent() + config_validate FieldSpec). Auto-activates at REPL start in
+  run_repl using ModelProvenance so an explicit --model flag wins; builds the runtime once with
+  the agent's model (no noisy startup switch). default_agent_profile() helper.
+- Surfacing: startup banner Agent line; REPL /status Agent line; gi status --output-format json
+  default_agent field; gi agent list|show <name> CLI (CliAction::Agent, read-only preview, json),
+  also backs the resume path via shared agent_command().
+- Docs: docs/agents.md (definition format, scopes, /agent, defaultAgent, precedence, relation to
+  subagentModel + future spawn tool); USAGE "Agents" section; Slices 9-14 roadmap appended to
+  docs/gi-harness-plan.md. Tests: commands resolve_agent_profile_returns_model_and_effort;
+  /agent parse + help-count 142->143; output_format_contract agent_show_and_default_agent_status.
+- Roadmap extension defined (agents first, then hybrid visuals): Slice 10 subagent spawn tool;
+  11 inline panels/margins + /-popup usefulness ranking; 12 kanji motion; 13 themes+status line;
+  14 opt-in ratatui TUI.

@@ -7907,6 +7907,10 @@ fn run_repl(
                 if trimmed.is_empty() {
                     continue;
                 }
+                // Record every non-empty submission — slash commands included —
+                // so the Up arrow recalls them (slash commands `continue` below
+                // and would otherwise never reach a push_history call).
+                editor.push_history(input);
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
@@ -7929,12 +7933,10 @@ fn run_repl(
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
                 let cwd = std::env::current_dir().unwrap_or_default();
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
                     cli.record_prompt_history(&trimmed);
                     cli.run_turn(&prompt)?;
                     continue;
                 }
-                editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn(&trimmed)?;
             }
@@ -15102,6 +15104,9 @@ fn slash_command_completion_candidates_with_sessions(
         "/agents help",
         "/mcp help",
         "/skills help",
+        // REPL-only session controls (handled directly in the loop, not specs).
+        "/exit",
+        "/quit",
     ] {
         completions.insert(candidate.to_string());
     }
@@ -21824,12 +21829,20 @@ UU conflicted.rs",
         let candidates =
             slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
         for stub in STUB_COMMANDS {
+            // `/exit` is intentionally surfaced as a REPL session control (handled
+            // directly by the loop, not the stub spec) alongside `/quit`.
+            if *stub == "exit" {
+                continue;
+            }
             let with_slash = format!("/{stub}");
             assert!(
                 !candidates.contains(&with_slash),
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+        // The REPL session controls are present.
+        assert!(candidates.contains(&"/exit".to_string()));
+        assert!(candidates.contains(&"/quit".to_string()));
     }
 
     #[test]

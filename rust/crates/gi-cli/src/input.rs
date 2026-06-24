@@ -378,6 +378,10 @@ fn describe_completion(candidate: &str) -> Option<&'static str> {
         .trim_start_matches('/')
         .split_whitespace()
         .next()?;
+    // REPL-only session controls aren't in the shared spec list.
+    if matches!(base, "exit" | "quit") {
+        return Some("Save the session and leave the REPL");
+    }
     commands::slash_command_specs()
         .iter()
         .find(|spec| spec.name == base || spec.aliases.contains(&base))
@@ -408,8 +412,8 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_index, command_needs_arg, fuzzy_score, insert_char, normalize_completions,
-        remove_char, starts_with_ci, LineEditor,
+        byte_index, command_needs_arg, describe_completion, fuzzy_score, insert_char,
+        normalize_completions, remove_char, starts_with_ci, LineEditor,
     };
 
     fn popup_commands(editor: &LineEditor, buffer: &str) -> Vec<String> {
@@ -463,6 +467,19 @@ mod tests {
         // `/model` has argument_hint `[model]`; `/help` has none.
         assert!(command_needs_arg("/model"));
         assert!(!command_needs_arg("/help"));
+    }
+
+    #[test]
+    fn exit_and_quit_appear_in_the_popup_with_descriptions() {
+        // REPL-only controls aren't specs, but are offered as completions with
+        // a description and take no argument.
+        let editor = LineEditor::new("> ", vec!["/exit".to_string(), "/quit".to_string()]);
+        let menu = popup_commands(&editor, "/");
+        assert!(menu.contains(&"/exit".to_string()));
+        assert!(menu.contains(&"/quit".to_string()));
+        assert!(describe_completion("/exit").is_some());
+        assert!(describe_completion("/quit").is_some());
+        assert!(!command_needs_arg("/exit"));
     }
 
     #[test]

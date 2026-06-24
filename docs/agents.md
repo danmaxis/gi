@@ -89,10 +89,49 @@ gi agent show reviewer                 # one agent's resolved model/effort/sourc
 gi agent show reviewer --output-format json
 ```
 
-## Relationship to `subagentModel` and spawned subagents
+## Agent instructions
 
-`subagentModel` is a separate setting — a fast model intended for *spawned* subagent
-subtasks. Per-agent `model` (this page) governs the **interactive** agent you switch to.
-A model-callable tool that runs an agent as a spawned subagent (with its own model and
-prompt) is planned as a later roadmap slice; until then, agents are activated
-interactively via `/agent` or at startup via `defaultAgent`.
+For Markdown agents, everything after the closing `---` of the frontmatter is the
+agent's **instruction body** — its system prompt when it runs as a spawned subagent
+(below). TOML agents can carry the same via a `prompt = """…"""` (or `instructions`)
+key. The body is optional; without it, an agent is just a model/effort profile.
+
+## Spawning subagents (`spawn_agent`)
+
+When enabled, the model can **delegate a focused subtask to a subagent** via the
+`spawn_agent` tool — opencode-style. The subagent runs to completion with its own model
+and returns its findings as the tool result, so the main agent can parallelize analysis,
+code review, search, or planning.
+
+Enable it (opt-in, off by default) in `.gi/settings.json`:
+
+```json
+{
+  "subagents": {
+    "enabled": true,
+    "model": "anthropic/claude-haiku-4-5",   // default subagent model (optional)
+    "maxIterations": 16                         // per-subagent tool-iteration cap (optional)
+  }
+}
+```
+
+The model calls it with a self-contained `prompt`, optionally naming an `agent` (to use
+its model + instructions) and/or overriding `model` / `reasoning_effort`:
+
+```json
+{ "agent": "reviewer", "prompt": "Review crates/api/src/client.rs for error handling gaps." }
+```
+
+**Safety model.** A subagent:
+
+- runs **read-only** — it can read/search the workspace but cannot edit files or run
+  commands (writes are denied), regardless of the parent's permission mode;
+- runs **non-interactively** (it cannot prompt the user);
+- is **bounded** by `maxIterations` (default 16) to cap cost;
+- **cannot spawn further subagents** — `spawn_agent` is never advertised to a subagent,
+  so nesting is capped at one level;
+- runs on its **own runtime** (its intermediate output is suppressed; you see a brief
+  `⟳ spawning …` / `✓ … finished` marker).
+
+The subagent model is resolved as: the call's `model` → the named agent's `model` →
+`subagents.model` → the compiled default.

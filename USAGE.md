@@ -339,7 +339,13 @@ and effort:
 Set `"defaultAgent": "reviewer"` in `.gi/settings.json` to auto-activate one at startup
 (an explicit `--model` flag still wins). Preview agents non-interactively with `gi agent
 list` / `gi agent show <name>` (`--output-format json` supported); the active/default
-agent shows in the banner, `/status`, and `gi status --output-format json`. Full details:
+agent shows in the banner, `/status`, and `gi status --output-format json`.
+
+**Spawning subagents.** Enable `"subagents": { "enabled": true }` to give the model a
+`spawn_agent` tool that delegates a focused subtask to a read-only subagent (its own
+model + the named agent's instructions) and returns the findings — useful for parallel
+analysis, review, or search. Subagents cannot modify files, cannot prompt, are
+iteration-bounded, and cannot spawn further subagents. Full details:
 [`docs/agents.md`](./docs/agents.md).
 
 ## Authentication

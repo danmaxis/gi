@@ -623,3 +623,25 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - Roadmap extension defined (agents first, then hybrid visuals): Slice 10 subagent spawn tool;
   11 inline panels/margins + /-popup usefulness ranking; 12 kanji motion; 13 themes+status line;
   14 opt-in ratatui TUI.
+
+## Slice 10 — Subagent spawn tool (opencode-style) (2026-06-24)
+- Model-callable `spawn_agent` runtime tool (opt-in via `subagents.enabled`). Delegates a
+  focused subtask to a read-only subagent that runs to completion with its own model and
+  returns its findings as the tool result.
+- execute_spawn_agent (CliToolExecutor): resolves optional named agent → model/effort/
+  instructions; model precedence call>agent>subagents.model>DEFAULT_MODEL; builds a fresh
+  runtime via build_runtime (own tokio executor → no deadlock when run inside a tool
+  dispatch — verified live against Ollama gemma4:12b, parent called the tool, subagent
+  returned HELLO, no hang), enable_tools + ReadOnly (writes denied), emit_output=false
+  (suppressed), bounded by subagents.maxIterations (default 16), run_turn(None prompter),
+  final_assistant_text. Brief ⟳/✓ markers when parent emit_output.
+- Recursion guard: thread-local SUBAGENT_ACTIVE + SubagentGuard RAII; local_runtime_tool_
+  definitions(memory_enabled, spawn_enabled) advertises spawn only when enabled && !subagent_
+  active(), so a subagent never gets spawn_agent → nesting capped at depth 1.
+- Config: RuntimeSubagentConfig { enabled, model, maxIterations } (parse_optional_subagents_
+  config + accessors + lib re-export + config_validate FieldSpec "subagents").
+- commands: AgentProfile/AgentSummary gain instructions; parse_agent_frontmatter captures the
+  .md body, .toml `prompt`/`instructions` key → subagent system prompt.
+- conversation.rs: ConversationRuntime::set_max_iterations (post-construction bound).
+- Docs: docs/agents.md spawn section + instructions; USAGE; roadmap Slice 10 ticked.
+- Tests: spawn_agent gating; parses_subagents_config; AgentProfile instructions from .md body.

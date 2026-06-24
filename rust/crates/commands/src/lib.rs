@@ -2199,6 +2199,9 @@ pub(crate) struct AgentSummary {
     description: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    // Slice 10: the agent's instruction body (Markdown body / TOML `prompt`),
+    // used as the subagent system prompt when spawned.
+    instructions: Option<String>,
     source: DefinitionSource,
     shadowed_by: Option<DefinitionSource>,
     // #728: on-disk path so `agents show` can surface the file path
@@ -4107,6 +4110,8 @@ fn load_agents_from_roots_with_invalids(
                         description: parse_toml_string(&contents, "description"),
                         model: parse_toml_string(&contents, "model"),
                         reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
+                        instructions: parse_toml_string(&contents, "prompt")
+                            .or_else(|| parse_toml_string(&contents, "instructions")),
                         source: *source,
                         shadowed_by: None,
                         path: Some(path),
@@ -4114,7 +4119,7 @@ fn load_agents_from_roots_with_invalids(
                 }
                 Some("md") => {
                     let contents = fs::read_to_string(&path)?;
-                    let (name, description, model, reasoning_effort) =
+                    let (name, description, model, reasoning_effort, instructions) =
                         parse_agent_frontmatter(&contents);
                     if name.is_none() && description.is_none() {
                         invalid_agents.push(InvalidAgentConfig {
@@ -4132,6 +4137,7 @@ fn load_agents_from_roots_with_invalids(
                         description,
                         model,
                         reasoning_effort,
+                        instructions,
                         source: *source,
                         shadowed_by: None,
                         path: Some(path),
@@ -4168,6 +4174,8 @@ pub struct AgentProfile {
     pub description: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    /// The agent's instruction body, used as the subagent system prompt. Slice 10.
+    pub instructions: Option<String>,
     /// Human-readable scope label (e.g. "project", "user").
     pub source: String,
 }
@@ -4179,6 +4187,7 @@ impl AgentProfile {
             description: summary.description.clone(),
             model: summary.model.clone(),
             reasoning_effort: summary.reasoning_effort.clone(),
+            instructions: summary.instructions.clone(),
             source: summary.source.label().to_string(),
         }
     }
@@ -4566,20 +4575,31 @@ fn parse_agent_frontmatter(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 ) {
     let mut lines = contents.lines();
     if lines.next().map(str::trim) != Some("---") {
-        return (None, None, None, None);
+        return (None, None, None, None, None);
     }
 
     let mut name = None;
     let mut description = None;
     let mut model = None;
     let mut reasoning_effort = None;
+    // Everything after the closing `---` is the agent's instruction body, used
+    // as the system prompt when the agent runs as a spawned subagent (Slice 10).
+    let mut in_body = false;
+    let mut body = String::new();
     for line in lines {
+        if in_body {
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed == "---" {
-            break;
+            in_body = true;
+            continue;
         }
         if let Some(value) = trimmed.strip_prefix("name:") {
             let value = unquote_frontmatter_value(value.trim());
@@ -4610,7 +4630,11 @@ fn parse_agent_frontmatter(
         }
     }
 
-    (name, description, model, reasoning_effort)
+    let instructions = {
+        let trimmed = body.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    (name, description, model, reasoning_effort, instructions)
 }
 
 fn render_agents_report(agents: &[AgentSummary]) -> String {
@@ -6715,6 +6739,22 @@ mod tests {
         assert!(crate::resolve_agent_profile("nope", &workspace)
             .expect("resolve missing")
             .is_none());
+
+        // Slice 10: a Markdown agent body becomes the profile's instructions.
+        let md_agents = workspace.join(".codex").join("agents");
+        fs::create_dir_all(&md_agents).expect("md agents dir");
+        fs::write(
+            md_agents.join("planner.md"),
+            "---\nname: planner\ndescription: Plans.\n---\n\nBreak the task into small, verifiable steps.\n",
+        )
+        .expect("write md agent");
+        let planner = crate::resolve_agent_profile("planner", &workspace)
+            .expect("resolve")
+            .expect("planner present");
+        assert_eq!(
+            planner.instructions.as_deref(),
+            Some("Break the task into small, verifiable steps.")
+        );
 
         for (key, value) in originals {
             match value {

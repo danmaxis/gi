@@ -74,7 +74,8 @@ pub use config::{
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
     RuntimeInvalidHookConfig, RuntimeMemoryConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, RuntimeProviderConfig, ScopedMcpServerConfig, GI_SETTINGS_SCHEMA_NAME,
+    RuntimePluginConfig, RuntimeProviderConfig, RuntimeSubagentConfig, ScopedMcpServerConfig,
+    GI_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

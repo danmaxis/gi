@@ -165,6 +165,7 @@ pub struct RuntimeFeatureConfig {
     provider: RuntimeProviderConfig,
     memory: RuntimeMemoryConfig,
     default_agent: Option<String>,
+    subagents: RuntimeSubagentConfig,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -255,6 +256,37 @@ impl RuntimeMemoryConfig {
     #[must_use]
     pub fn store_root(&self) -> Option<&str> {
         self.store_root.as_deref()
+    }
+}
+
+/// Configuration for model-callable subagent spawning (`spawn_agent`). Opt-in,
+/// disabled by default. Slice 10.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeSubagentConfig {
+    enabled: bool,
+    model: Option<String>,
+    max_iterations: Option<u32>,
+}
+
+impl RuntimeSubagentConfig {
+    /// Whether the `spawn_agent` tool is advertised to the model. Default `false`.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Default model for spawned subagents when neither the spawn call nor the
+    /// named agent specifies one.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Cap on a subagent's per-turn tool iterations (defaults applied by the
+    /// caller when unset).
+    #[must_use]
+    pub fn max_iterations(&self) -> Option<u32> {
+        self.max_iterations
     }
 }
 
@@ -836,6 +868,7 @@ fn build_runtime_config(
         provider: parse_optional_provider_config(&merged_value)?,
         memory: parse_optional_memory_config(&merged_value)?,
         default_agent: parse_optional_default_agent(&merged_value),
+        subagents: parse_optional_subagents_config(&merged_value)?,
     };
 
     Ok(RuntimeConfig {
@@ -975,6 +1008,12 @@ impl RuntimeConfig {
         self.feature_config.default_agent.as_deref()
     }
 
+    /// Subagent-spawning configuration (`spawn_agent`). Slice 10.
+    #[must_use]
+    pub fn subagents(&self) -> &RuntimeSubagentConfig {
+        &self.feature_config.subagents
+    }
+
     /// Merge config-level default trusted roots with per-call roots.
     ///
     /// Config roots are defaults and are kept first; per-call roots extend the
@@ -1005,6 +1044,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn default_agent(&self) -> Option<&str> {
         self.default_agent.as_deref()
+    }
+
+    /// Subagent-spawning configuration (`spawn_agent`).
+    #[must_use]
+    pub fn subagents(&self) -> &RuntimeSubagentConfig {
+        &self.subagents
     }
 
     #[must_use]
@@ -2264,6 +2309,23 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<RuntimeMemoryConfig,
     })
 }
 
+fn parse_optional_subagents_config(root: &JsonValue) -> Result<RuntimeSubagentConfig, ConfigError> {
+    let Some(value) = root.as_object().and_then(|object| object.get("subagents")) else {
+        return Ok(RuntimeSubagentConfig::default());
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(RuntimeSubagentConfig::default());
+    };
+    let enabled = optional_bool(object, "enabled", "subagents")?.unwrap_or(false);
+    let model = optional_string(object, "model", "subagents")?.map(str::to_string);
+    let max_iterations = optional_u32(object, "maxIterations", "subagents")?;
+    Ok(RuntimeSubagentConfig {
+        enabled,
+        model,
+        max_iterations,
+    })
+}
+
 fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
     let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
         return Ok(RuntimeProviderConfig::default());
@@ -3123,6 +3185,35 @@ mod tests {
         assert!(loaded.memory().enabled());
         assert!(loaded.memory().auto_capture());
         assert_eq!(loaded.memory().store_root(), Some(".gi/mem"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_subagents_config_and_defaults_to_disabled() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        // Unset → disabled by default.
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(!loaded.subagents().enabled());
+        assert_eq!(loaded.subagents().model(), None);
+        assert_eq!(loaded.subagents().max_iterations(), None);
+
+        // Explicit subagents block is parsed.
+        fs::write(
+            home.join("settings.json"),
+            r#"{ "subagents": { "enabled": true, "model": "anthropic/x", "maxIterations": 8 } }"#,
+        )
+        .expect("write subagents settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(loaded.subagents().enabled());
+        assert_eq!(loaded.subagents().model(), Some("anthropic/x"));
+        assert_eq!(loaded.subagents().max_iterations(), Some(8));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -198,6 +198,12 @@ where
         self
     }
 
+    /// Bound the per-turn tool-iteration count after construction (used to cap
+    /// spawned subagents). Mirrors [`Self::with_max_iterations`].
+    pub fn set_max_iterations(&mut self, max_iterations: usize) {
+        self.max_iterations = max_iterations;
+    }
+
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;

@@ -292,10 +292,18 @@ Docs: `docs/agents.md`.
 
 ### Slice 10: Subagent spawn tool (opencode-style)
 
-- [ ] A model-callable tool that runs a *named agent as a subagent* with its own model +
-  prompt to completion and returns the result, building on Slice 9's resolution and the
-  existing `task_registry` / `worker_boot` infra.
-- [ ] Per-spawn model/effort override; result captured back into the parent turn.
+- [x] A model-callable `spawn_agent` tool runs a *named agent as a subagent* with its own
+  model + instructions to completion and returns the result.
+- [x] Per-spawn model/effort override; result captured back into the parent turn.
+
+Done 2026-06-24: opt-in (`subagents.enabled`) `spawn_agent` runtime tool. The subagent
+gets its own runtime (own tokio executor → no deadlock when run inside a tool dispatch),
+runs **read-only** + non-interactively + iteration-bounded with `emit_output` suppressed,
+and is never advertised to itself (thread-local recursion guard → depth ≤ 1). Model
+precedence: call `model` → agent `model` → `subagents.model` → default. Agent `.md`
+bodies / `.toml` `prompt` keys now flow into `AgentProfile.instructions` as the subagent
+system prompt. `RuntimeSubagentConfig` in `crates/runtime/src/config.rs`. Docs:
+`docs/agents.md`.
 
 ### Slice 11: Inline visual panels, margins & command-popup ranking (Phase-1 aesthetics)
 

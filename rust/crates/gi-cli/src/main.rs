@@ -8103,6 +8103,28 @@ struct AskUserRequest {
     timeout_ms: Option<u64>,
 }
 
+/// Input for the `spawn_agent` runtime tool (Slice 10).
+#[derive(Debug, Deserialize)]
+struct SpawnAgentRequest {
+    prompt: String,
+    agent: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+/// Default per-turn iteration cap for a spawned subagent when `subagents.maxIterations`
+/// is unset — enough for a few rounds of read/search + a final answer, bounded
+/// to prevent runaway cost.
+const SUBAGENT_DEFAULT_MAX_ITERATIONS: usize = 16;
+
+/// Monotonic, process-unique session id for spawned subagents.
+fn next_subagent_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("subagent-{n}")
+}
+
 #[derive(Debug, Deserialize)]
 struct AskUserChoice {
     id: String,
@@ -8370,7 +8392,11 @@ impl RuntimeMcpState {
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let local_runtime_tools = local_runtime_tool_definitions(runtime_config.memory().enabled());
+    // Advertise spawn_agent only when enabled in config AND we're not already
+    // building a subagent's runtime (prevents recursive self-spawning).
+    let spawn_enabled = runtime_config.subagents().enabled() && !subagent_active();
+    let local_runtime_tools =
+        local_runtime_tool_definitions(runtime_config.memory().enabled(), spawn_enabled);
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, local_runtime_tools));
     };
@@ -8458,7 +8484,38 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
     ]
 }
 
-fn local_runtime_tool_definitions(memory_enabled: bool) -> Vec<RuntimeToolDefinition> {
+thread_local! {
+    /// True while a spawned subagent's runtime is being built/run on this thread.
+    /// Used to keep `spawn_agent` out of a subagent's own toolset, capping
+    /// nesting at depth 1 (no recursive self-spawning). Slice 10.
+    static SUBAGENT_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn subagent_active() -> bool {
+    SUBAGENT_ACTIVE.with(std::cell::Cell::get)
+}
+
+/// RAII guard that marks the current thread as inside a subagent for the
+/// duration of building + running it, then restores the prior value.
+struct SubagentGuard(bool);
+
+impl SubagentGuard {
+    fn enter() -> Self {
+        let previous = SUBAGENT_ACTIVE.with(|cell| cell.replace(true));
+        Self(previous)
+    }
+}
+
+impl Drop for SubagentGuard {
+    fn drop(&mut self) {
+        SUBAGENT_ACTIVE.with(|cell| cell.set(self.0));
+    }
+}
+
+fn local_runtime_tool_definitions(
+    memory_enabled: bool,
+    spawn_enabled: bool,
+) -> Vec<RuntimeToolDefinition> {
     let mut tools = vec![RuntimeToolDefinition {
         name: "ask_user".to_string(),
         description: Some(
@@ -8527,6 +8584,31 @@ fn local_runtime_tool_definitions(memory_enabled: bool) -> Vec<RuntimeToolDefini
                     "tags": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["kind", "text"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        });
+    }
+
+    // spawn_agent runs a named agent as a read-only subagent. Opt-in
+    // (`subagents.enabled`) and never advertised to a subagent itself, so a
+    // subagent cannot recursively spawn more subagents.
+    if spawn_enabled {
+        tools.push(RuntimeToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: Some(
+                "Delegate a focused, read-only subtask to a subagent and get back its findings. The subagent runs to completion with its own model and can read/search the workspace but cannot modify files or run commands. Use it to parallelize analysis, code review, search, or planning. Provide a self-contained `prompt`; optionally name a configured `agent` to use its model + instructions."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "Self-contained task for the subagent." },
+                    "agent": { "type": "string", "description": "Name of a configured agent (.gi/agents/<name>) whose model + instructions to use." },
+                    "model": { "type": "string", "description": "Override the subagent model." },
+                    "reasoning_effort": { "type": "string", "enum": ["low", "medium", "high"] }
+                },
+                "required": ["prompt"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -15657,6 +15739,9 @@ impl CliToolExecutor {
         if tool_name == "memory_write" {
             return execute_memory_write(&value);
         }
+        if tool_name == "spawn_agent" {
+            return self.execute_spawn_agent(value);
+        }
 
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
@@ -15692,6 +15777,118 @@ impl CliToolExecutor {
             }
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
+    }
+
+    /// Run a named agent as a read-only subagent to completion and return its
+    /// final text (Slice 10). The subagent gets its own runtime (own tokio
+    /// executor → no deadlock), runs with `emit_output=false` and ReadOnly
+    /// permission, is bounded by `max_iterations`, and never sees `spawn_agent`
+    /// itself (recursion guard), so nesting is capped at depth 1.
+    fn execute_spawn_agent(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        let input: SpawnAgentRequest = serde_json::from_value(value)
+            .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        let prompt = input.prompt.trim().to_string();
+        if prompt.is_empty() {
+            return Err(ToolError::new("spawn_agent requires a non-empty prompt"));
+        }
+        let cwd = env::current_dir().map_err(|error| ToolError::new(error.to_string()))?;
+
+        // Resolve an optional named agent → model + effort + instructions.
+        let profile = match input.agent.as_deref() {
+            Some(name) => match commands::resolve_agent_profile(name, &cwd)
+                .map_err(|error| ToolError::new(format!("failed to load agents: {error}")))?
+            {
+                Some(profile) => Some(profile),
+                None => {
+                    return Err(ToolError::new(format!(
+                        "no agent named `{name}` (see `/agent list`)"
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        let config = ConfigLoader::default_for(&cwd).load().ok();
+        // Model precedence: explicit override → agent's model → subagents.model
+        // config → the compiled default.
+        let model = input
+            .model
+            .or_else(|| profile.as_ref().and_then(|profile| profile.model.clone()))
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|config| config.subagents().model().map(str::to_string))
+            })
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let model = resolve_model_alias_with_config(&model);
+        let effort = input.reasoning_effort.or_else(|| {
+            profile
+                .as_ref()
+                .and_then(|profile| profile.reasoning_effort.clone())
+        });
+        let max_iterations = config
+            .as_ref()
+            .and_then(|config| config.subagents().max_iterations())
+            .map_or(SUBAGENT_DEFAULT_MAX_ITERATIONS, |value| value as usize);
+
+        // Compose the subagent system prompt: the base prompt plus the agent's
+        // role/instructions and a hard read-only reminder.
+        let mut system_prompt = build_system_prompt(&model)
+            .map_err(|error| ToolError::new(format!("failed to build subagent prompt: {error}")))?;
+        let mut role = match &profile {
+            Some(profile) => {
+                let mut role = format!("You are the `{}` subagent.", profile.name);
+                if let Some(description) = &profile.description {
+                    role.push(' ');
+                    role.push_str(description);
+                }
+                if let Some(instructions) = &profile.instructions {
+                    role.push_str("\n\n");
+                    role.push_str(instructions);
+                }
+                role
+            }
+            None => "You are a focused subagent.".to_string(),
+        };
+        role.push_str("\n\nYou are running as a read-only subagent: inspect the workspace with read/search tools and report your findings concisely. You cannot modify files or run commands. Finish with a clear, self-contained answer for the agent that spawned you.");
+        system_prompt.push(role);
+
+        let label = profile
+            .as_ref()
+            .map_or_else(|| "subagent".to_string(), |profile| profile.name.clone());
+        if self.emit_output {
+            println!("  ⟳ spawning {label} · {model} …");
+        }
+
+        let run = || -> Result<String, Box<dyn std::error::Error>> {
+            let _guard = SubagentGuard::enter();
+            let session = Session::new().with_workspace_root(cwd.clone());
+            let session_id = next_subagent_session_id();
+            let mut runtime = build_runtime(
+                session,
+                &session_id,
+                model.clone(),
+                system_prompt,
+                true,  // enable_tools — read/grep/glob, constrained by ReadOnly policy
+                false, // emit_output — suppress the subagent's intermediate output
+                None,  // allowed_tools — all enabled tools (policy constrains writes)
+                PermissionMode::ReadOnly,
+                None,
+            )?;
+            runtime
+                .api_client_mut()
+                .set_reasoning_effort(effort.clone());
+            runtime.set_max_iterations(max_iterations);
+            let summary = runtime.run_turn(prompt, None)?;
+            Ok(final_assistant_text(&summary))
+        };
+
+        let text =
+            run().map_err(|error| ToolError::new(format!("subagent run failed: {error}")))?;
+        if self.emit_output {
+            println!("  ✓ {label} finished");
+        }
+        Ok(format!("[subagent: {label} · {model}]\n\n{}", text.trim()))
     }
 
     fn execute_ask_user(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -21169,7 +21366,7 @@ UU conflicted.rs",
 
     #[test]
     fn local_runtime_tools_include_ask_user() {
-        let tools = local_runtime_tool_definitions(false);
+        let tools = local_runtime_tool_definitions(false, false);
         let ask_user = tools
             .iter()
             .find(|tool| tool.name == "ask_user")
@@ -21189,11 +21386,11 @@ UU conflicted.rs",
     #[test]
     fn memory_tools_are_gated_on_the_memory_flag() {
         // Disabled (default): no memory tools advertised to the model.
-        let off = local_runtime_tool_definitions(false);
+        let off = local_runtime_tool_definitions(false, false);
         assert!(!off.iter().any(|tool| tool.name.starts_with("memory_")));
 
         // Enabled: both query + write appear, ReadOnly (opt-in is the consent).
-        let on = local_runtime_tool_definitions(true);
+        let on = local_runtime_tool_definitions(true, false);
         let query = on
             .iter()
             .find(|tool| tool.name == "memory_query")
@@ -21205,6 +21402,22 @@ UU conflicted.rs",
         assert_eq!(query.required_permission, PermissionMode::ReadOnly);
         assert_eq!(write.required_permission, PermissionMode::ReadOnly);
         assert_eq!(write.input_schema["required"][0].as_str(), Some("kind"));
+    }
+
+    #[test]
+    fn spawn_agent_tool_is_gated_on_the_subagents_flag() {
+        // Disabled (default): spawn_agent is not advertised.
+        let off = local_runtime_tool_definitions(false, false);
+        assert!(!off.iter().any(|tool| tool.name == "spawn_agent"));
+
+        // Enabled: spawn_agent appears, ReadOnly, requiring a prompt.
+        let on = local_runtime_tool_definitions(false, true);
+        let spawn = on
+            .iter()
+            .find(|tool| tool.name == "spawn_agent")
+            .expect("spawn_agent should be advertised when subagents are enabled");
+        assert_eq!(spawn.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(spawn.input_schema["required"][0].as_str(), Some("prompt"));
     }
 
     fn ask_user_choices() -> Vec<AskUserChoice> {

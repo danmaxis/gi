@@ -8038,8 +8038,17 @@ fn run_repl(
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::CycleMode(buffer) => {
                 let next = cli.mode.next();
-                if let Err(error) = cli.set_mode(next) {
+                // Quiet switch: no `▸ Mode` log line — the prompt box (with its
+                // mode accent + description) is the indicator, redrawn in place.
+                if let Err(error) = cli.set_mode(next, false) {
                     eprintln!("{error}");
+                }
+                // Erase the just-rendered prompt block (status + header + the
+                // prompt line) so the next iteration redraws the box in place
+                // rather than stacking a new one per Shift+Tab. Slice 15.
+                if io::stdout().is_terminal() {
+                    print!("\x1b[3F\x1b[J");
+                    let _ = io::stdout().flush();
                 }
                 // Re-seed the next prompt with whatever was typed so the switch
                 // doesn't discard in-progress text (Slice 15).
@@ -9058,6 +9067,7 @@ impl LiveCli {
         render::prompt_header(
             self.active_agent.as_deref(),
             Some(self.mode.as_str()),
+            Some(self.mode.note()),
             use_color,
         )
     }
@@ -9106,7 +9116,7 @@ impl LiveCli {
         self.run_turn(input)?;
         if take_exit_plan_approved() {
             if self.mode == SessionMode::Plan {
-                self.set_mode(SessionMode::Edit)?;
+                self.set_mode(SessionMode::Edit, true)?;
             }
             let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
             let note = if use_color {
@@ -9976,9 +9986,18 @@ impl LiveCli {
     /// Switch the operating mode (Slice 15): updates the derived permission mode
     /// + ask-before-mutate behavior and rebuilds the runtime, preserving the
     /// session. Reuses the same rebuild path as `/model` / `/permissions`.
-    fn set_mode(&mut self, mode: SessionMode) -> Result<(), Box<dyn std::error::Error>> {
+    /// Switch the operating mode (rebuilds the runtime). `announce` prints a
+    /// `▸ Mode … → …` confirmation; Shift+Tab cycling passes `false` because it
+    /// redraws the prompt box in place instead (Slice 15).
+    fn set_mode(
+        &mut self,
+        mode: SessionMode,
+        announce: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if mode == self.mode {
-            println!("Already in {} mode.", mode.as_str());
+            if announce {
+                println!("Already in {} mode.", mode.as_str());
+            }
             return Ok(());
         }
         let previous = self.mode;
@@ -9999,17 +10018,14 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
-        let note = match mode {
-            SessionMode::Default => "asks before edits",
-            SessionMode::Plan => "read-only · drafts a plan to approve",
-            SessionMode::Edit => "auto-accepts edits",
-            SessionMode::Mugen => "無限 · auto-approve + auto-continue",
-        };
-        println!(
-            "▸ Mode {} → \x1b[1m{}\x1b[0m ({note})",
-            previous.as_str(),
-            mode.as_str()
-        );
+        if announce {
+            println!(
+                "▸ Mode {} → \x1b[1m{}\x1b[0m ({})",
+                previous.as_str(),
+                mode.as_str(),
+                mode.note(),
+            );
+        }
         Ok(())
     }
 
@@ -10026,9 +10042,9 @@ impl LiveCli {
                     MODE_NAMES.join(", ")
                 );
             }
-            "next" => self.set_mode(self.mode.next())?,
+            "next" => self.set_mode(self.mode.next(), true)?,
             name => match SessionMode::parse(name) {
-                Some(mode) => self.set_mode(mode)?,
+                Some(mode) => self.set_mode(mode, true)?,
                 None => println!("Unknown mode `{name}`. Try: {}", MODE_NAMES.join(", ")),
             },
         }
@@ -16776,6 +16792,17 @@ impl SessionMode {
     /// `mugen` keeps working across turns until done / capped / interrupted.
     fn auto_continue(self) -> bool {
         matches!(self, Self::Mugen)
+    }
+
+    /// A short description of what the mode does, shown beside its name in the
+    /// prompt box and in switch confirmations. Slice 15.
+    fn note(self) -> &'static str {
+        match self {
+            Self::Default => "asks before edits",
+            Self::Plan => "read-only · drafts a plan to approve",
+            Self::Edit => "auto-accepts edits",
+            Self::Mugen => "無限 · auto-approve + auto-continue",
+        }
     }
 
     /// Map a raw permission mode to a non-asking session mode (used for

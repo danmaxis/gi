@@ -147,17 +147,27 @@ pub fn prompt_glyph(use_color: bool, accent: Option<Color>) -> String {
 }
 
 /// A themed bounding-box header shown above the prompt, labeling the active
-/// `mode` and `agent` (e.g. `╭─ edit · reviewer ─╮`). Returns `None` when there
-/// is nothing to show. `NO_COLOR` → the plain box-drawing form. A non-default
-/// `mode` tints the border + title via [`mode_accent`]. Slice 14a / 15.
+/// `mode` (with an optional `note` describing it, e.g. `plan · read-only …`)
+/// and `agent` — e.g. `╭─ edit · auto-accepts edits · reviewer ─╮`. Returns
+/// `None` when there is nothing to show. `NO_COLOR` → the plain box-drawing
+/// form. A non-default `mode` tints the border + title via [`mode_accent`].
+/// Slice 14a / 15.
 #[must_use]
-pub fn prompt_header(agent: Option<&str>, mode: Option<&str>, use_color: bool) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
+pub fn prompt_header(
+    agent: Option<&str>,
+    mode: Option<&str>,
+    note: Option<&str>,
+    use_color: bool,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
     if let Some(mode) = mode.filter(|value| !value.is_empty()) {
-        parts.push(mode);
+        match note.filter(|value| !value.is_empty()) {
+            Some(note) => parts.push(format!("{mode} · {note}")),
+            None => parts.push(mode.to_string()),
+        }
     }
     if let Some(agent) = agent.filter(|value| !value.is_empty()) {
-        parts.push(agent);
+        parts.push(agent.to_string());
     }
     if parts.is_empty() {
         return None;
@@ -1471,19 +1481,31 @@ mod tests {
         assert!(super::prompt_glyph(true, None).contains('❯'));
         assert!(super::prompt_glyph(true, None).contains('\u{1b}'));
 
-        // Header labels mode · agent; empty when both absent.
+        // Header labels mode (+ note) · agent; empty when all absent.
         assert_eq!(
-            super::prompt_header(Some("reviewer"), Some("edit"), false),
+            super::prompt_header(
+                Some("reviewer"),
+                Some("edit"),
+                Some("auto-accepts edits"),
+                false
+            ),
+            Some("╭─ edit · auto-accepts edits · reviewer ─╮".to_string())
+        );
+        // Note omitted → just the mode name.
+        assert_eq!(
+            super::prompt_header(Some("reviewer"), Some("edit"), None, false),
             Some("╭─ edit · reviewer ─╮".to_string())
         );
         assert_eq!(
-            super::prompt_header(Some("reviewer"), None, false),
+            super::prompt_header(Some("reviewer"), None, None, false),
             Some("╭─ reviewer ─╮".to_string())
         );
-        assert_eq!(super::prompt_header(None, None, false), None);
-        assert!(super::prompt_header(None, Some("plan"), true)
-            .unwrap()
-            .contains('\u{1b}'));
+        assert_eq!(super::prompt_header(None, None, None, false), None);
+        assert!(
+            super::prompt_header(None, Some("plan"), Some("read-only"), true)
+                .unwrap()
+                .contains('\u{1b}')
+        );
     }
 
     #[test]
@@ -1501,7 +1523,7 @@ mod tests {
             panic!("expected a truecolor accent");
         };
         let sgr = format!("\x1b[38;2;{r};{g};{b}m");
-        assert!(super::prompt_header(Some("ss"), Some("mugen"), true)
+        assert!(super::prompt_header(Some("ss"), Some("mugen"), None, true)
             .unwrap()
             .contains(&sgr));
         // The glyph honors the accent too, and stays visible-width 2.

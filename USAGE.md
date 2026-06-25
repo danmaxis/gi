@@ -138,6 +138,13 @@ error: no worker state file found at .gi/worker-state.json
   Then rerun: gi state [--output-format json]
 ```
 
+## Cancelling a request
+
+While the agent is **thinking / reaching the model server**, press **ESC** (or
+**Ctrl+C**) to cancel the in-flight request and return to the prompt. After the response
+has started streaming, **Ctrl+C** cancels it. A second **Ctrl+C** at the idle prompt
+closes the client — so "Ctrl+C twice" exits.
+
 ## Advanced slash commands (Interactive REPL only)
 
 These commands are available inside the interactive REPL (`gi` with no args). They extend the assistant with workspace analysis, planning, and navigation features.

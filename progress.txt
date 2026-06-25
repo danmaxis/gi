@@ -660,3 +660,22 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - Deferred (noted in roadmap): panels/gutters on STREAMED assistant + tool output + turn
   separators — that output streams live to stdout (consume_stream out=stdout when emit_output),
   so it needs streaming-safe wrapping not verifiable headless; revisit with Slice 13.
+
+## Request cancellation — ESC to cancel, Ctrl+C twice to exit (2026-06-24)
+- AnthropicRuntimeClient gains abort_signal + first_output flags. consume_stream wraps BOTH
+  the initial connect (stream_message) AND each event in tokio::select! against the abort
+  signal → a cancel returns REQUEST_CANCELLED_MESSAGE promptly (fixes "trying to reach the
+  model server, can't cancel"). prepare_turn_runtime sets the abort signal on the client and
+  returns it; the HookAbortMonitor (SIGINT) already aborts, so Ctrl+C cancels in cooked mode.
+- Interactive ESC: run_turn (TTY only) enables raw mode up front and spawns start_interrupt_
+  reader (ESC or Ctrl+C → abort). consume_stream restores cooked mode the instant the model
+  starts responding (first_output), so streamed output is never staircased; raw is only active
+  during the thinking wait (animation is \r-safe). disable_raw_mode runs on all exit paths.
+- Ctrl+C-twice-to-exit emerges naturally: 1st press cancels (back to prompt), 2nd press at the
+  idle prompt → input.rs Exit. No counter needed.
+- run_turn: when abort_signal aborted && result is Err → discard the turn, print
+  "⏹ Request cancelled.", return to prompt (no error/auto-compact path). gi -p text shares
+  run_turn so it cancels too.
+- Verified: SIGINT against an unreachable endpoint cancels the hanging connect promptly (was a
+  hang). Unit tests: key_cancels_request (ESC/Ctrl+C), wait_for_abort resolves on abort.
+  Interactive ESC + raw-mode restore need live terminal verification (PTY hangs headless).

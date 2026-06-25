@@ -8896,9 +8896,12 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
-    ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (BuiltRuntime, HookAbortMonitor, runtime::HookAbortSignal),
+        Box<dyn std::error::Error>,
+    > {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -8910,9 +8913,15 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
-        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
+        // Let the streaming client observe the abort signal so ESC / Ctrl+C can
+        // cancel an in-flight model request (Ctrl+C also reaches it via SIGINT
+        // through the HookAbortMonitor).
+        runtime
+            .api_client_mut()
+            .set_abort_signal(hook_abort_signal.clone());
+        let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal.clone());
 
-        Ok((runtime, hook_abort_monitor))
+        Ok((runtime, hook_abort_monitor, hook_abort_signal))
     }
 
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
@@ -8922,7 +8931,7 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         // Animate the "thinking" indicator on a background thread while the turn
@@ -8940,12 +8949,52 @@ impl LiveCli {
         if animation.is_some() {
             permission_prompter = permission_prompter.with_anim_lock(Arc::clone(&anim_lock));
         }
+        // Interactive cancellation: read ESC / Ctrl+C as keys during the
+        // "thinking" wait so the user can abort an in-flight request. Raw mode
+        // is enabled up front (before the request) and `consume_stream` restores
+        // cooked mode the instant the model starts responding, so streamed
+        // output is never staircased. After streaming, Ctrl+C reaches the
+        // request via SIGINT (HookAbortMonitor). First press cancels (back to
+        // the prompt); a second Ctrl+C at the idle prompt exits.
+        let interactive = stdout.is_terminal();
+        let first_output = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let interrupt_reader = if interactive {
+            runtime
+                .api_client_mut()
+                .set_first_output_flag(Arc::clone(&first_output));
+            let _ = crossterm::terminal::enable_raw_mode();
+            Some(start_interrupt_reader(
+                abort_signal.clone(),
+                Arc::clone(&first_output),
+                Arc::clone(&reader_stop),
+            ))
+        } else {
+            None
+        };
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        reader_stop.store(true, Ordering::SeqCst);
         anim_stop.store(true, Ordering::Relaxed);
         if let Some(animation) = animation {
             let _ = animation.join();
         }
+        if let Some(reader) = interrupt_reader {
+            let _ = reader.join();
+        }
+        if interactive {
+            // Idempotent: consume_stream already restored cooked mode once output
+            // started; this covers the no-output (pure cancel) case.
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
         hook_abort_monitor.stop();
+
+        // User-initiated cancellation (ESC / Ctrl+C): discard the turn and return
+        // to the prompt instead of treating it as a failure.
+        if abort_signal.is_aborted() && result.is_err() {
+            let _ = runtime.shutdown_plugins();
+            println!("\x1b[2m⏹ Request cancelled.\x1b[0m");
+            return Ok(());
+        }
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
@@ -9082,7 +9131,7 @@ impl LiveCli {
                         *self.runtime.session_mut() = result.compacted_session.clone();
 
                         // Build a new runtime with the compacted session and retry
-                        let (mut new_runtime, hook_abort_monitor) =
+                        let (mut new_runtime, hook_abort_monitor, _abort_signal) =
                             self.prepare_turn_runtime(true)?;
                         drop(hook_abort_monitor);
 
@@ -9172,7 +9221,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -9186,7 +9235,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -9211,7 +9260,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -14208,6 +14257,46 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 /// Spawn a background thread that animates a "thinking" spinner on one line
 /// until `stop` is set. Each frame is drawn while holding `lock`, so a permission
 /// prompt (which takes the same lock) never interleaves with the animation.
+/// Background reader that watches for ESC / Ctrl+C during the "thinking" wait
+/// and aborts the in-flight request. The caller enables raw mode before
+/// spawning; this thread exits when the turn ends (`stop`) or the model starts
+/// responding (`first_output`, at which point `consume_stream` restores cooked
+/// mode). It does not toggle raw mode itself, avoiding a race with that
+/// restore. Slice: request cancellation.
+fn start_interrupt_reader(
+    abort: runtime::HookAbortSignal,
+    first_output: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        use crossterm::event::{poll, read, Event};
+        loop {
+            if stop.load(Ordering::SeqCst) || first_output.load(Ordering::SeqCst) {
+                break;
+            }
+            match poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    if let Ok(Event::Key(key)) = read() {
+                        if key_cancels_request(&key) {
+                            abort.abort();
+                            break;
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// Whether a key event should cancel the in-flight request: ESC, or Ctrl+C.
+fn key_cancels_request(key: &crossterm::event::KeyEvent) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> JoinHandle<()> {
     let stop = Arc::clone(stop);
     let lock = Arc::clone(lock);
@@ -14324,6 +14413,32 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    /// When set and aborted mid-stream, the in-flight request is cancelled.
+    /// Threaded in by `prepare_turn_runtime` so ESC / Ctrl+C can interrupt the
+    /// model request.
+    abort_signal: Option<runtime::HookAbortSignal>,
+    /// Set true the instant the model starts responding. In the interactive
+    /// REPL this also restores cooked terminal mode (the ESC reader runs raw
+    /// only during the "thinking" wait), so streamed output isn't staircased.
+    first_output: Option<Arc<AtomicBool>>,
+}
+
+/// Marker text for a user-initiated cancellation, recognized in `run_turn` so
+/// it can show a friendly "cancelled" notice instead of an error report.
+const REQUEST_CANCELLED_MESSAGE: &str = "request cancelled by user";
+
+/// Resolves once the abort signal fires; never resolves when there is no
+/// signal. Raced against the model stream so a cancel interrupts it promptly,
+/// including during the initial connect / "thinking" wait.
+async fn wait_for_abort(signal: Option<&runtime::HookAbortSignal>) {
+    match signal {
+        Some(signal) => {
+            while !signal.is_aborted() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 impl AnthropicRuntimeClient {
@@ -14389,11 +14504,21 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            abort_signal: None,
+            first_output: None,
         })
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         self.reasoning_effort = effort;
+    }
+
+    fn set_abort_signal(&mut self, signal: runtime::HookAbortSignal) {
+        self.abort_signal = Some(signal);
+    }
+
+    fn set_first_output_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.first_output = Some(flag);
     }
 }
 
@@ -14465,13 +14590,17 @@ impl AnthropicRuntimeClient {
         message_request: &MessageRequest,
         apply_stall_timeout: bool,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut stream = self
-            .client
-            .stream_message(message_request)
-            .await
-            .map_err(|error| {
+        // Race the initial connect against the abort signal too — "trying to
+        // reach the model server" is exactly when the user wants to cancel.
+        let mut stream = tokio::select! {
+            biased;
+            () = wait_for_abort(self.abort_signal.as_ref()) => {
+                return Err(RuntimeError::new(REQUEST_CANCELLED_MESSAGE));
+            }
+            result = self.client.stream_message(message_request) => result.map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            })?,
+        };
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -14489,28 +14618,51 @@ impl AnthropicRuntimeClient {
         let mut saw_stop = false;
         let mut received_any_event = false;
 
+        let abort = self.abort_signal.clone();
+        let session_id = self.session_id.clone();
         loop {
-            let next = if apply_stall_timeout && !received_any_event {
-                match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
-                    Err(_elapsed) => {
-                        return Err(RuntimeError::new(
-                            "post-tool stall: model did not respond within timeout",
-                        ));
-                    }
+            let fetch_with_stall = apply_stall_timeout && !received_any_event;
+            // Race each event against the abort signal so ESC / Ctrl+C can
+            // interrupt an in-flight request (including the initial connect /
+            // "thinking" wait before any token arrives).
+            let next = tokio::select! {
+                biased;
+                () = wait_for_abort(abort.as_ref()) => {
+                    return Err(RuntimeError::new(REQUEST_CANCELLED_MESSAGE));
                 }
-            } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                result = async {
+                    if fetch_with_stall {
+                        match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
+                            Ok(inner) => inner.map_err(|error| {
+                                RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+                            }),
+                            Err(_elapsed) => Err(RuntimeError::new(
+                                "post-tool stall: model did not respond within timeout",
+                            )),
+                        }
+                    } else {
+                        stream.next_event().await.map_err(|error| {
+                            RuntimeError::new(format_user_visible_api_error(&session_id, &error))
+                        })
+                    }
+                } => result?,
             };
 
             let Some(event) = next else {
                 break;
             };
-            received_any_event = true;
+            if !received_any_event {
+                received_any_event = true;
+                // The model has started responding: the "thinking" wait is over.
+                // Restore cooked mode (the interactive ESC reader ran raw only
+                // during that wait) before any token is written, so streamed
+                // output isn't staircased.
+                if let Some(flag) = &self.first_output {
+                    if !flag.swap(true, Ordering::SeqCst) {
+                        let _ = crossterm::terminal::disable_raw_mode();
+                    }
+                }
+            }
 
             match event {
                 ApiStreamEvent::MessageStart(start) => {
@@ -21426,6 +21578,51 @@ UU conflicted.rs",
             .expect("spawn_agent should be advertised when subagents are enabled");
         assert_eq!(spawn.required_permission, PermissionMode::ReadOnly);
         assert_eq!(spawn.input_schema["required"][0].as_str(), Some("prompt"));
+    }
+
+    #[test]
+    fn key_cancels_request_on_esc_and_ctrl_c() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(super::key_cancels_request(&KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )));
+        assert!(super::key_cancels_request(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        // A plain 'c' or other keys must not cancel.
+        assert!(!super::key_cancels_request(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+        assert!(!super::key_cancels_request(&KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn wait_for_abort_resolves_once_the_signal_aborts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let signal = runtime::HookAbortSignal::new();
+        let trigger = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            trigger.abort();
+        });
+        let resolved = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), super::wait_for_abort(Some(&signal)))
+                .await
+                .is_ok()
+        });
+        assert!(
+            resolved,
+            "wait_for_abort should resolve after the signal aborts"
+        );
     }
 
     fn ask_user_choices() -> Vec<AskUserChoice> {

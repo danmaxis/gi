@@ -3369,7 +3369,7 @@ fn colorize_splash_line(line: &str, row: usize) -> String {
 }
 
 /// Canonical theme names the `/theme` command accepts and advertises.
-const AVAILABLE_THEMES: [&str; 2] = ["gi-dark", "gi-light"];
+const AVAILABLE_THEMES: [&str; 5] = render::THEME_NAMES;
 
 /// Seed the process-wide runtime theme slot from persisted user/project config
 /// so the configured default applies to all rendering. `GI_THEME` still
@@ -3457,10 +3457,15 @@ fn run_theme_command(name: Option<&str>) -> ThemeCommandResult {
 
     let Some(requested) = name else {
         let (current, source) = render::effective_theme();
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        let preview = AVAILABLE_THEMES
+            .iter()
+            .map(|name| format!("    {}", render::theme_swatch(name, use_color)))
+            .collect::<Vec<_>>()
+            .join("\n");
         let message = format!(
-            "Theme\n  Current        {current} ({})\n  Available      {}",
+            "Theme\n  Current        {current} ({})\n  Available\n{preview}",
             source.as_str(),
-            AVAILABLE_THEMES.join(", ")
         );
         return ThemeCommandResult {
             message,
@@ -3579,6 +3584,29 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 fn format_connected_line(model: &str) -> String {
     let provider = provider_label(detect_provider_kind(model));
     format!("Connected: {model} via {provider}")
+}
+
+/// Compose the dim, single-line REPL status indicator shown before each prompt:
+/// `◈ model · agent · ~tokens · branch`. Pure + NO_COLOR-safe. Slice 13.
+fn compose_status_line(
+    model: &str,
+    agent: Option<&str>,
+    tokens: usize,
+    branch: &str,
+    use_color: bool,
+) -> String {
+    let agent_part = agent.map_or_else(String::new, |agent| format!(" · {agent}"));
+    let tok = if tokens >= 1000 {
+        format!("~{:.1}k tok", tokens as f64 / 1000.0)
+    } else {
+        format!("~{tokens} tok")
+    };
+    let line = format!("◈ {model}{agent_part} · {tok} · {branch}");
+    if use_color {
+        format!("\x1b[2m{line}\x1b[0m")
+    } else {
+        line
+    }
 }
 
 fn filter_tool_specs(
@@ -7918,8 +7946,18 @@ fn run_repl(
     reveal_banner(&cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
+    // Branch for the persistent status line (Slice 13). Resolved once — it
+    // rarely changes mid-session and a git call per prompt isn't worth it.
+    let status_branch = status_context(None)
+        .ok()
+        .and_then(|context| context.git_branch.clone())
+        .unwrap_or_else(|| "no-git".to_string());
+
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        if io::stdout().is_terminal() {
+            println!("{}", cli.status_line(&status_branch));
+        }
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -8912,6 +8950,18 @@ impl LiveCli {
         ))
     }
 
+    /// The dim status indicator shown before each REPL prompt (Slice 13).
+    fn status_line(&self, branch: &str) -> String {
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        compose_status_line(
+            &self.model,
+            self.active_agent.as_deref(),
+            self.runtime.estimated_tokens(),
+            branch,
+            use_color,
+        )
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
@@ -8957,10 +9007,18 @@ impl LiveCli {
         // runs (it otherwise sits frozen during generation). A shared lock keeps
         // it from clashing with permission prompts. TTY-only, so scripted/piped
         // runs stay clean.
+        // `first_output` flips true the instant the model starts responding. It
+        // stops the thinking spinner (so it never collides with the streamed
+        // answer) and, interactively, restores cooked mode for the ESC reader.
+        let first_output = Arc::new(AtomicBool::new(false));
         let anim_stop = Arc::new(AtomicBool::new(false));
         let anim_lock = Arc::new(Mutex::new(()));
         let animation = if stdout.is_terminal() {
-            Some(start_thinking_animation(&anim_stop, &anim_lock))
+            Some(start_thinking_animation(
+                &anim_stop,
+                &anim_lock,
+                &first_output,
+            ))
         } else {
             None
         };
@@ -8976,12 +9034,14 @@ impl LiveCli {
         // request via SIGINT (HookAbortMonitor). First press cancels (back to
         // the prompt); a second Ctrl+C at the idle prompt exits.
         let interactive = stdout.is_terminal();
-        let first_output = Arc::new(AtomicBool::new(false));
         let reader_stop = Arc::new(AtomicBool::new(false));
         let interrupt_reader = if interactive {
             runtime
                 .api_client_mut()
                 .set_first_output_flag(Arc::clone(&first_output));
+            runtime
+                .api_client_mut()
+                .set_anim_lock(Arc::clone(&anim_lock));
             let _ = crossterm::terminal::enable_raw_mode();
             Some(start_interrupt_reader(
                 abort_signal.clone(),
@@ -9017,16 +9077,18 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
-                }
-                println!();
+                // The assistant text already streamed live during the turn (and
+                // was flushed on block/message stop), so don't re-print it here —
+                // that re-print plus the running spinner was the duplicated,
+                // garbled output. Mark completion on its OWN line: the streamed
+                // answer may not end in a newline, and `Spinner::finish` clears
+                // the current line, which would erase the answer's last line.
+                let done = if stdout.is_terminal() && env::var_os("NO_COLOR").is_none() {
+                    "\x1b[2m✔ ✨ Done\x1b[0m"
+                } else {
+                    "✔ ✨ Done"
+                };
+                println!("\n{done}");
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -14355,16 +14417,24 @@ fn thinking_label(frame: usize, use_color: bool) -> String {
     }
 }
 
-fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> JoinHandle<()> {
+fn start_thinking_animation(
+    stop: &Arc<AtomicBool>,
+    lock: &Arc<Mutex<()>>,
+    first_output: &Arc<AtomicBool>,
+) -> JoinHandle<()> {
     let stop = Arc::clone(stop);
     let lock = Arc::clone(lock);
+    // Stop the spinner the instant the model starts responding so it never
+    // collides with the streamed answer / tool output. It runs only during the
+    // pure "thinking" wait.
+    let first_output = Arc::clone(first_output);
     let theme = render::ColorTheme::default();
     let use_color = env::var_os("NO_COLOR").is_none();
     thread::spawn(move || {
         let mut spinner = Spinner::new();
         let mut out = io::stdout();
         let mut frame: usize = 0;
-        while !stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) && !first_output.load(Ordering::SeqCst) {
             {
                 let _guard = lock
                     .lock()
@@ -14374,13 +14444,17 @@ fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> Jo
             frame = frame.wrapping_add(1);
             thread::sleep(Duration::from_millis(90));
         }
-        // Clear the spinner line so the caller can render the result cleanly.
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut out = io::stdout();
-        let _ = write!(out, "\r\x1b[2K");
-        let _ = out.flush();
+        // Clear the spinner line so the caller can render the result cleanly —
+        // unless the stream already cleared it on first output (avoids erasing
+        // the first chunk of the streamed answer).
+        if !first_output.load(Ordering::SeqCst) {
+            let _guard = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut out = io::stdout();
+            let _ = write!(out, "\r\x1b[2K");
+            let _ = out.flush();
+        }
     })
 }
 
@@ -14477,6 +14551,9 @@ struct AnthropicRuntimeClient {
     /// REPL this also restores cooked terminal mode (the ESC reader runs raw
     /// only during the "thinking" wait), so streamed output isn't staircased.
     first_output: Option<Arc<AtomicBool>>,
+    /// Shared with the thinking-spinner thread so clearing the spinner line on
+    /// first output is coordinated with (doesn't interleave) a spinner tick.
+    anim_lock: Option<Arc<Mutex<()>>>,
 }
 
 /// Marker text for a user-initiated cancellation, recognized in `run_turn` so
@@ -14562,6 +14639,7 @@ impl AnthropicRuntimeClient {
             reasoning_effort: None,
             abort_signal: None,
             first_output: None,
+            anim_lock: None,
         })
     }
 
@@ -14575,6 +14653,10 @@ impl AnthropicRuntimeClient {
 
     fn set_first_output_flag(&mut self, flag: Arc<AtomicBool>) {
         self.first_output = Some(flag);
+    }
+
+    fn set_anim_lock(&mut self, lock: Arc<Mutex<()>>) {
+        self.anim_lock = Some(lock);
     }
 }
 
@@ -14710,12 +14792,22 @@ impl AnthropicRuntimeClient {
             if !received_any_event {
                 received_any_event = true;
                 // The model has started responding: the "thinking" wait is over.
-                // Restore cooked mode (the interactive ESC reader ran raw only
-                // during that wait) before any token is written, so streamed
-                // output isn't staircased.
+                // Flip the shared flag (stops the spinner + ESC reader), restore
+                // cooked mode (the reader ran raw only during that wait so output
+                // isn't staircased), and clear the spinner's line so the streamed
+                // answer starts clean. The animation skips its own clear when this
+                // flag is set, so the line isn't cleared twice.
                 if let Some(flag) = &self.first_output {
                     if !flag.swap(true, Ordering::SeqCst) {
                         let _ = crossterm::terminal::disable_raw_mode();
+                        // Clear the spinner's line under the shared lock so it
+                        // can't interleave with an in-progress spinner tick.
+                        let _guard = self.anim_lock.as_ref().map(|lock| {
+                            lock.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        });
+                        let _ = write!(out, "\r\x1b[2K");
+                        let _ = out.flush();
                     }
                 }
             }
@@ -15169,7 +15261,6 @@ const STUB_COMMANDS: &[&str] = &[
     "plan",
     "review",
     "tasks",
-    "theme",
     "voice",
     "usage",
     "rename",
@@ -21637,6 +21728,18 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn compose_status_line_is_concise_and_no_color_safe() {
+        let line = super::compose_status_line("mistral", Some("reviewer"), 12_345, "main", false);
+        assert_eq!(line, "◈ mistral · reviewer · ~12.3k tok · main");
+        assert!(!line.contains('\u{1b}'));
+        // No agent → omitted; small token counts aren't abbreviated.
+        let line = super::compose_status_line("opus", None, 42, "dev", false);
+        assert_eq!(line, "◈ opus · ~42 tok · dev");
+        // Colored variant is dim-wrapped.
+        assert!(super::compose_status_line("m", None, 0, "b", true).starts_with("\u{1b}[2m"));
+    }
+
+    #[test]
     fn thinking_label_cycles_kanji_and_is_no_color_safe() {
         // Cycles through the dojo kanji as frames advance.
         let first = super::thinking_label(0, false);
@@ -22116,6 +22219,11 @@ UU conflicted.rs",
         // The REPL session controls are present.
         assert!(candidates.contains(&"/exit".to_string()));
         assert!(candidates.contains(&"/quit".to_string()));
+        // `/theme` is fully implemented (not a stub), so it must be offered.
+        assert!(
+            candidates.contains(&"/theme".to_string()),
+            "/theme should appear in the slash popup"
+        );
     }
 
     #[test]

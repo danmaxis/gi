@@ -689,3 +689,29 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
   (interactive TTY + color only, total ~450ms capped); non-TTY / NO_COLOR print once (unchanged).
 - Visuals can't be verified headless (PTY hangs); frame logic is unit-tested and gated. Needs
   live confirmation. Tests: thinking_label_cycles_kanji_and_is_no_color_safe.
+
+## Slice 13 — Theme expansion & status line (2026-06-24)
+- render.rs: 3 new palettes — gi-matcha (green), gi-sumi (ink/mono), gi-sunrise (warm) — via
+  ColorTheme constructors + rgb() helper; canonical_theme_name aliases (matcha/green, sumi/ink/
+  mono, sunrise/warm); named() + Default arms; render::THEME_NAMES is the single source of truth
+  (main.rs AVAILABLE_THEMES = render::THEME_NAMES).
+- /theme (no arg) previews every palette with colored swatches (render::theme_swatch, heading·
+  strong·link·code blocks); NO_COLOR → plain names.
+- Persistent status line: compose_status_line(model, agent, tokens, branch, use_color) → dim
+  "◈ model · agent · ~tokens · branch", printed before each REPL prompt (LiveCli::status_line);
+  TTY-gated, NO_COLOR-safe; branch resolved once per session.
+- USAGE themes section refreshed (was stale sakana-*/SAKANA_GI_THEME → GI_THEME + 5 palettes +
+  status line). Tests: resolves_new_palettes_and_aliases, theme_swatch_previews_*,
+  compose_status_line_is_concise_and_no_color_safe. Visuals need live confirmation.
+
+## REPL output fixes (with Slice 13) (2026-06-25)
+- /theme was wrongly in STUB_COMMANDS (excludes from the fuzzy popup + help) despite being
+  fully implemented (parse arm + REPL handler + CLI). Removed it → /theme now appears in the
+  slash popup. Regression test added.
+- Fixed duplicated/garbled assistant output: the REPL streamed the answer live AND re-printed
+  final_assistant_text at the end (double), while the thinking spinner ran the whole turn and
+  collided with the stream. Now: the spinner stops the instant the model responds (first_output
+  flips → animation exits; consume_stream clears the spinner line under the shared anim_lock,
+  then streams the answer), and the redundant final print is removed (streamed text is canonical
+  + flushed). Completion marker ("✔ ✨ Done") prints on its own line (Spinner::finish cleared the
+  current line, which would erase the answer's last line). Verified clean via `gi -p`.

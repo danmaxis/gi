@@ -230,29 +230,32 @@ Model aliases currently supported by the CLI:
 
 ## Terminal themes
 
-Sakana-GI ships two expressive terminal palettes, `sakana-dark` and `sakana-light`.
+Gi ships five terminal palettes: `gi-dark`, `gi-light`, `gi-matcha` (calm green),
+`gi-sumi` (near-monochrome ink), and `gi-sunrise` (warm rising-sun). Each has short
+aliases (`dark`, `light`, `matcha`/`green`, `sumi`/`ink`/`mono`, `sunrise`/`warm`).
 
-Select a theme for a single run with the `SAKANA_GI_THEME` environment variable:
+Select a theme for a single run with the `GI_THEME` environment variable:
 
 ```bash
-cd rust
-SAKANA_GI_THEME=sakana-dark ./target/debug/gi "explain this module"
-SAKANA_GI_THEME=sakana-light ./target/debug/gi "explain this module"
+GI_THEME=gi-matcha gi "explain this module"
 ```
 
-Persist a default across runs from inside the interactive REPL:
+From inside the interactive REPL:
 
 ```text
-/theme              # show the effective theme, its source, and available names
-/theme sakana-light # switch live and save to ~/.gi/settings.json ("theme" key)
+/theme            # preview every palette (colored swatches) + the effective theme
+/theme sunrise    # switch live and save to ~/.gi/settings.json ("theme" key)
 ```
 
-Precedence is `SAKANA_GI_THEME` (highest) → the persisted `theme` setting → the
-built-in default. Because the env var always wins, scripted and CI runs stay
-deterministic; when it is set, `/theme` still saves your choice but warns that
-the env var is currently pinning the rendered theme. The effective theme and its
-source are reported by `gi status --output-format json` (under `theme`) and by
-`gi doctor`. JSON and non-TTY output never emit ANSI theme color codes.
+Precedence is `GI_THEME` (highest) → the persisted `theme` setting → the built-in
+default. Because the env var always wins, scripted and CI runs stay deterministic; when
+it is set, `/theme` still saves your choice but warns that the env var is pinning the
+rendered theme. The effective theme and its source are reported by
+`gi status --output-format json` (under `theme`) and by `gi doctor`. JSON and non-TTY
+output never emit ANSI theme color codes.
+
+A dim **status line** (`◈ model · agent · ~tokens · branch`) is shown before each REPL
+prompt so the active model, agent, context size, and branch are always in view.
 
 ## Providers and models
 

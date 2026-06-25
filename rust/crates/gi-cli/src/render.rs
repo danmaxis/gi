@@ -63,8 +63,38 @@ pub fn canonical_theme_name(name: &str) -> Option<&'static str> {
     match normalize_theme_name(name).as_str() {
         "gi-dark" | "dark" => Some("gi-dark"),
         "gi-light" | "light" => Some("gi-light"),
+        "gi-matcha" | "matcha" | "green" => Some("gi-matcha"),
+        "gi-sumi" | "sumi" | "ink" | "mono" => Some("gi-sumi"),
+        "gi-sunrise" | "sunrise" | "warm" => Some("gi-sunrise"),
         _ => None,
     }
+}
+
+/// All selectable canonical theme names, in display order. Slice 13.
+pub const THEME_NAMES: [&str; 5] = ["gi-dark", "gi-light", "gi-matcha", "gi-sumi", "gi-sunrise"];
+
+/// A one-line preview of a theme: colored swatches (heading · strong · link ·
+/// code) followed by the name. Without color (or for an unknown name) it
+/// returns just the name. Slice 13.
+#[must_use]
+pub fn theme_swatch(name: &str, use_color: bool) -> String {
+    let Some(theme) = ColorTheme::named(name) else {
+        return name.to_string();
+    };
+    if !use_color {
+        return name.to_string();
+    }
+    let block = |color: Color| match color {
+        Color::Rgb { r, g, b } => format!("\x1b[38;2;{r};{g};{b}m███\x1b[0m"),
+        _ => "███".to_string(),
+    };
+    format!(
+        "{} {} {} {}  {name}",
+        block(theme.heading),
+        block(theme.strong),
+        block(theme.link),
+        block(theme.inline_code),
+    )
 }
 
 /// Pure precedence resolver: env over runtime override over built-in default.
@@ -129,6 +159,9 @@ impl Default for ColorTheme {
         match effective_theme() {
             ("gi-dark", _) => return Self::gi_dark(),
             ("gi-light", _) => return Self::gi_light(),
+            ("gi-matcha", _) => return Self::gi_matcha(),
+            ("gi-sumi", _) => return Self::gi_sumi(),
+            ("gi-sunrise", _) => return Self::gi_sunrise(),
             _ => {}
         }
         Self {
@@ -153,6 +186,9 @@ impl ColorTheme {
         match canonical_theme_name(name)? {
             "gi-dark" => Some(Self::gi_dark()),
             "gi-light" => Some(Self::gi_light()),
+            "gi-matcha" => Some(Self::gi_matcha()),
+            "gi-sumi" => Some(Self::gi_sumi()),
+            "gi-sunrise" => Some(Self::gi_sunrise()),
             _ => None,
         }
     }
@@ -278,6 +314,66 @@ impl ColorTheme {
             },
         }
     }
+
+    /// Matcha — calm green/tea palette for dark terminals. Slice 13.
+    #[must_use]
+    pub const fn gi_matcha() -> Self {
+        Self {
+            heading: rgb(126, 176, 109),
+            emphasis: rgb(214, 158, 92),
+            strong: rgb(196, 130, 78),
+            inline_code: rgb(150, 190, 140),
+            link: rgb(110, 178, 162),
+            quote: rgb(140, 150, 135),
+            table_border: rgb(120, 150, 110),
+            code_block_border: rgb(95, 110, 90),
+            spinner_active: rgb(150, 200, 120),
+            spinner_done: rgb(130, 200, 150),
+            spinner_failed: rgb(214, 120, 110),
+        }
+    }
+
+    /// Sumi — near-monochrome ink palette (a faint indigo keeps links legible).
+    /// Slice 13.
+    #[must_use]
+    pub const fn gi_sumi() -> Self {
+        Self {
+            heading: rgb(222, 222, 226),
+            emphasis: rgb(182, 184, 190),
+            strong: rgb(238, 238, 240),
+            inline_code: rgb(160, 165, 172),
+            link: rgb(150, 170, 204),
+            quote: rgb(120, 122, 128),
+            table_border: rgb(110, 112, 118),
+            code_block_border: rgb(90, 92, 98),
+            spinner_active: rgb(200, 202, 208),
+            spinner_done: rgb(150, 200, 160),
+            spinner_failed: rgb(210, 120, 120),
+        }
+    }
+
+    /// Sunrise — warm rising-sun palette (oranges/vermilion). Slice 13.
+    #[must_use]
+    pub const fn gi_sunrise() -> Self {
+        Self {
+            heading: rgb(236, 140, 92),
+            emphasis: rgb(228, 120, 140),
+            strong: rgb(240, 176, 84),
+            inline_code: rgb(224, 150, 110),
+            link: rgb(220, 126, 100),
+            quote: rgb(180, 150, 140),
+            table_border: rgb(216, 150, 110),
+            code_block_border: rgb(150, 110, 95),
+            spinner_active: rgb(244, 160, 100),
+            spinner_done: rgb(150, 200, 150),
+            spinner_failed: rgb(224, 96, 96),
+        }
+    }
+}
+
+/// Compact truecolor constructor used by the palette definitions.
+const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    Color::Rgb { r, g, b }
 }
 
 fn normalize_theme_name(name: &str) -> String {
@@ -1237,6 +1333,24 @@ mod tests {
     }
 
     #[test]
+    fn resolves_new_palettes_and_aliases() {
+        assert_eq!(ColorTheme::named("matcha"), Some(ColorTheme::gi_matcha()));
+        assert_eq!(ColorTheme::named("gi-sumi"), Some(ColorTheme::gi_sumi()));
+        assert_eq!(ColorTheme::named("warm"), Some(ColorTheme::gi_sunrise()));
+        // Each declared theme name resolves to a distinct palette.
+        let palettes: Vec<_> = super::THEME_NAMES
+            .iter()
+            .map(|name| ColorTheme::named(name).expect("named theme"))
+            .collect();
+        assert_eq!(palettes.len(), super::THEME_NAMES.len());
+        for (i, a) in palettes.iter().enumerate() {
+            for b in &palettes[i + 1..] {
+                assert_ne!(a, b, "palettes should be distinct");
+            }
+        }
+    }
+
+    #[test]
     fn terminal_width_is_clamped_to_readable_range() {
         let width = terminal_width();
         assert!((40..=100).contains(&width), "got {width}");
@@ -1270,6 +1384,17 @@ mod tests {
     #[test]
     fn with_gutter_prefixes_every_line() {
         assert_eq!(with_gutter("a\nb", "▏ "), "▏ a\n▏ b");
+    }
+
+    #[test]
+    fn theme_swatch_previews_colors_or_plain_name() {
+        // Colored: truecolor swatches + name; NO_COLOR: just the name.
+        let colored = super::theme_swatch("gi-matcha", true);
+        assert!(colored.contains("\u{1b}[38;2;"));
+        assert!(colored.contains("gi-matcha"));
+        assert_eq!(super::theme_swatch("gi-matcha", false), "gi-matcha");
+        // Unknown name passes through.
+        assert_eq!(super::theme_swatch("nope", true), "nope");
     }
 
     #[test]

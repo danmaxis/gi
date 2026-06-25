@@ -334,8 +334,14 @@ TTY/`NO_COLOR`-gated. Interactive rendering needs live confirmation (PTY hangs h
 
 ### Slice 13: Theme expansion & status line
 
-- [ ] More palettes beyond dark/light; a persistent status line (model · agent · tokens ·
-  branch) in the inline model; `/theme` preview.
+- [x] More palettes beyond dark/light: `gi-matcha` (green), `gi-sumi` (ink/mono), `gi-sunrise`
+  (warm), each with aliases; `render::THEME_NAMES` is the single source of truth.
+- [x] A persistent status line (`◈ model · agent · ~tokens · branch`) printed before each REPL
+  prompt; dim, NO_COLOR-safe, TTY-gated.
+- [x] `/theme` (no arg) now previews every palette with colored swatches.
+
+Done 2026-06-24: pure, unit-tested `compose_status_line` / `theme_swatch` and palette
+constructors; visuals TTY/`NO_COLOR`-gated. Live rendering needs visual confirmation.
 
 ### Slice 14: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 

@@ -349,16 +349,19 @@ prompt box (`╭─ <mode> · <agent> ─╮`):
 - **default** — workspace-write, but **asks before edits** (write/edit/bash prompt for
   approval).
 - **edit** — workspace-write, **auto-accepts** edits (no prompts).
-- **plan** — **read-only**: the agent investigates and proposes an approach without changing
-  anything.
+- **plan** — **read-only propose → approve → execute**: the agent investigates and drafts an
+  implementation plan without touching files, then calls `exit_plan_mode` to show it for
+  approval. **Approve** → gi switches to **edit** mode and the agent implements the plan;
+  reply with anything else to **revise** (your text is fed back as feedback and it stays in
+  plan).
 - **mugen** (無限, "limitless") — **danger-full-access**: auto-approves every tool.
 
-Set `"defaultMode": "edit"` in `.gi/settings.json` to pick the startup mode. Non-interactive
-`gi -p` always auto-accepts (it never blocks on a prompt).
+The active mode tints the prompt box + `❯` (plan blue, edit green, mugen red); Shift+Tab
+keeps whatever you've typed. Set `"defaultMode": "edit"` in `.gi/settings.json` to pick the
+startup mode. Non-interactive `gi -p` always auto-accepts (it never blocks on a prompt).
 
-> Two deluxe behaviors are still being wired: `plan` will gain a **propose→approve→execute**
-> flow, and `mugen` an **auto-continue** loop (keep working until done / capped / ESC). For
-> now `plan` is read-only and `mugen` auto-approves a single turn.
+> One deluxe behavior is still being wired: `mugen` will gain an **auto-continue** loop (keep
+> working across turns until done / capped / ESC). For now `mugen` auto-approves a single turn.
 
 ## Agents
 

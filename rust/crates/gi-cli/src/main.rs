@@ -8029,11 +8029,11 @@ fn run_repl(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
+                    cli.run_turn_and_continue(&prompt)?;
                     continue;
                 }
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                cli.run_turn_and_continue(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::CycleMode(buffer) => {
@@ -8507,8 +8507,14 @@ fn build_runtime_mcp_state(
     // Advertise spawn_agent only when enabled in config AND we're not already
     // building a subagent's runtime (prevents recursive self-spawning).
     let spawn_enabled = runtime_config.subagents().enabled() && !subagent_active();
-    let local_runtime_tools =
-        local_runtime_tool_definitions(runtime_config.memory().enabled(), spawn_enabled);
+    // exit_plan_mode is advertised only while the active session is in plan mode
+    // (set by LiveCli via a thread-local) and never inside a subagent. Slice 15b.
+    let plan_enabled = plan_tools() && !subagent_active();
+    let local_runtime_tools = local_runtime_tool_definitions(
+        runtime_config.memory().enabled(),
+        spawn_enabled,
+        plan_enabled,
+    );
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, local_runtime_tools));
     };
@@ -8627,6 +8633,7 @@ impl Drop for SubagentGuard {
 fn local_runtime_tool_definitions(
     memory_enabled: bool,
     spawn_enabled: bool,
+    plan_enabled: bool,
 ) -> Vec<RuntimeToolDefinition> {
     let mut tools = vec![RuntimeToolDefinition {
         name: "ask_user".to_string(),
@@ -8721,6 +8728,28 @@ fn local_runtime_tool_definitions(
                     "reasoning_effort": { "type": "string", "enum": ["low", "medium", "high"] }
                 },
                 "required": ["prompt"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        });
+    }
+
+    // exit_plan_mode is advertised only while in plan mode (read-only): the model
+    // drafts a plan, calls this to request approval, and on approval gi switches
+    // to edit mode and the plan is executed. Slice 15b.
+    if plan_enabled {
+        tools.push(RuntimeToolDefinition {
+            name: "exit_plan_mode".to_string(),
+            description: Some(
+                "Call this when you are in plan mode and have finished drafting an implementation plan that is ready for the user to approve. Pass the full plan as `plan` (markdown). The user reviews it: on approval gi switches to edit mode and you implement the plan; on rejection you receive their feedback and stay in plan mode. Do NOT edit files or run mutating commands before the plan is approved."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan": { "type": "string", "description": "The full implementation plan to present for approval, in markdown." }
+                },
+                "required": ["plan"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -8905,8 +8934,10 @@ impl LiveCli {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let permission_mode = mode.permission_mode();
         // Make `permission_policy` (called inside build_runtime) apply this
-        // mode's ask-before-mutate behavior.
+        // mode's ask-before-mutate behavior, and advertise `exit_plan_mode` only
+        // in plan mode (Slice 15b).
         set_ask_before_mutate(mode.ask_before_mutate());
+        set_plan_tools(mode == SessionMode::Plan);
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -9065,6 +9096,27 @@ impl LiveCli {
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.shutdown_plugins()?;
         self.runtime = runtime;
+        Ok(())
+    }
+
+    /// Run a turn, then handle plan-mode approval: if the model called
+    /// `exit_plan_mode` and the user approved, switch to edit mode and continue
+    /// one turn so the plan is executed. Slice 15b.
+    fn run_turn_and_continue(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn(input)?;
+        if take_exit_plan_approved() {
+            if self.mode == SessionMode::Plan {
+                self.set_mode(SessionMode::Edit)?;
+            }
+            let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+            let note = if use_color {
+                "\x1b[1m▶ Executing approved plan…\x1b[0m"
+            } else {
+                "▶ Executing approved plan…"
+            };
+            println!("{note}");
+            self.run_turn(PLAN_EXECUTE_NUDGE)?;
+        }
         Ok(())
     }
 
@@ -9933,6 +9985,7 @@ impl LiveCli {
         self.mode = mode;
         self.permission_mode = mode.permission_mode();
         set_ask_before_mutate(mode.ask_before_mutate());
+        set_plan_tools(mode == SessionMode::Plan);
         let session = self.runtime.session().clone();
         let runtime = build_runtime(
             session,
@@ -16185,6 +16238,9 @@ impl CliToolExecutor {
         if tool_name == "spawn_agent" {
             return self.execute_spawn_agent(value);
         }
+        if tool_name == "exit_plan_mode" {
+            return self.execute_exit_plan_mode(value);
+        }
 
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
@@ -16332,6 +16388,76 @@ impl CliToolExecutor {
             println!("  ✓ {label} finished");
         }
         Ok(format!("[subagent: {label} · {model}]\n\n{}", text.trim()))
+    }
+
+    /// Present a drafted plan for approval (plan mode). On approval, sets the
+    /// `EXIT_PLAN_APPROVED` flag so the REPL switches to edit mode and executes;
+    /// on rejection, returns the user's feedback so the model can revise. The
+    /// model is told NOT to edit before approval. Slice 15b.
+    fn execute_exit_plan_mode(&self, value: serde_json::Value) -> Result<String, ToolError> {
+        let plan = value
+            .get("plan")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if plan.is_empty() {
+            return Err(ToolError::new("exit_plan_mode requires a non-empty plan"));
+        }
+
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+
+        // Never block on a non-interactive stdin: report back rather than hang.
+        if !io::stdin().is_terminal() {
+            return Ok(json!({
+                "approved": false,
+                "interactive_required": true,
+                "message": "Plan approval requires an interactive terminal; cannot proceed."
+            })
+            .to_string());
+        }
+
+        println!();
+        println!("{}", render::panel(Some("Plan"), &plan, use_color));
+        println!();
+        print!("Approve this plan? [y]es to execute · anything else to revise (type feedback): ");
+        let _ = io::stdout().flush();
+
+        let response = match read_line_with_timeout(None) {
+            Ok(Some(line)) => line.trim().to_string(),
+            Ok(None) | Err(_) => String::new(),
+        };
+        let approved = matches!(
+            response.to_ascii_lowercase().as_str(),
+            "y" | "yes" | "approve" | "approved" | "ok"
+        );
+
+        if approved {
+            set_exit_plan_approved(true);
+            println!("✔ Plan approved — switching to edit mode to execute.");
+            Ok(json!({
+                "approved": true,
+                "message": "The plan was approved. gi is switching to edit mode; implement the plan now."
+            })
+            .to_string())
+        } else {
+            // Explicit no → no feedback; any other text → revision feedback.
+            let feedback = if matches!(
+                response.to_ascii_lowercase().as_str(),
+                "n" | "no" | "reject" | "rejected" | ""
+            ) {
+                String::new()
+            } else {
+                response
+            };
+            println!("✗ Plan not approved — staying in plan mode.");
+            Ok(json!({
+                "approved": false,
+                "feedback": feedback,
+                "message": "The plan was not approved. Stay in plan mode and revise the plan based on the feedback."
+            })
+            .to_string())
+        }
     }
 
     fn execute_ask_user(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -16666,11 +16792,22 @@ impl SessionMode {
 
 const MODE_NAMES: [&str; 4] = ["default", "plan", "edit", "mugen"];
 
+/// Continuation prompt sent automatically after a plan is approved, so the model
+/// executes it in edit mode without the user re-typing. Slice 15b.
+const PLAN_EXECUTE_NUDGE: &str =
+    "The plan was approved. Implement it now, making the necessary edits to the codebase.";
+
 thread_local! {
     /// Set by the active `LiveCli` so `permission_policy` can make "default" mode
     /// ask before mutating the workspace. Leakage into read-only subagent builds
     /// is harmless (read-only denies mutating tools anyway). Slice 15.
     static ASK_BEFORE_MUTATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the active `LiveCli` so `build_runtime_mcp_state` advertises the
+    /// `exit_plan_mode` tool only while in plan mode. Slice 15b.
+    static PLAN_TOOLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the `exit_plan_mode` tool when the user approves the drafted plan;
+    /// the REPL consumes it after the turn to switch to edit and execute. Slice 15b.
+    static EXIT_PLAN_APPROVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn set_ask_before_mutate(value: bool) {
@@ -16679,6 +16816,23 @@ fn set_ask_before_mutate(value: bool) {
 
 fn ask_before_mutate() -> bool {
     ASK_BEFORE_MUTATE.with(std::cell::Cell::get)
+}
+
+fn set_plan_tools(value: bool) {
+    PLAN_TOOLS.with(|cell| cell.set(value));
+}
+
+fn plan_tools() -> bool {
+    PLAN_TOOLS.with(std::cell::Cell::get)
+}
+
+fn set_exit_plan_approved(value: bool) {
+    EXIT_PLAN_APPROVED.with(|cell| cell.set(value));
+}
+
+/// Read and clear the plan-approval flag (consumed once by the REPL per turn).
+fn take_exit_plan_approved() -> bool {
+    EXIT_PLAN_APPROVED.with(|cell| cell.replace(false))
 }
 
 /// Mutating tools that `default` mode prompts before running.
@@ -21906,7 +22060,7 @@ UU conflicted.rs",
 
     #[test]
     fn local_runtime_tools_include_ask_user() {
-        let tools = local_runtime_tool_definitions(false, false);
+        let tools = local_runtime_tool_definitions(false, false, false);
         let ask_user = tools
             .iter()
             .find(|tool| tool.name == "ask_user")
@@ -21926,11 +22080,11 @@ UU conflicted.rs",
     #[test]
     fn memory_tools_are_gated_on_the_memory_flag() {
         // Disabled (default): no memory tools advertised to the model.
-        let off = local_runtime_tool_definitions(false, false);
+        let off = local_runtime_tool_definitions(false, false, false);
         assert!(!off.iter().any(|tool| tool.name.starts_with("memory_")));
 
         // Enabled: both query + write appear, ReadOnly (opt-in is the consent).
-        let on = local_runtime_tool_definitions(true, false);
+        let on = local_runtime_tool_definitions(true, false, false);
         let query = on
             .iter()
             .find(|tool| tool.name == "memory_query")
@@ -21947,17 +22101,33 @@ UU conflicted.rs",
     #[test]
     fn spawn_agent_tool_is_gated_on_the_subagents_flag() {
         // Disabled (default): spawn_agent is not advertised.
-        let off = local_runtime_tool_definitions(false, false);
+        let off = local_runtime_tool_definitions(false, false, false);
         assert!(!off.iter().any(|tool| tool.name == "spawn_agent"));
 
         // Enabled: spawn_agent appears, ReadOnly, requiring a prompt.
-        let on = local_runtime_tool_definitions(false, true);
+        let on = local_runtime_tool_definitions(false, true, false);
         let spawn = on
             .iter()
             .find(|tool| tool.name == "spawn_agent")
             .expect("spawn_agent should be advertised when subagents are enabled");
         assert_eq!(spawn.required_permission, PermissionMode::ReadOnly);
         assert_eq!(spawn.input_schema["required"][0].as_str(), Some("prompt"));
+    }
+
+    #[test]
+    fn exit_plan_mode_tool_is_gated_on_plan_mode() {
+        // Not in plan mode: exit_plan_mode is not advertised.
+        let off = local_runtime_tool_definitions(false, false, false);
+        assert!(!off.iter().any(|tool| tool.name == "exit_plan_mode"));
+
+        // Plan mode: exit_plan_mode appears, ReadOnly, requiring a plan.
+        let on = local_runtime_tool_definitions(false, false, true);
+        let exit = on
+            .iter()
+            .find(|tool| tool.name == "exit_plan_mode")
+            .expect("exit_plan_mode should be advertised in plan mode");
+        assert_eq!(exit.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(exit.input_schema["required"][0].as_str(), Some("plan"));
     }
 
     #[test]

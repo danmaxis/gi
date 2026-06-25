@@ -358,13 +358,18 @@ Done 2026-06-25.
 - [x] `SessionMode {default, plan, edit, mugen}` over the permission system; `/mode` +
   Shift+Tab switching; `defaultMode` config; mode shown in the prompt box.
 - [x] **default asks before edits, edit auto-accepts** (`PermissionPolicy::with_ask_tools`).
-- [ ] **plan → approve → execute** (`exit_plan_mode` tool): plan is read-only today; the
-  approve→auto-execute flow is pending.
+- [x] **per-mode accent colors** on the prompt box + `❯` (`render::mode_accent`); Shift+Tab
+  preserves the typed buffer (`ReadOutcome::CycleMode(String)` + `read_line_with_initial`).
+- [x] **plan → approve → execute** (`exit_plan_mode` tool, gated on plan mode): the model
+  drafts a plan, gi shows it in a panel + asks approval; approve flips to edit mode and
+  auto-continues one turn to execute; reject returns feedback and stays in plan.
 - [ ] **mugen auto-continue** loop (`task_complete` tool + cap + ESC): mugen auto-approves a
   single turn today; the autonomous across-turn loop is pending.
 
-Partial 2026-06-25: mode-system core shipped + tested; the two autonomous behaviors above are
-multi-turn loops that need live-terminal verification, deferred to a focused follow-up.
+Progress 2026-06-25: mode-system core + the two prompt tweaks + plan→approve→execute shipped &
+unit-tested (gating + build/fmt/clippy green). The interactive approval prompt + mode-flip +
+execute path still needs live-terminal smoke (raw-mode tty, not runnable in the sandbox). Mugen
+auto-continue remains.
 
 ### Slice 14b: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 

@@ -7931,6 +7931,7 @@ fn run_repl(
     let mut resolved_model = provenance.resolved;
     let mut effort = reasoning_effort;
     let repl_cwd = env::current_dir()?;
+    let mut default_plan_execute_mode: Option<SessionMode> = None;
     let active_agent = default_agent_profile(&repl_cwd)?.map(|profile| {
         if let Some(agent_model) = profile.model.as_deref() {
             if !model_was_flag {
@@ -7940,6 +7941,10 @@ fn run_repl(
         if effort.is_none() {
             effort.clone_from(&profile.reasoning_effort);
         }
+        default_plan_execute_mode = profile
+            .plan_execute_mode
+            .as_deref()
+            .and_then(SessionMode::parse_execute_target);
         profile.name
     });
     // Initial operating mode (Slice 15): a configured `defaultMode` wins; else
@@ -7956,6 +7961,7 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, initial_mode)?;
     cli.set_reasoning_effort(effort);
     cli.active_agent = active_agent;
+    cli.plan_execute_mode = default_plan_execute_mode;
     // Mugen's autonomous loop is opt-in via `modes.mugen` (Slice 15c).
     if let Some(config) = &repl_config {
         cli.set_mugen_config(config.mugen().enabled(), config.mugen().max_turns());
@@ -8110,6 +8116,9 @@ struct LiveCli {
     /// opt-in) and its per-prompt turn cap. Slice 15c.
     mugen_enabled: bool,
     mugen_max_turns: u32,
+    /// Target mode plan-approval switches into for the active agent (`edit` /
+    /// `mugen`); `None` → ask each time. Slice 16.
+    plan_execute_mode: Option<SessionMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -9009,6 +9018,7 @@ impl LiveCli {
             active_agent: None,
             mugen_enabled: false,
             mugen_max_turns: runtime::DEFAULT_MUGEN_MAX_TURNS,
+            plan_execute_mode: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -9116,6 +9126,17 @@ impl LiveCli {
         )
     }
 
+    /// Transient system-prompt guidance for the active mode, appended per turn so
+    /// weaker models follow the mode's workflow. `None` for default/edit (no extra
+    /// guidance needed). Slice 16.
+    fn mode_guidance(&self) -> Option<String> {
+        match self.mode {
+            SessionMode::Plan => Some(PLAN_MODE_GUIDANCE.to_string()),
+            SessionMode::Mugen if self.mugen_enabled => Some(MUGEN_MODE_GUIDANCE.to_string()),
+            _ => None,
+        }
+    }
+
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
@@ -9124,11 +9145,19 @@ impl LiveCli {
         Box<dyn std::error::Error>,
     > {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        // Append transient, mode-specific guidance so the model actually behaves
+        // for the active mode (e.g. drafts a plan + calls exit_plan_mode in plan
+        // mode). The base prompt stays built-once; this matches the live mode each
+        // turn. Slice 16.
+        let mut system_prompt = self.system_prompt.clone();
+        if let Some(guidance) = self.mode_guidance() {
+            system_prompt.push(guidance);
+        }
         let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
-            self.system_prompt.clone(),
+            system_prompt,
             true,
             emit_output,
             self.allowed_tools.clone(),
@@ -9160,7 +9189,11 @@ impl LiveCli {
         self.run_turn(input)?;
         if take_exit_plan_approved() {
             if self.mode == SessionMode::Plan {
-                self.set_mode(SessionMode::Edit, true)?;
+                // Per-agent config picks the execution mode; otherwise ask.
+                let target = self
+                    .plan_execute_mode
+                    .unwrap_or_else(Self::ask_plan_execute_target);
+                self.set_mode(target, true)?;
             }
             let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
             let note = if use_color {
@@ -9172,6 +9205,23 @@ impl LiveCli {
             self.run_turn(PLAN_EXECUTE_NUDGE)?;
         }
         Ok(())
+    }
+
+    /// Prompt for the mode to execute an approved plan in. Non-interactive →
+    /// `edit` (never blocks). Slice 16.
+    fn ask_plan_execute_target() -> SessionMode {
+        if !io::stdin().is_terminal() {
+            return SessionMode::Edit;
+        }
+        print!("Execute the plan in [e]dit or [m]ugen? [E/m]: ");
+        let _ = io::stdout().flush();
+        match read_line_with_timeout(None) {
+            Ok(Some(line)) => match line.trim().to_ascii_lowercase().as_str() {
+                "m" | "mugen" => SessionMode::Mugen,
+                _ => SessionMode::Edit,
+            },
+            _ => SessionMode::Edit,
+        }
     }
 
     /// In mugen mode with the loop enabled (`modes.mugen.enabled`), keep
@@ -10009,6 +10059,10 @@ impl LiveCli {
         if let Some(effort) = profile.reasoning_effort.clone() {
             self.set_reasoning_effort(Some(effort));
         }
+        self.plan_execute_mode = profile
+            .plan_execute_mode
+            .as_deref()
+            .and_then(SessionMode::parse_execute_target);
         self.active_agent = Some(profile.name.clone());
         println!(
             "▸ Agent {} active · model {}{}",
@@ -14749,6 +14803,53 @@ fn start_thinking_animation(
     })
 }
 
+/// Flatten `text` to one line and cap it at `max` chars, appending a total-size
+/// note when truncated. Keeps the approval prompt readable. Slice 16.
+fn truncate_inline(text: &str, max: usize) -> String {
+    let one_line: String = text
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect();
+    let count = one_line.chars().count();
+    if count > max {
+        let head: String = one_line.chars().take(max).collect();
+        format!("{head}… ({count} chars total)")
+    } else {
+        one_line
+    }
+}
+
+/// Concise one-line summary of a tool-call input for the approval prompt, so we
+/// don't dump a whole escaped JSON blob (e.g. a full file's contents). Slice 16.
+fn summarize_permission_input(tool_name: &str, input: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) else {
+        return truncate_inline(input, 200);
+    };
+    let str_field = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| parsed.get(*key).and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+    };
+    match tool_name {
+        "write_file" | "Write" | "edit_file" | "Edit" => {
+            let path = str_field(&["path", "file_path"]).unwrap_or_else(|| "?".to_string());
+            match str_field(&["content", "new_string", "new_str"]) {
+                Some(content) => {
+                    let lines = content.lines().count().max(1);
+                    let bytes = content.len();
+                    format!("{path} ({lines} lines, {bytes} bytes)")
+                }
+                None => path,
+            }
+        }
+        "bash" | "Bash" => str_field(&["command", "cmd"]).map_or_else(
+            || truncate_inline(input, 200),
+            |cmd| truncate_inline(&cmd, 200),
+        ),
+        _ => truncate_inline(input, 200),
+    }
+}
+
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
     /// When set, held while prompting so the background "thinking" animation is
@@ -14791,7 +14892,10 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         if let Some(reason) = &request.reason {
             println!("  Reason           {reason}");
         }
-        println!("  Input            {}", request.input);
+        println!(
+            "  Input            {}",
+            summarize_permission_input(&request.tool_name, &request.input)
+        );
         print!("Approve this tool call? [y/N]: ");
         let _ = io::stdout().flush();
 
@@ -15039,6 +15143,11 @@ impl AnthropicRuntimeClient {
         };
         let renderer = TerminalRenderer::new();
         let mut markdown_stream = MarkdownStreamState::default();
+        // Bound the streamed answer with a left gutter bar (interactive TTY only;
+        // piped output stays clean). Slice 16.
+        let gutter_on = io::stdout().is_terminal();
+        let mut answer_gutter =
+            render::StreamGutter::new(gutter_on, gutter_on && env::var_os("NO_COLOR").is_none());
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
@@ -15141,6 +15250,7 @@ impl AnthropicRuntimeClient {
                                 progress_reporter.mark_text_phase(&text);
                             }
                             if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                let rendered = answer_gutter.wrap(&rendered);
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -15173,6 +15283,7 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
                     if let Some(rendered) = markdown_stream.flush(&renderer) {
+                        let rendered = answer_gutter.wrap(&rendered);
                         write!(out, "{rendered}")
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -16904,6 +17015,15 @@ impl SessionMode {
         matches!(self, Self::Mugen)
     }
 
+    /// Parse a plan-approval execution target — only `edit` / `mugen` are valid
+    /// (you don't re-enter plan/default to execute). `None` → ask. Slice 16.
+    fn parse_execute_target(value: &str) -> Option<Self> {
+        match Self::parse(value) {
+            Some(mode @ (Self::Edit | Self::Mugen)) => Some(mode),
+            _ => None,
+        }
+    }
+
     /// A short description of what the mode does, shown beside its name in the
     /// prompt box and in switch confirmations. Slice 15.
     fn note(self) -> &'static str {
@@ -16937,6 +17057,14 @@ const PLAN_EXECUTE_NUDGE: &str =
 /// Continuation prompt sent automatically each mugen auto-turn (no user input),
 /// nudging the model onward and reminding it of the clean stop. Slice 15c.
 const MUGEN_NUDGE: &str = "Continue with the next step of the task autonomously. When the entire task is fully complete, call the task_complete tool with a short summary.";
+
+/// System-prompt guidance appended while in plan mode so the model drafts a plan
+/// and calls `exit_plan_mode` instead of editing or just chatting. Slice 16.
+const PLAN_MODE_GUIDANCE: &str = "You are in PLAN MODE and the workspace is READ-ONLY. Do not edit files or run mutating commands — any attempt will be denied. First, ask the user any essential clarifying questions needed to scope the work. Then produce a concrete, step-by-step implementation plan and call the `exit_plan_mode` tool with the full plan (as markdown) for the user to approve. Only after the user approves will gi switch to an editing mode so you can implement it. Do not claim you have made changes while in plan mode.";
+
+/// System-prompt guidance appended while in mugen mode with the auto-continue
+/// loop enabled, so the model works autonomously and stops cleanly. Slice 16.
+const MUGEN_MODE_GUIDANCE: &str = "You are in MUGEN MODE (autonomous): gi will keep continuing your work across turns with no further user input. Work through the task end to end, step by step. When the entire task is fully complete, call the `task_complete` tool with a short summary to stop. Do not call it while work remains.";
 
 thread_local! {
     /// Set by the active `LiveCli` so `permission_policy` can make "default" mode
@@ -22330,6 +22458,39 @@ UU conflicted.rs",
         assert_eq!(SessionMode::parse("auto"), Some(SessionMode::Mugen));
         assert_eq!(SessionMode::parse("nope"), None);
         assert_eq!(SessionMode::Default.as_str(), "default");
+
+        // Plan-execute target: only edit / mugen are valid (Slice 16).
+        assert_eq!(
+            SessionMode::parse_execute_target("edit"),
+            Some(SessionMode::Edit)
+        );
+        assert_eq!(
+            SessionMode::parse_execute_target("mugen"),
+            Some(SessionMode::Mugen)
+        );
+        assert_eq!(SessionMode::parse_execute_target("plan"), None);
+        assert_eq!(SessionMode::parse_execute_target("default"), None);
+    }
+
+    #[test]
+    fn permission_input_summary_elides_large_writes() {
+        // A big write_file content is reduced to path + size, not dumped.
+        let big = "x".repeat(5000);
+        let input = serde_json::json!({ "path": "song.html", "content": big }).to_string();
+        let summary = super::summarize_permission_input("write_file", &input);
+        assert!(summary.contains("song.html"));
+        assert!(summary.contains("bytes"));
+        assert!(!summary.contains("xxxx"));
+        assert!(summary.chars().count() < 80);
+
+        // A bash call shows the command; an opaque blob is truncated with a note.
+        let bash = serde_json::json!({ "command": "mkdir country soul" }).to_string();
+        assert_eq!(
+            super::summarize_permission_input("bash", &bash),
+            "mkdir country soul"
+        );
+        let blob = format!("\"{}\"", "y".repeat(500));
+        assert!(super::summarize_permission_input("mystery", &blob).contains("chars total"));
 
         // Shift+Tab cycle: default → plan → edit → mugen → default.
         assert_eq!(SessionMode::Default.next(), SessionMode::Plan);

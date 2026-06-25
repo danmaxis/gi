@@ -2215,6 +2215,9 @@ pub(crate) struct AgentSummary {
     // Slice 10: the agent's instruction body (Markdown body / TOML `prompt`),
     // used as the subagent system prompt when spawned.
     instructions: Option<String>,
+    // Slice 16: which mode plan-approval switches into for this agent
+    // ("edit" | "mugen"); None → gi asks each time.
+    plan_execute_mode: Option<String>,
     source: DefinitionSource,
     shadowed_by: Option<DefinitionSource>,
     // #728: on-disk path so `agents show` can surface the file path
@@ -4125,6 +4128,7 @@ fn load_agents_from_roots_with_invalids(
                         reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
                         instructions: parse_toml_string(&contents, "prompt")
                             .or_else(|| parse_toml_string(&contents, "instructions")),
+                        plan_execute_mode: parse_toml_string(&contents, "plan_execute_mode"),
                         source: *source,
                         shadowed_by: None,
                         path: Some(path),
@@ -4132,8 +4136,14 @@ fn load_agents_from_roots_with_invalids(
                 }
                 Some("md") => {
                     let contents = fs::read_to_string(&path)?;
-                    let (name, description, model, reasoning_effort, instructions) =
-                        parse_agent_frontmatter(&contents);
+                    let (
+                        name,
+                        description,
+                        model,
+                        reasoning_effort,
+                        instructions,
+                        plan_execute_mode,
+                    ) = parse_agent_frontmatter(&contents);
                     if name.is_none() && description.is_none() {
                         invalid_agents.push(InvalidAgentConfig {
                             path,
@@ -4151,6 +4161,7 @@ fn load_agents_from_roots_with_invalids(
                         model,
                         reasoning_effort,
                         instructions,
+                        plan_execute_mode,
                         source: *source,
                         shadowed_by: None,
                         path: Some(path),
@@ -4189,6 +4200,9 @@ pub struct AgentProfile {
     pub reasoning_effort: Option<String>,
     /// The agent's instruction body, used as the subagent system prompt. Slice 10.
     pub instructions: Option<String>,
+    /// Which mode plan-approval switches into for this agent ("edit" | "mugen");
+    /// `None` → gi asks each time. Slice 16.
+    pub plan_execute_mode: Option<String>,
     /// Human-readable scope label (e.g. "project", "user").
     pub source: String,
 }
@@ -4201,6 +4215,7 @@ impl AgentProfile {
             model: summary.model.clone(),
             reasoning_effort: summary.reasoning_effort.clone(),
             instructions: summary.instructions.clone(),
+            plan_execute_mode: summary.plan_execute_mode.clone(),
             source: summary.source.label().to_string(),
         }
     }
@@ -4579,8 +4594,10 @@ fn unquote_frontmatter_value(value: &str) -> String {
 }
 
 /// Parse agent metadata from YAML frontmatter in `.md` agent files.
-/// Returns (name, description, model, reasoning_effort) extracted from
-/// the `---`-delimited YAML block at the top of the file.
+/// Returns (name, description, model, reasoning_effort, instructions,
+/// plan_execute_mode) from the `---`-delimited YAML block + body. The flat
+/// tuple is kept for parity with the single call site; a struct adds no clarity.
+#[allow(clippy::type_complexity)]
 fn parse_agent_frontmatter(
     contents: &str,
 ) -> (
@@ -4589,16 +4606,18 @@ fn parse_agent_frontmatter(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 ) {
     let mut lines = contents.lines();
     if lines.next().map(str::trim) != Some("---") {
-        return (None, None, None, None, None);
+        return (None, None, None, None, None, None);
     }
 
     let mut name = None;
     let mut description = None;
     let mut model = None;
     let mut reasoning_effort = None;
+    let mut plan_execute_mode = None;
     // Everything after the closing `---` is the agent's instruction body, used
     // as the system prompt when the agent runs as a spawned subagent (Slice 10).
     let mut in_body = false;
@@ -4640,6 +4659,13 @@ fn parse_agent_frontmatter(
             if !value.is_empty() {
                 reasoning_effort = Some(value);
             }
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("plan_execute_mode:") {
+            let value = unquote_frontmatter_value(value.trim());
+            if !value.is_empty() {
+                plan_execute_mode = Some(value);
+            }
         }
     }
 
@@ -4647,7 +4673,14 @@ fn parse_agent_frontmatter(
         let trimmed = body.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     };
-    (name, description, model, reasoning_effort, instructions)
+    (
+        name,
+        description,
+        model,
+        reasoning_effort,
+        instructions,
+        plan_execute_mode,
+    )
 }
 
 fn render_agents_report(agents: &[AgentSummary]) -> String {
@@ -7462,6 +7495,21 @@ mod tests {
         let (name, description) = super::parse_skill_frontmatter(contents);
         assert_eq!(name.as_deref(), Some("hud"));
         assert_eq!(description.as_deref(), Some("Quoted description"));
+    }
+
+    #[test]
+    fn agent_frontmatter_parses_plan_execute_mode() {
+        // The 6th tuple element carries the per-agent plan-approval target (Slice 16).
+        let with = "---\nname: builder\nplan_execute_mode: mugen\n---\nbody\n";
+        let (name, _desc, _model, _effort, _instr, plan_execute_mode) =
+            super::parse_agent_frontmatter(with);
+        assert_eq!(name.as_deref(), Some("builder"));
+        assert_eq!(plan_execute_mode.as_deref(), Some("mugen"));
+
+        // Absent → None (gi asks each time).
+        let without = "---\nname: builder\n---\nbody\n";
+        let (_n, _d, _m, _e, _i, plan_execute_mode) = super::parse_agent_frontmatter(without);
+        assert_eq!(plan_execute_mode, None);
     }
 
     #[test]

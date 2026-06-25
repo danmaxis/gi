@@ -7957,7 +7957,10 @@ fn run_repl(
     cli.set_reasoning_effort(effort);
     cli.active_agent = active_agent;
     let mut editor = input::LineEditor::new(
-        render::prompt_glyph(io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()),
+        render::prompt_glyph(
+            io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+            render::mode_accent(cli.mode.as_str()),
+        ),
         cli.repl_completion_candidates().unwrap_or_default(),
     );
     reveal_banner(&cli.startup_banner());
@@ -7970,11 +7973,17 @@ fn run_repl(
         .and_then(|context| context.git_branch.clone())
         .unwrap_or_else(|| "no-git".to_string());
 
+    // Text carried over from a Shift+Tab mode switch, re-seeded into the next
+    // prompt so the typed line survives the switch (Slice 15).
+    let mut pending_input: Option<String> = None;
+
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
-        // Refresh the themed prompt indicator (theme can change via /theme).
+        // Refresh the themed prompt indicator (theme can change via /theme,
+        // and the accent tracks the active mode — Slice 15).
         editor.set_prompt(render::prompt_glyph(
             io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+            render::mode_accent(cli.mode.as_str()),
         ));
         if io::stdout().is_terminal() {
             println!("{}", cli.status_line(&status_branch));
@@ -7983,7 +7992,11 @@ fn run_repl(
                 println!("{header}");
             }
         }
-        match editor.read_line()? {
+        let outcome = match pending_input.take() {
+            Some(seed) => editor.read_line_with_initial(seed)?,
+            None => editor.read_line()?,
+        };
+        match outcome {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
                 if trimmed.is_empty() {
@@ -8023,10 +8036,15 @@ fn run_repl(
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
-            input::ReadOutcome::CycleMode => {
+            input::ReadOutcome::CycleMode(buffer) => {
                 let next = cli.mode.next();
                 if let Err(error) = cli.set_mode(next) {
                     eprintln!("{error}");
+                }
+                // Re-seed the next prompt with whatever was typed so the switch
+                // doesn't discard in-progress text (Slice 15).
+                if !buffer.is_empty() {
+                    pending_input = Some(buffer);
                 }
             }
             input::ReadOutcome::Exit => {
@@ -16972,8 +16990,8 @@ mod tests {
         AskUserResult, AskUserSource, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
         GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
         LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
-        SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        SessionLifecycleSummary, SessionMode, SlashCommand, StatusUsage, TmuxPaneSnapshot,
+        DEFAULT_MODEL, LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{

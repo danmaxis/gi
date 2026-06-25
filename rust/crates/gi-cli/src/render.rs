@@ -107,22 +107,49 @@ fn theme_fg(color: Color) -> String {
     }
 }
 
-/// The themed prompt indicator that replaces the bare `> ` (a colored `❯ `).
-/// Its visible width is always 2. `NO_COLOR` → plain `"❯ "`. Slice 14a.
+/// Semantic accent color for a non-default operating mode, used to tint the
+/// prompt box + `❯` glyph so the active mode is unmistakable. `default`/empty
+/// → `None` (keep the neutral theme color). These are intentional status
+/// colors (like the `spinner_*` palette), not theme-driven. Slice 15.
 #[must_use]
-pub fn prompt_glyph(use_color: bool) -> String {
+pub fn mode_accent(mode: &str) -> Option<Color> {
+    match mode {
+        "plan" => Some(Color::Rgb {
+            r: 96,
+            g: 165,
+            b: 250,
+        }), // calm blue — read-only
+        "edit" => Some(Color::Rgb {
+            r: 122,
+            g: 199,
+            b: 120,
+        }), // green — active editing
+        "mugen" => Some(Color::Rgb {
+            r: 236,
+            g: 72,
+            b: 120,
+        }), // loud red/magenta — autonomous
+        _ => None,
+    }
+}
+
+/// The themed prompt indicator that replaces the bare `> ` (a colored `❯ `).
+/// Its visible width is always 2. `NO_COLOR` → plain `"❯ "`. An `accent` (from
+/// [`mode_accent`]) tints the glyph per active mode; `None` keeps the theme
+/// color. Slice 14a / 15.
+#[must_use]
+pub fn prompt_glyph(use_color: bool, accent: Option<Color>) -> String {
     if !use_color {
         return "❯ ".to_string();
     }
-    format!(
-        "{}\x1b[1m❯\x1b[0m ",
-        theme_fg(ColorTheme::default().heading)
-    )
+    let color = accent.unwrap_or_else(|| ColorTheme::default().heading);
+    format!("{}\x1b[1m❯\x1b[0m ", theme_fg(color))
 }
 
 /// A themed bounding-box header shown above the prompt, labeling the active
 /// `mode` and `agent` (e.g. `╭─ edit · reviewer ─╮`). Returns `None` when there
-/// is nothing to show. `NO_COLOR` → the plain box-drawing form. Slice 14a.
+/// is nothing to show. `NO_COLOR` → the plain box-drawing form. A non-default
+/// `mode` tints the border + title via [`mode_accent`]. Slice 14a / 15.
 #[must_use]
 pub fn prompt_header(agent: Option<&str>, mode: Option<&str>, use_color: bool) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
@@ -140,8 +167,9 @@ pub fn prompt_header(agent: Option<&str>, mode: Option<&str>, use_color: bool) -
         return Some(format!("╭─ {label} ─╮"));
     }
     let theme = ColorTheme::default();
-    let border = theme_fg(theme.code_block_border);
-    let title = theme_fg(theme.heading);
+    let accent = mode.and_then(mode_accent);
+    let border = theme_fg(accent.unwrap_or(theme.code_block_border));
+    let title = theme_fg(accent.unwrap_or(theme.heading));
     let reset = "\x1b[0m";
     Some(format!(
         "{border}╭─ {reset}{title}{label}{reset}{border} ─╮{reset}"
@@ -1439,9 +1467,9 @@ mod tests {
 
     #[test]
     fn prompt_glyph_and_header_are_themed_and_no_color_safe() {
-        assert_eq!(super::prompt_glyph(false), "❯ ");
-        assert!(super::prompt_glyph(true).contains('❯'));
-        assert!(super::prompt_glyph(true).contains('\u{1b}'));
+        assert_eq!(super::prompt_glyph(false, None), "❯ ");
+        assert!(super::prompt_glyph(true, None).contains('❯'));
+        assert!(super::prompt_glyph(true, None).contains('\u{1b}'));
 
         // Header labels mode · agent; empty when both absent.
         assert_eq!(
@@ -1456,6 +1484,30 @@ mod tests {
         assert!(super::prompt_header(None, Some("plan"), true)
             .unwrap()
             .contains('\u{1b}'));
+    }
+
+    #[test]
+    fn mode_accent_tints_non_default_modes() {
+        // Default / empty stay neutral (no accent); the other modes get one.
+        assert_eq!(super::mode_accent("default"), None);
+        assert_eq!(super::mode_accent(""), None);
+        assert!(super::mode_accent("plan").is_some());
+        assert!(super::mode_accent("edit").is_some());
+        assert!(super::mode_accent("mugen").is_some());
+
+        // The mugen accent (loud red/magenta) shows up in the colored header SGR.
+        let accent = super::mode_accent("mugen").unwrap();
+        let super::Color::Rgb { r, g, b } = accent else {
+            panic!("expected a truecolor accent");
+        };
+        let sgr = format!("\x1b[38;2;{r};{g};{b}m");
+        assert!(super::prompt_header(Some("ss"), Some("mugen"), true)
+            .unwrap()
+            .contains(&sgr));
+        // The glyph honors the accent too, and stays visible-width 2.
+        let glyph = super::prompt_glyph(true, Some(accent));
+        assert!(glyph.contains(&sgr));
+        assert_eq!(super::strip_ansi(&glyph).chars().count(), 2);
     }
 
     #[test]

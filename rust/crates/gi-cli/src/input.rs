@@ -20,8 +20,9 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
-    /// Shift+Tab pressed at the prompt — cycle the operating mode. Slice 15.
-    CycleMode,
+    /// Shift+Tab pressed at the prompt — cycle the operating mode, carrying the
+    /// in-progress buffer so the next prompt is re-seeded with it. Slice 15.
+    CycleMode(String),
 }
 
 const POPUP_MAX: usize = 5;
@@ -120,11 +121,18 @@ impl LineEditor {
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
+        self.read_line_with_initial(String::new())
+    }
+
+    /// Like [`read_line`](Self::read_line) but starts the editor with `initial`
+    /// already typed (cursor at end). Used to preserve in-progress text across a
+    /// mode switch (Shift+Tab → `CycleMode`). Slice 15.
+    pub fn read_line_with_initial(&mut self, initial: String) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
         enable_raw_mode()?;
-        let outcome = self.edit();
+        let outcome = self.edit(initial);
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
         let _ = write!(stdout, "\r\n");
@@ -133,9 +141,9 @@ impl LineEditor {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn edit(&mut self) -> io::Result<ReadOutcome> {
-        let mut buffer = String::new();
-        let mut cursor = 0usize; // char index
+    fn edit(&mut self, initial: String) -> io::Result<ReadOutcome> {
+        let mut cursor = initial.chars().count(); // char index, at end of seed
+        let mut buffer = initial;
         let mut selected = 0usize;
         let mut dismissed = false;
         let mut hist_pos = self.history.len();
@@ -200,13 +208,12 @@ impl LineEditor {
                     self.render(&buffer, cursor, None, 0)?;
                     return Ok(ReadOutcome::Submit(buffer));
                 }
-                // Shift+Tab cycles the operating mode (only with an empty buffer
-                // so typed text isn't lost). Slice 15.
+                // Shift+Tab cycles the operating mode, carrying any in-progress
+                // text so it's preserved across the switch — the REPL re-seeds
+                // the next prompt with it (command-like). Slice 15.
                 (KeyCode::BackTab, _) => {
-                    if buffer.is_empty() {
-                        self.render(&buffer, cursor, None, 0)?;
-                        return Ok(ReadOutcome::CycleMode);
-                    }
+                    self.render(&buffer, cursor, None, 0)?;
+                    return Ok(ReadOutcome::CycleMode(std::mem::take(&mut buffer)));
                 }
                 (KeyCode::Tab, _) => {
                     if let Some(items) = &popup {

@@ -354,14 +354,23 @@ prompt box (`╭─ <mode> · <agent> ─╮`):
   approval. **Approve** → gi switches to **edit** mode and the agent implements the plan;
   reply with anything else to **revise** (your text is fed back as feedback and it stays in
   plan).
-- **mugen** (無限, "limitless") — **danger-full-access**: auto-approves every tool.
+- **mugen** (無限, "limitless") — **danger-full-access**: auto-approves every tool. With the
+  opt-in **auto-continue loop** enabled it also keeps working **across turns** with no further
+  input — re-prompting itself until the agent calls `task_complete`, a turn cap is reached, or
+  you press **ESC/Ctrl+C**. Each auto-turn prints `⟳ MUGEN auto-continue (n/max)`.
 
 The active mode tints the prompt box + `❯` (plan blue, edit green, mugen red); Shift+Tab
 keeps whatever you've typed. Set `"defaultMode": "edit"` in `.gi/settings.json` to pick the
 startup mode. Non-interactive `gi -p` always auto-accepts (it never blocks on a prompt).
 
-> One deluxe behavior is still being wired: `mugen` will gain an **auto-continue** loop (keep
-> working across turns until done / capped / ESC). For now `mugen` auto-approves a single turn.
+The mugen loop is **off by default** — enable it explicitly in `.gi/settings.json`:
+
+```json
+{ "modes": { "mugen": { "enabled": true, "maxTurns": 25 } } }
+```
+
+`maxTurns` (default 25) caps autonomous turns per prompt so the loop is always bounded and
+ESC-interruptible. With the loop disabled, `mugen` still auto-approves but runs a single turn.
 
 ## Agents
 

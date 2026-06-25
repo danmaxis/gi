@@ -7945,9 +7945,9 @@ fn run_repl(
     // Initial operating mode (Slice 15): a configured `defaultMode` wins; else
     // workspace-write defaults to `default` (asks before edits), and an explicit
     // read-only / danger flag maps to plan / mugen.
-    let initial_mode = ConfigLoader::default_for(&repl_cwd)
-        .load()
-        .ok()
+    let repl_config = ConfigLoader::default_for(&repl_cwd).load().ok();
+    let initial_mode = repl_config
+        .as_ref()
         .and_then(|config| config.default_mode().and_then(SessionMode::parse))
         .unwrap_or_else(|| match permission_mode {
             PermissionMode::WorkspaceWrite => SessionMode::Default,
@@ -7956,6 +7956,10 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, initial_mode)?;
     cli.set_reasoning_effort(effort);
     cli.active_agent = active_agent;
+    // Mugen's autonomous loop is opt-in via `modes.mugen` (Slice 15c).
+    if let Some(config) = &repl_config {
+        cli.set_mugen_config(config.mugen().enabled(), config.mugen().max_turns());
+    }
     let mut editor = input::LineEditor::new(
         render::prompt_glyph(
             io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
@@ -8030,10 +8034,12 @@ fn run_repl(
                 if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
                     cli.record_prompt_history(&trimmed);
                     cli.run_turn_and_continue(&prompt)?;
+                    cli.run_mugen_loop()?;
                     continue;
                 }
                 cli.record_prompt_history(&trimmed);
                 cli.run_turn_and_continue(&trimmed)?;
+                cli.run_mugen_loop()?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::CycleMode(buffer) => {
@@ -8100,6 +8106,10 @@ struct LiveCli {
     /// Name of the active agent (Slice 9), if one was selected via `/agent` or
     /// `defaultAgent`. The agent's model already lives in `self.model`.
     active_agent: Option<String>,
+    /// Whether mugen's autonomous auto-continue loop is enabled (`modes.mugen`,
+    /// opt-in) and its per-prompt turn cap. Slice 15c.
+    mugen_enabled: bool,
+    mugen_max_turns: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -8516,13 +8526,16 @@ fn build_runtime_mcp_state(
     // Advertise spawn_agent only when enabled in config AND we're not already
     // building a subagent's runtime (prevents recursive self-spawning).
     let spawn_enabled = runtime_config.subagents().enabled() && !subagent_active();
-    // exit_plan_mode is advertised only while the active session is in plan mode
-    // (set by LiveCli via a thread-local) and never inside a subagent. Slice 15b.
+    // exit_plan_mode / task_complete are advertised only while the active session
+    // is in plan / mugen mode (set by LiveCli via thread-locals) and never inside
+    // a subagent. Slices 15b / 15c.
     let plan_enabled = plan_tools() && !subagent_active();
+    let mugen_enabled = mugen_tools() && !subagent_active();
     let local_runtime_tools = local_runtime_tool_definitions(
         runtime_config.memory().enabled(),
         spawn_enabled,
         plan_enabled,
+        mugen_enabled,
     );
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, local_runtime_tools));
@@ -8643,6 +8656,7 @@ fn local_runtime_tool_definitions(
     memory_enabled: bool,
     spawn_enabled: bool,
     plan_enabled: bool,
+    mugen_enabled: bool,
 ) -> Vec<RuntimeToolDefinition> {
     let mut tools = vec![RuntimeToolDefinition {
         name: "ask_user".to_string(),
@@ -8759,6 +8773,27 @@ fn local_runtime_tool_definitions(
                     "plan": { "type": "string", "description": "The full implementation plan to present for approval, in markdown." }
                 },
                 "required": ["plan"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        });
+    }
+
+    // task_complete is advertised only in mugen mode: it's the clean stop for the
+    // autonomous auto-continue loop. The model calls it when the task is fully
+    // done so gi stops re-prompting. Slice 15c.
+    if mugen_enabled {
+        tools.push(RuntimeToolDefinition {
+            name: "task_complete".to_string(),
+            description: Some(
+                "Call this when the entire task is fully complete and no further work remains. In mugen (autonomous) mode gi keeps continuing your work across turns until you call this; calling it stops the loop and returns control to the user. Provide a short `summary` of what was accomplished. Do not call it while work still remains."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "A short summary of what was accomplished." }
+                },
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -8947,6 +8982,7 @@ impl LiveCli {
         // in plan mode (Slice 15b).
         set_ask_before_mutate(mode.ask_before_mutate());
         set_plan_tools(mode == SessionMode::Plan);
+        set_mugen_tools(mode == SessionMode::Mugen);
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -8971,9 +9007,17 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             active_agent: None,
+            mugen_enabled: false,
+            mugen_max_turns: runtime::DEFAULT_MUGEN_MAX_TURNS,
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    /// Configure mugen's autonomous loop from `modes.mugen` config (Slice 15c).
+    fn set_mugen_config(&mut self, enabled: bool, max_turns: u32) {
+        self.mugen_enabled = enabled;
+        self.mugen_max_turns = max_turns.max(1);
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
@@ -9130,6 +9174,45 @@ impl LiveCli {
         Ok(())
     }
 
+    /// In mugen mode with the loop enabled (`modes.mugen.enabled`), keep
+    /// auto-continuing turns with no user input until the model calls
+    /// `task_complete`, the turn cap is hit, or the user interrupts (ESC/Ctrl+C).
+    /// A no-op outside mugen or when the loop is disabled. Slice 15c.
+    fn run_mugen_loop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.mode != SessionMode::Mugen || !self.mugen_enabled {
+            return Ok(());
+        }
+        // The initiating turn already ran: if it finished the task or was
+        // interrupted, don't start the loop.
+        if take_task_complete() || take_turn_interrupted() {
+            return Ok(());
+        }
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        let dim = |line: &str| {
+            if use_color {
+                println!("\x1b[2m{line}\x1b[0m");
+            } else {
+                println!("{line}");
+            }
+        };
+        let max = self.mugen_max_turns;
+        for n in 1..=max {
+            dim(&format!("⟳ MUGEN auto-continue ({n}/{max})"));
+            self.run_turn(MUGEN_NUDGE)?;
+            if take_task_complete() {
+                return Ok(());
+            }
+            if take_turn_interrupted() {
+                dim("⏹ Mugen loop interrupted.");
+                return Ok(());
+            }
+        }
+        dim(&format!(
+            "⟳ Mugen reached the {max}-turn cap — pausing. Send a message to continue."
+        ));
+        Ok(())
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -9202,6 +9285,8 @@ impl LiveCli {
         // to the prompt instead of treating it as a failure.
         if abort_signal.is_aborted() && result.is_err() {
             let _ = runtime.shutdown_plugins();
+            // Signal the mugen loop (if any) to stop auto-continuing. Slice 15c.
+            set_turn_interrupted(true);
             println!("\x1b[2m⏹ Request cancelled.\x1b[0m");
             return Ok(());
         }
@@ -10005,6 +10090,7 @@ impl LiveCli {
         self.permission_mode = mode.permission_mode();
         set_ask_before_mutate(mode.ask_before_mutate());
         set_plan_tools(mode == SessionMode::Plan);
+        set_mugen_tools(mode == SessionMode::Mugen);
         let session = self.runtime.session().clone();
         let runtime = build_runtime(
             session,
@@ -16257,6 +16343,9 @@ impl CliToolExecutor {
         if tool_name == "exit_plan_mode" {
             return self.execute_exit_plan_mode(value);
         }
+        if tool_name == "task_complete" {
+            return Self::execute_task_complete(&value);
+        }
 
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
@@ -16474,6 +16563,27 @@ impl CliToolExecutor {
             })
             .to_string())
         }
+    }
+
+    /// Mugen's clean stop: the model declares the task finished. Sets the
+    /// `TASK_COMPLETE` flag the auto-continue loop consumes to halt. Slice 15c.
+    fn execute_task_complete(value: &serde_json::Value) -> Result<String, ToolError> {
+        let summary = value
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        set_task_complete(true);
+        if let Some(summary) = summary {
+            println!("\x1b[1m✔ task_complete\x1b[0m — {summary}");
+        } else {
+            println!("\x1b[1m✔ task_complete\x1b[0m");
+        }
+        Ok(json!({
+            "acknowledged": true,
+            "message": "Task marked complete; the autonomous loop will stop."
+        })
+        .to_string())
     }
 
     fn execute_ask_user(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -16824,6 +16934,10 @@ const MODE_NAMES: [&str; 4] = ["default", "plan", "edit", "mugen"];
 const PLAN_EXECUTE_NUDGE: &str =
     "The plan was approved. Implement it now, making the necessary edits to the codebase.";
 
+/// Continuation prompt sent automatically each mugen auto-turn (no user input),
+/// nudging the model onward and reminding it of the clean stop. Slice 15c.
+const MUGEN_NUDGE: &str = "Continue with the next step of the task autonomously. When the entire task is fully complete, call the task_complete tool with a short summary.";
+
 thread_local! {
     /// Set by the active `LiveCli` so `permission_policy` can make "default" mode
     /// ask before mutating the workspace. Leakage into read-only subagent builds
@@ -16835,6 +16949,15 @@ thread_local! {
     /// Set by the `exit_plan_mode` tool when the user approves the drafted plan;
     /// the REPL consumes it after the turn to switch to edit and execute. Slice 15b.
     static EXIT_PLAN_APPROVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the active `LiveCli` so `build_runtime_mcp_state` advertises the
+    /// `task_complete` tool only while in mugen mode. Slice 15c.
+    static MUGEN_TOOLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by the `task_complete` tool when the model declares the task done; the
+    /// mugen auto-continue loop consumes it to stop cleanly. Slice 15c.
+    static TASK_COMPLETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set by `run_turn` when the turn was cancelled by the user (ESC/Ctrl+C) so
+    /// the mugen loop can break instead of auto-continuing. Slice 15c.
+    static TURN_INTERRUPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn set_ask_before_mutate(value: bool) {
@@ -16860,6 +16983,32 @@ fn set_exit_plan_approved(value: bool) {
 /// Read and clear the plan-approval flag (consumed once by the REPL per turn).
 fn take_exit_plan_approved() -> bool {
     EXIT_PLAN_APPROVED.with(|cell| cell.replace(false))
+}
+
+fn set_mugen_tools(value: bool) {
+    MUGEN_TOOLS.with(|cell| cell.set(value));
+}
+
+fn mugen_tools() -> bool {
+    MUGEN_TOOLS.with(std::cell::Cell::get)
+}
+
+fn set_task_complete(value: bool) {
+    TASK_COMPLETE.with(|cell| cell.set(value));
+}
+
+/// Read and clear the task-complete flag (consumed by the mugen loop per turn).
+fn take_task_complete() -> bool {
+    TASK_COMPLETE.with(|cell| cell.replace(false))
+}
+
+fn set_turn_interrupted(value: bool) {
+    TURN_INTERRUPTED.with(|cell| cell.set(value));
+}
+
+/// Read and clear the turn-interrupted flag (consumed by the mugen loop).
+fn take_turn_interrupted() -> bool {
+    TURN_INTERRUPTED.with(|cell| cell.replace(false))
 }
 
 /// Mutating tools that `default` mode prompts before running.
@@ -22087,7 +22236,7 @@ UU conflicted.rs",
 
     #[test]
     fn local_runtime_tools_include_ask_user() {
-        let tools = local_runtime_tool_definitions(false, false, false);
+        let tools = local_runtime_tool_definitions(false, false, false, false);
         let ask_user = tools
             .iter()
             .find(|tool| tool.name == "ask_user")
@@ -22107,11 +22256,11 @@ UU conflicted.rs",
     #[test]
     fn memory_tools_are_gated_on_the_memory_flag() {
         // Disabled (default): no memory tools advertised to the model.
-        let off = local_runtime_tool_definitions(false, false, false);
+        let off = local_runtime_tool_definitions(false, false, false, false);
         assert!(!off.iter().any(|tool| tool.name.starts_with("memory_")));
 
         // Enabled: both query + write appear, ReadOnly (opt-in is the consent).
-        let on = local_runtime_tool_definitions(true, false, false);
+        let on = local_runtime_tool_definitions(true, false, false, false);
         let query = on
             .iter()
             .find(|tool| tool.name == "memory_query")
@@ -22128,11 +22277,11 @@ UU conflicted.rs",
     #[test]
     fn spawn_agent_tool_is_gated_on_the_subagents_flag() {
         // Disabled (default): spawn_agent is not advertised.
-        let off = local_runtime_tool_definitions(false, false, false);
+        let off = local_runtime_tool_definitions(false, false, false, false);
         assert!(!off.iter().any(|tool| tool.name == "spawn_agent"));
 
         // Enabled: spawn_agent appears, ReadOnly, requiring a prompt.
-        let on = local_runtime_tool_definitions(false, true, false);
+        let on = local_runtime_tool_definitions(false, true, false, false);
         let spawn = on
             .iter()
             .find(|tool| tool.name == "spawn_agent")
@@ -22144,17 +22293,32 @@ UU conflicted.rs",
     #[test]
     fn exit_plan_mode_tool_is_gated_on_plan_mode() {
         // Not in plan mode: exit_plan_mode is not advertised.
-        let off = local_runtime_tool_definitions(false, false, false);
+        let off = local_runtime_tool_definitions(false, false, false, false);
         assert!(!off.iter().any(|tool| tool.name == "exit_plan_mode"));
 
         // Plan mode: exit_plan_mode appears, ReadOnly, requiring a plan.
-        let on = local_runtime_tool_definitions(false, false, true);
+        let on = local_runtime_tool_definitions(false, false, true, false);
         let exit = on
             .iter()
             .find(|tool| tool.name == "exit_plan_mode")
             .expect("exit_plan_mode should be advertised in plan mode");
         assert_eq!(exit.required_permission, PermissionMode::ReadOnly);
         assert_eq!(exit.input_schema["required"][0].as_str(), Some("plan"));
+    }
+
+    #[test]
+    fn task_complete_tool_is_gated_on_mugen_mode() {
+        // Not in mugen mode: task_complete is not advertised.
+        let off = local_runtime_tool_definitions(false, false, false, false);
+        assert!(!off.iter().any(|tool| tool.name == "task_complete"));
+
+        // Mugen mode: task_complete appears, ReadOnly (it's a control signal).
+        let on = local_runtime_tool_definitions(false, false, false, true);
+        let complete = on
+            .iter()
+            .find(|tool| tool.name == "task_complete")
+            .expect("task_complete should be advertised in mugen mode");
+        assert_eq!(complete.required_permission, PermissionMode::ReadOnly);
     }
 
     #[test]

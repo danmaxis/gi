@@ -167,6 +167,7 @@ pub struct RuntimeFeatureConfig {
     default_agent: Option<String>,
     default_mode: Option<String>,
     subagents: RuntimeSubagentConfig,
+    mugen: RuntimeMugenConfig,
 }
 
 /// Controls which external AI coding framework rules are imported into the system prompt.
@@ -288,6 +289,35 @@ impl RuntimeSubagentConfig {
     #[must_use]
     pub fn max_iterations(&self) -> Option<u32> {
         self.max_iterations
+    }
+}
+
+/// Default safety cap on the number of autonomous turns the `mugen` auto-continue
+/// loop runs before pausing for the user. Slice 15c.
+pub const DEFAULT_MUGEN_MAX_TURNS: u32 = 25;
+
+/// Configuration for `mugen` mode's autonomous auto-continue loop
+/// (`modes.mugen`). Opt-in, disabled by default so the loop is never a surprise.
+/// Slice 15c.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimeMugenConfig {
+    enabled: bool,
+    max_turns: Option<u32>,
+}
+
+impl RuntimeMugenConfig {
+    /// Whether mugen keeps working across turns until `task_complete` / the cap /
+    /// ESC. Default `false` — mugen otherwise just auto-approves a single turn.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Hard cap on autonomous turns per initiating prompt. Defaults to
+    /// [`DEFAULT_MUGEN_MAX_TURNS`] when unset.
+    #[must_use]
+    pub fn max_turns(&self) -> u32 {
+        self.max_turns.unwrap_or(DEFAULT_MUGEN_MAX_TURNS)
     }
 }
 
@@ -871,6 +901,7 @@ fn build_runtime_config(
         default_agent: parse_optional_default_agent(&merged_value),
         default_mode: parse_optional_string_key(&merged_value, "defaultMode"),
         subagents: parse_optional_subagents_config(&merged_value)?,
+        mugen: parse_optional_mugen_config(&merged_value)?,
     };
 
     Ok(RuntimeConfig {
@@ -1020,6 +1051,12 @@ impl RuntimeConfig {
     #[must_use]
     pub fn subagents(&self) -> &RuntimeSubagentConfig {
         &self.feature_config.subagents
+    }
+
+    /// Mugen auto-continue-loop configuration (`modes.mugen`). Slice 15c.
+    #[must_use]
+    pub fn mugen(&self) -> &RuntimeMugenConfig {
+        &self.feature_config.mugen
     }
 
     /// Merge config-level default trusted roots with per-call roots.
@@ -2345,6 +2382,23 @@ fn parse_optional_subagents_config(root: &JsonValue) -> Result<RuntimeSubagentCo
     })
 }
 
+/// Parse `modes.mugen.{enabled,maxTurns}` (the autonomous-loop gate). Absent /
+/// non-object → defaults (disabled). Slice 15c.
+fn parse_optional_mugen_config(root: &JsonValue) -> Result<RuntimeMugenConfig, ConfigError> {
+    let Some(modes) = root.as_object().and_then(|object| object.get("modes")) else {
+        return Ok(RuntimeMugenConfig::default());
+    };
+    let Some(mugen) = modes.as_object().and_then(|object| object.get("mugen")) else {
+        return Ok(RuntimeMugenConfig::default());
+    };
+    let Some(object) = mugen.as_object() else {
+        return Ok(RuntimeMugenConfig::default());
+    };
+    let enabled = optional_bool(object, "enabled", "modes.mugen")?.unwrap_or(false);
+    let max_turns = optional_u32(object, "maxTurns", "modes.mugen")?;
+    Ok(RuntimeMugenConfig { enabled, max_turns })
+}
+
 fn parse_optional_provider_config(root: &JsonValue) -> Result<RuntimeProviderConfig, ConfigError> {
     let Some(provider_value) = root.as_object().and_then(|object| object.get("provider")) else {
         return Ok(RuntimeProviderConfig::default());
@@ -3233,6 +3287,33 @@ mod tests {
         assert!(loaded.subagents().enabled());
         assert_eq!(loaded.subagents().model(), Some("anthropic/x"));
         assert_eq!(loaded.subagents().max_iterations(), Some(8));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_mugen_config_and_defaults_to_disabled() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".gi");
+        fs::create_dir_all(cwd.join(".gi")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        // Unset → disabled, default cap.
+        fs::write(home.join("settings.json"), "{}").expect("write empty settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(!loaded.mugen().enabled());
+        assert_eq!(loaded.mugen().max_turns(), super::DEFAULT_MUGEN_MAX_TURNS);
+
+        // Explicit modes.mugen block is parsed.
+        fs::write(
+            home.join("settings.json"),
+            r#"{ "modes": { "mugen": { "enabled": true, "maxTurns": 7 } } }"#,
+        )
+        .expect("write mugen settings");
+        let loaded = ConfigLoader::new(&cwd, &home).load().expect("load");
+        assert!(loaded.mugen().enabled());
+        assert_eq!(loaded.mugen().max_turns(), 7);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

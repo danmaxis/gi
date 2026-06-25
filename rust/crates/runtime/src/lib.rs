@@ -73,9 +73,9 @@ pub use config::{
     McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ProviderFallbackConfig, ResolvedPermissionMode,
     RulesImportConfig, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookCommand, RuntimeHookConfig,
-    RuntimeInvalidHookConfig, RuntimeMemoryConfig, RuntimePermissionRuleConfig,
+    RuntimeInvalidHookConfig, RuntimeMemoryConfig, RuntimeMugenConfig, RuntimePermissionRuleConfig,
     RuntimePluginConfig, RuntimeProviderConfig, RuntimeSubagentConfig, ScopedMcpServerConfig,
-    GI_SETTINGS_SCHEMA_NAME,
+    DEFAULT_MUGEN_MAX_TURNS, GI_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

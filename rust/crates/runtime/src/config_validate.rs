@@ -173,6 +173,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "modes",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "hooks",
         expected: FieldType::Object,
     },

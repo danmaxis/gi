@@ -363,13 +363,16 @@ Done 2026-06-25.
 - [x] **plan → approve → execute** (`exit_plan_mode` tool, gated on plan mode): the model
   drafts a plan, gi shows it in a panel + asks approval; approve flips to edit mode and
   auto-continues one turn to execute; reject returns feedback and stays in plan.
-- [ ] **mugen auto-continue** loop (`task_complete` tool + cap + ESC): mugen auto-approves a
-  single turn today; the autonomous across-turn loop is pending.
+- [x] **mugen auto-continue** loop (`task_complete` tool + cap + ESC, gated on mugen mode):
+  with `modes.mugen.enabled` the REPL re-prompts itself (MUGEN_NUDGE) across turns until the
+  model calls `task_complete`, `modes.mugen.maxTurns` (default 25) is hit, or ESC interrupts.
+  Opt-in (default off); each auto-turn prints `⟳ MUGEN auto-continue (n/max)`.
 
-Progress 2026-06-25: mode-system core + the two prompt tweaks + plan→approve→execute shipped &
-unit-tested (gating + build/fmt/clippy green). The interactive approval prompt + mode-flip +
-execute path still needs live-terminal smoke (raw-mode tty, not runnable in the sandbox). Mugen
-auto-continue remains.
+Progress 2026-06-25: Slice 15 complete — mode-system core, the two prompt tweaks,
+plan→approve→execute, and mugen auto-continue all shipped & unit-tested (gating, config parse,
+build/fmt/clippy green). The interactive bits (plan-approval prompt + mode flip; the mugen loop
+running across turns + ESC interrupt) need live-terminal smoke (raw-mode tty, not runnable in
+the sandbox).
 
 ### Slice 14b: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 

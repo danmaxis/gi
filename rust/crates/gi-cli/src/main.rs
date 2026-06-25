@@ -3217,9 +3217,28 @@ fn config_model_for_current_dir() -> Option<String> {
 /// (magenta → violet → cyan); without it, plain monospace is returned.
 /// The Gi startup splash: a karateka figure (left, rendered in `░▒▓█`) beside
 /// block `GI` letters, headed by `「 技 」`. Returns plain text when `use_color`
-/// is false (NO_COLOR / non-TTY); the colored form paints the karateka as a
-/// shaded white gi, the `GI` letters with a cool indigo→vermilion gradient, and
-/// restrained sumi/vermilion accents on the header and tagline.
+/// Print the startup banner with a brief staggered, line-by-line reveal when
+/// the terminal supports it (interactive TTY + color), giving the splash a
+/// sense of motion. Scripts / non-TTY / `NO_COLOR` get the banner in a single
+/// write (unchanged behavior). Total reveal is capped so startup stays snappy.
+/// Slice 12.
+fn reveal_banner(banner: &str) {
+    let animate = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    if !animate {
+        println!("{banner}");
+        return;
+    }
+    let mut out = io::stdout();
+    let lines: Vec<&str> = banner.split('\n').collect();
+    let count = u32::try_from(lines.len().max(1)).unwrap_or(1);
+    let per_line = (Duration::from_millis(450) / count).min(Duration::from_millis(28));
+    for line in lines {
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+        thread::sleep(per_line);
+    }
+}
+
 fn startup_logo(use_color: bool) -> String {
     const HEADER: &str = "「 技 」";
     const ART: [&str; 14] = [
@@ -7896,7 +7915,7 @@ fn run_repl(
     cli.active_agent = active_agent;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
-    println!("{}", cli.startup_banner());
+    reveal_banner(&cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
     loop {
@@ -14297,12 +14316,51 @@ fn key_cancels_request(key: &crossterm::event::KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+/// Dojo kanji cycled by the thinking spinner for the "kanji motion" effect
+/// (技 technique · 道 way · 心 mind · 気 spirit · 拳 fist · 武 martial). Slice 12.
+const THINKING_KANJI: [&str; 6] = ["技", "道", "心", "気", "拳", "武"];
+const THINKING_PHRASES: [&str; 6] = [
+    "Thinking",
+    "Pondering",
+    "Reasoning",
+    "Focusing",
+    "Working",
+    "Crunching",
+];
+
+/// A ping-pong colour along the gi indigo→vermilion ramp, giving the kanji a
+/// shimmer as the spinner ticks. Slice 12.
+fn thinking_shimmer(frame: usize) -> (u8, u8, u8) {
+    const STEPS: usize = 14;
+    let pos = frame % (STEPS * 2);
+    let t = if pos < STEPS { pos } else { STEPS * 2 - pos };
+    let f = t as f32 / STEPS as f32;
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * f).round() as u8;
+    // indigo (64,86,196) → vermilion (236,96,60)
+    (lerp(64, 236), lerp(86, 96), lerp(196, 60))
+}
+
+/// Build the thinking-spinner label for `frame`: a shimmering, cycling dojo
+/// kanji followed by a rotating verb and animated dots. Pure + NO_COLOR-safe so
+/// the frame logic is testable. Slice 12.
+fn thinking_label(frame: usize, use_color: bool) -> String {
+    let kanji = THINKING_KANJI[(frame / 6) % THINKING_KANJI.len()];
+    let phrase = THINKING_PHRASES[(frame / 18) % THINKING_PHRASES.len()];
+    let dots = ".".repeat(1 + (frame / 4) % 3);
+    if use_color {
+        let (r, g, b) = thinking_shimmer(frame);
+        format!("\x1b[1;38;2;{r};{g};{b}m{kanji}\x1b[0m {phrase}{dots}")
+    } else {
+        format!("{kanji} {phrase}{dots}")
+    }
+}
+
 fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> JoinHandle<()> {
     let stop = Arc::clone(stop);
     let lock = Arc::clone(lock);
     let theme = render::ColorTheme::default();
+    let use_color = env::var_os("NO_COLOR").is_none();
     thread::spawn(move || {
-        const PHRASES: [&str; 5] = ["Thinking", "Pondering", "Reasoning", "Working", "Crunching"];
         let mut spinner = Spinner::new();
         let mut out = io::stdout();
         let mut frame: usize = 0;
@@ -14311,9 +14369,7 @@ fn start_thinking_animation(stop: &Arc<AtomicBool>, lock: &Arc<Mutex<()>>) -> Jo
                 let _guard = lock
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let phrase = PHRASES[(frame / 16) % PHRASES.len()];
-                let dots = ".".repeat(1 + (frame / 4) % 3);
-                let _ = spinner.tick(&format!("🥋 {phrase}{dots}"), &theme, &mut out);
+                let _ = spinner.tick(&thinking_label(frame, use_color), &theme, &mut out);
             }
             frame = frame.wrapping_add(1);
             thread::sleep(Duration::from_millis(90));
@@ -21578,6 +21634,23 @@ UU conflicted.rs",
             .expect("spawn_agent should be advertised when subagents are enabled");
         assert_eq!(spawn.required_permission, PermissionMode::ReadOnly);
         assert_eq!(spawn.input_schema["required"][0].as_str(), Some("prompt"));
+    }
+
+    #[test]
+    fn thinking_label_cycles_kanji_and_is_no_color_safe() {
+        // Cycles through the dojo kanji as frames advance.
+        let first = super::thinking_label(0, false);
+        let later = super::thinking_label(6, false);
+        assert!(first.contains('技'));
+        assert!(later.contains('道'));
+        assert!(first.contains("Thinking"));
+        // NO_COLOR variant carries no ANSI; colored variant shimmers (truecolor).
+        assert!(!super::thinking_label(0, false).contains('\u{1b}'));
+        assert!(super::thinking_label(0, true).contains("\u{1b}[1;38;2;"));
+        // Shimmer stays within the indigo→vermilion ramp and ping-pongs.
+        assert_eq!(super::thinking_shimmer(0), (64, 86, 196));
+        assert_eq!(super::thinking_shimmer(14), (236, 96, 60));
+        assert_eq!(super::thinking_shimmer(28), (64, 86, 196));
     }
 
     #[test]

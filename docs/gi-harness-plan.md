@@ -322,9 +322,15 @@ streamed-output panels/gutters deferred (see unchecked item).
 
 ### Slice 12: Kanji motion & richer thinking states
 
-- [ ] Animated splash (kanji gradient shimmer / stroke reveal) and per-phase thinking
-  glyphs, building on the `start_thinking_animation` thread + `gi_gradient`; TTY-gated,
-  `NO_COLOR`-safe.
+- [x] Kanji-motion thinking spinner: cycles dojo kanji (技 道 心 気 拳 武) with a rotating
+  verb and an indigo↔vermilion shimmer (`thinking_label`/`thinking_shimmer`); NO_COLOR-safe,
+  TTY-gated. Builds on the `start_thinking_animation` thread.
+- [x] Animated splash: a brief staggered line-by-line reveal of the banner on startup
+  (`reveal_banner`), interactive-TTY + color only; scripts / non-TTY / `NO_COLOR` get the
+  single-write banner unchanged. Reveal capped (~450 ms) so startup stays snappy.
+
+Done 2026-06-24: pure, unit-tested frame logic (`thinking_label`/`thinking_shimmer`); visuals
+TTY/`NO_COLOR`-gated. Interactive rendering needs live confirmation (PTY hangs headless).
 
 ### Slice 13: Theme expansion & status line
 

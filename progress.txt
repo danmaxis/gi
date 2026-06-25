@@ -679,3 +679,13 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - Verified: SIGINT against an unreachable endpoint cancels the hanging connect promptly (was a
   hang). Unit tests: key_cancels_request (ESC/Ctrl+C), wait_for_abort resolves on abort.
   Interactive ESC + raw-mode restore need live terminal verification (PTY hangs headless).
+
+## Slice 12 — Kanji motion & richer thinking states (2026-06-24)
+- thinking_label(frame, use_color) + thinking_shimmer(frame): the thinking spinner now cycles
+  dojo kanji (技 道 心 気 拳 武) with a rotating verb (Thinking/Pondering/Reasoning/Focusing/
+  Working/Crunching) and an indigo↔vermilion ping-pong shimmer on the kanji; NO_COLOR → plain.
+  Pure + unit-tested; wired into start_thinking_animation (TTY-gated as before).
+- reveal_banner(): startup banner now reveals line-by-line with a short staggered delay
+  (interactive TTY + color only, total ~450ms capped); non-TTY / NO_COLOR print once (unchanged).
+- Visuals can't be verified headless (PTY hangs); frame logic is unit-tested and gated. Needs
+  live confirmation. Tests: thinking_label_cycles_kanji_and_is_no_color_safe.

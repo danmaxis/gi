@@ -8849,20 +8849,18 @@ impl LiveCli {
             .active_agent
             .as_deref()
             .map_or_else(String::new, |name| {
-                format!("  \x1b[2mAgent\x1b[0m            {name}\n")
+                format!("\x1b[2mAgent\x1b[0m            {name}\n")
             });
-        let banner = format!(
-            "{}\n\
-  \x1b[2mModel\x1b[0m            {}\n\
+        // Slice 11: frame the session info in a width-aware panel under the logo.
+        let info = format!(
+            "\x1b[2mModel\x1b[0m            {}\n\
 {}\
-  \x1b[2mPermissions\x1b[0m      {}\n\
-  \x1b[2mBranch\x1b[0m           {}\n\
-  \x1b[2mWorkspace\x1b[0m        {}\n\
-  \x1b[2mDirectory\x1b[0m        {}\n\
-  \x1b[2mSession\x1b[0m          {}\n\
-  \x1b[2mAuto-save\x1b[0m        {}\n\n\
-  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
-            startup_logo(true),
+\x1b[2mPermissions\x1b[0m      {}\n\
+\x1b[2mBranch\x1b[0m           {}\n\
+\x1b[2mWorkspace\x1b[0m        {}\n\
+\x1b[2mDirectory\x1b[0m        {}\n\
+\x1b[2mSession\x1b[0m          {}\n\
+\x1b[2mAuto-save\x1b[0m        {}",
             self.model,
             agent_line,
             self.permission_mode.as_str(),
@@ -8871,6 +8869,11 @@ impl LiveCli {
             cwd,
             self.session.id,
             session_path,
+        );
+        let banner = format!(
+            "{}\n{}\n\n  Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
+            startup_logo(true),
+            render::panel(None, &info, true),
         );
         if env::var_os("NO_COLOR").is_some() {
             render::strip_ansi(&banner)

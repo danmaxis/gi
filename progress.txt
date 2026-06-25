@@ -645,3 +645,18 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
 - conversation.rs: ConversationRuntime::set_max_iterations (post-construction bound).
 - Docs: docs/agents.md spawn section + instructions; USAGE; roadmap Slice 10 ticked.
 - Tests: spawn_agent gating; parses_subagents_config; AgentProfile instructions from .md body.
+
+## Slice 11 (partial) — Inline panels foundation, framed banner, /-popup ranking (2026-06-24)
+- render.rs: terminal_width() (crossterm size, clamped 40..=100); panel(title, body, use_color)
+  width-aware rounded box matching the tool-box style (grey border, cyan title), rectangular
+  via visible_width padding, NO_COLOR-safe (box chars kept, color dropped); with_gutter(). Unit
+  tests (rectangle, NO_COLOR, gutter, width clamp).
+- input.rs: empty `/` popup now ranks by usefulness instead of shortest-length — curated
+  priority list (help/model/agent/memory/status/diff/compact/resume/opencode/permissions/
+  theme/clear) + recency boost from history; answer tokens (y/n/yes/no) demoted out of the
+  initial top. Once the user types, fuzzy_score is unchanged. empty_filter_rank() + test.
+- main.rs: startup_banner frames the session-info block in render::panel under the logo
+  (REPL-only; banner test still green).
+- Deferred (noted in roadmap): panels/gutters on STREAMED assistant + tool output + turn
+  separators — that output streams live to stdout (consume_stream out=stdout when emit_output),
+  so it needs streaming-safe wrapping not verifiable headless; revisit with Slice 13.

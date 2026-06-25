@@ -1153,11 +1153,80 @@ pub(crate) fn strip_ansi(input: &str) -> String {
     output
 }
 
+/// Best-effort terminal width, clamped to a readable range. Falls back to 80
+/// columns when the size can't be queried (pipes, CI, non-TTY). Slice 11.
+#[must_use]
+pub fn terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map_or(80, |(cols, _)| cols as usize)
+        .clamp(40, 100)
+}
+
+/// Render `body` inside a width-aware rounded panel matching gi's tool-call box
+/// style (grey border, optional cyan title). `body` may contain ANSI escapes;
+/// padding is computed from the *visible* width. The panel is sized to its
+/// content but never wider than the terminal. Emits no ANSI when `use_color` is
+/// false (box-drawing characters are still used — `NO_COLOR` means no color,
+/// not no Unicode). Slice 11.
+#[must_use]
+pub fn panel(title: Option<&str>, body: &str, use_color: bool) -> String {
+    const PAD: usize = 1;
+    let lines: Vec<&str> = body.split('\n').collect();
+    let content_w = lines
+        .iter()
+        .map(|line| visible_width(line))
+        .max()
+        .unwrap_or(0);
+    let title_w = title.map_or(0, |title| title.chars().count());
+    let max_inner = terminal_width().saturating_sub(2 + PAD * 2).max(8);
+    let inner = content_w.max(title_w).min(max_inner);
+    let span = inner + PAD * 2;
+
+    let (border, title_color, reset) = if use_color {
+        ("\x1b[38;5;245m", "\x1b[1;36m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    let pad = " ".repeat(PAD);
+
+    let mut out = String::new();
+    match title {
+        Some(title) => {
+            // ╭─ title ───────╮  (─ title  consumes 2 + title_w + 1 cells)
+            let dashes = span.saturating_sub(2 + title_w + 1);
+            out.push_str(&format!(
+                "{border}╭─ {reset}{title_color}{title}{reset}{border} {dashes}╮{reset}\n",
+                dashes = "─".repeat(dashes),
+            ));
+        }
+        None => out.push_str(&format!("{border}╭{}╮{reset}\n", "─".repeat(span))),
+    }
+    for line in &lines {
+        let fill = " ".repeat(inner.saturating_sub(visible_width(line)));
+        out.push_str(&format!(
+            "{border}│{reset}{pad}{line}{fill}{pad}{border}│{reset}\n"
+        ));
+    }
+    out.push_str(&format!("{border}╰{}╯{reset}", "─".repeat(span)));
+    out
+}
+
+/// Prefix every line of `body` with `prefix` (a left gutter / margin). `body`
+/// may contain ANSI escapes; the prefix is applied verbatim. Slice 11.
+#[must_use]
+pub fn with_gutter(body: &str, prefix: &str) -> String {
+    body.split('\n')
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_runtime_theme, effective_theme, resolve_theme, set_runtime_theme, strip_ansi,
-        ColorTheme, MarkdownStreamState, Spinner, TerminalRenderer, ThemeSource,
+        clear_runtime_theme, effective_theme, panel, resolve_theme, set_runtime_theme, strip_ansi,
+        terminal_width, with_gutter, ColorTheme, MarkdownStreamState, Spinner, TerminalRenderer,
+        ThemeSource,
     };
 
     #[test]
@@ -1165,6 +1234,42 @@ mod tests {
         assert_eq!(ColorTheme::named("gi-dark"), Some(ColorTheme::gi_dark()));
         assert_eq!(ColorTheme::named("gi_light"), Some(ColorTheme::gi_light()));
         assert_eq!(ColorTheme::named("unknown"), None);
+    }
+
+    #[test]
+    fn terminal_width_is_clamped_to_readable_range() {
+        let width = terminal_width();
+        assert!((40..=100).contains(&width), "got {width}");
+    }
+
+    #[test]
+    fn panel_frames_content_as_a_rectangle() {
+        let rendered = panel(Some("Status"), "model: opus\nbranch: main", false);
+        let lines: Vec<&str> = rendered.lines().collect();
+        // Top has the title, bottom is a closing border, body rows are bordered.
+        assert!(lines[0].starts_with("╭─ Status"));
+        assert!(lines[0].ends_with('╮'));
+        assert!(lines.last().unwrap().starts_with('╰'));
+        assert!(lines.last().unwrap().ends_with('╯'));
+        assert!(lines[1].starts_with('│') && lines[1].contains("model: opus"));
+        // Every visible row is the same width (a true rectangle).
+        let widths: Vec<usize> = lines
+            .iter()
+            .map(|line| strip_ansi(line).chars().count())
+            .collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "ragged panel: {widths:?}"
+        );
+        // NO_COLOR variant carries no ANSI.
+        assert!(!rendered.contains('\u{1b}'));
+        // Colored variant does.
+        assert!(panel(Some("Status"), "x", true).contains("\u{1b}["));
+    }
+
+    #[test]
+    fn with_gutter_prefixes_every_line() {
+        assert_eq!(with_gutter("a\nb", "▏ "), "▏ a\n▏ b");
     }
 
     #[test]

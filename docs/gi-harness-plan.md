@@ -307,13 +307,18 @@ system prompt. `RuntimeSubagentConfig` in `crates/runtime/src/config.rs`. Docs:
 
 ### Slice 11: Inline visual panels, margins & command-popup ranking (Phase-1 aesthetics)
 
-- [ ] Width-aware layout via `crossterm::terminal::size`; bordered panels + consistent
-  left margin/gutter for assistant and tool output, reusing `render.rs` box primitives +
-  theme slots; graceful narrow-terminal and `NO_COLOR` fallbacks.
-- [ ] Order the live `/` popup by context/usefulness: with an empty filter, rank by a
-  curated priority list of common commands plus session recency/frequency, and keep
-  answer-style tokens (`/y`, `/n`) out of the initial suggestions (the fuzzy filter takes
-  over once the user types). `crates/gi-cli/src/input.rs`.
+- [x] Width-aware panel foundation: `render::terminal_width()` (clamped), `render::panel()`
+  (rounded, themed, rectangular, `NO_COLOR`/narrow-safe), `render::with_gutter()`.
+- [x] Frame the startup banner's session info in a panel under the logo.
+- [x] Order the live `/` popup by context/usefulness: with an empty filter, rank by a
+  curated priority list + recent use, and keep answer-style tokens (`/y`, `/n`) out of the
+  initial suggestions (the fuzzy filter takes over once the user types).
+- [ ] Apply panels/gutters to **streamed** assistant + tool output and add turn separators.
+  Deferred: that output streams live (markdown deltas → stdout), so it needs streaming-safe
+  wrapping that can't be verified in the headless sandbox; revisit alongside Slice 13.
+
+Done 2026-06-24 (partial): foundation + popup ranking + framed banner shipped;
+streamed-output panels/gutters deferred (see unchecked item).
 
 ### Slice 12: Kanji motion & richer thinking states
 

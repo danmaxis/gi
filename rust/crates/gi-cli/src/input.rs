@@ -71,13 +71,26 @@ impl LineEditor {
         if !buffer.starts_with('/') || buffer.contains(' ') || buffer.contains('\n') {
             return None;
         }
-        let mut scored: Vec<(i64, &String)> = self
-            .completions
-            .iter()
-            .filter(|candidate| !candidate.contains(' '))
-            .filter_map(|candidate| fuzzy_score(candidate, buffer).map(|score| (score, candidate)))
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut scored: Vec<(i64, &String)> = if buffer == "/" {
+            // Empty filter: order by context/usefulness (curated priorities +
+            // recent use), not shortest-length, and keep answer-style tokens
+            // (`/y`, `/n`, …) out of the initial suggestions. Slice 11.
+            self.completions
+                .iter()
+                .filter(|candidate| !candidate.contains(' '))
+                .map(|candidate| (empty_filter_rank(candidate, &self.history), candidate))
+                .collect()
+        } else {
+            self.completions
+                .iter()
+                .filter(|candidate| !candidate.contains(' '))
+                .filter_map(|candidate| {
+                    fuzzy_score(candidate, buffer).map(|score| (score, candidate))
+                })
+                .collect()
+        };
+        // Sort by score descending; tie-break by name for deterministic order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
         scored.truncate(POPUP_MAX);
         Some(
             scored
@@ -351,6 +364,54 @@ fn starts_with_ci(candidate: &str, query: &str) -> bool {
         .starts_with(&query.to_ascii_lowercase())
 }
 
+/// Curated, high-to-low priority order for the empty (`/`) popup — the commands
+/// most users reach for first. Anything not listed ranks below these.
+const CURATED_POPUP_ORDER: &[&str] = &[
+    "help",
+    "model",
+    "agent",
+    "memory",
+    "status",
+    "diff",
+    "compact",
+    "resume",
+    "opencode",
+    "permissions",
+    "theme",
+    "clear",
+];
+
+/// Answer-style tokens that should never lead the empty popup (they're replies,
+/// not commands a user opens the menu to find).
+const POPUP_ANSWER_TOKENS: &[&str] = &["y", "n", "yes", "no"];
+
+/// Rank a candidate for the empty (`/`) popup by context and usefulness:
+/// curated priorities first, then a small boost for recently-used commands,
+/// with answer-style tokens demoted out of the initial suggestions. Slice 11.
+fn empty_filter_rank(candidate: &str, history: &[String]) -> i64 {
+    let base = candidate
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if POPUP_ANSWER_TOKENS.contains(&base) {
+        return -5000;
+    }
+    let curated = CURATED_POPUP_ORDER
+        .iter()
+        .position(|name| *name == base)
+        .map_or(0, |index| 1000 - index as i64);
+    // Recency: the most recent matching submission lifts the rank a little, so
+    // commands you actually use surface above the rest (but below curated).
+    let recency = history
+        .iter()
+        .rev()
+        .take(50)
+        .position(|entry| entry.trim_start_matches('/').split_whitespace().next() == Some(base))
+        .map_or(0, |pos| (30 - pos as i64).max(0));
+    curated + recency
+}
+
 /// Fuzzy score: a case-insensitive prefix wins (shorter candidates rank higher),
 /// then a subsequence match, else `None`.
 fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
@@ -444,6 +505,49 @@ mod tests {
         assert!(!filtered.contains(&"/status".to_string()));
         // Argument candidates never appear as command-menu rows.
         assert!(!filtered.contains(&"/model opus".to_string()));
+    }
+
+    #[test]
+    fn empty_popup_ranks_by_usefulness_not_length() {
+        let editor = LineEditor::new(
+            "> ",
+            vec![
+                "/n".to_string(),
+                "/y".to_string(),
+                "/model".to_string(),
+                "/help".to_string(),
+                "/agent".to_string(),
+                "/memory".to_string(),
+                "/status".to_string(),
+                "/zzz".to_string(),
+            ],
+        );
+        let menu = popup_commands(&editor, "/");
+        // Curated commands lead; short answer tokens are demoted out of the top.
+        assert_eq!(&menu[0], "/help");
+        assert!(menu.iter().position(|c| c == "/model").unwrap() < 3);
+        assert!(
+            !menu.contains(&"/n".to_string()),
+            "answer tokens must not lead: {menu:?}"
+        );
+        assert!(!menu.contains(&"/y".to_string()));
+
+        // Recency lifts a non-curated command above other non-curated peers.
+        let mut recent = LineEditor::new(
+            "> ",
+            vec!["/zzz".to_string(), "/aaa".to_string(), "/bbb".to_string()],
+        );
+        recent.push_history("/zzz");
+        let menu = popup_commands(&recent, "/");
+        assert_eq!(
+            &menu[0], "/zzz",
+            "recently used should surface first: {menu:?}"
+        );
+
+        // Typing a filter still uses fuzzy matching: `/n` leads with the exact
+        // prefix match (answer tokens are only demoted in the empty view).
+        let typed = popup_commands(&editor, "/n");
+        assert_eq!(typed.first().map(String::as_str), Some("/n"));
     }
 
     #[test]

@@ -343,10 +343,34 @@ TTY/`NO_COLOR`-gated. Interactive rendering needs live confirmation (PTY hangs h
 Done 2026-06-24: pure, unit-tested `compose_status_line` / `theme_swatch` and palette
 constructors; visuals TTY/`NO_COLOR`-gated. Live rendering needs visual confirmation.
 
-### Slice 14: Opt-in full-screen TUI (`gi --tui`, Phase 2)
+### Slice 14a: Inline prompt shell (agent + mode bounding box, themed indicator)
+
+- [x] Themed prompt indicator (`render::prompt_glyph` → a colored `❯`) replacing `> `.
+- [x] A themed bounding-box header above the prompt (`render::prompt_header`) naming the
+  active agent + mode (`╭─ <mode> · <agent> ─╮`).
+- [x] `input.rs` tracks the prompt's visible width so the cursor positions correctly with a
+  colored prompt; agent moved out of the status line into the box.
+
+Done 2026-06-25.
+
+### Slice 15: Operating modes (default / plan / edit / mugen)
+
+- [x] `SessionMode {default, plan, edit, mugen}` over the permission system; `/mode` +
+  Shift+Tab switching; `defaultMode` config; mode shown in the prompt box.
+- [x] **default asks before edits, edit auto-accepts** (`PermissionPolicy::with_ask_tools`).
+- [ ] **plan → approve → execute** (`exit_plan_mode` tool): plan is read-only today; the
+  approve→auto-execute flow is pending.
+- [ ] **mugen auto-continue** loop (`task_complete` tool + cap + ESC): mugen auto-approves a
+  single turn today; the autonomous across-turn loop is pending.
+
+Partial 2026-06-25: mode-system core shipped + tested; the two autonomous behaviors above are
+multi-turn loops that need live-terminal verification, deferred to a focused follow-up.
+
+### Slice 14b: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 
 - [ ] ratatui-based persistent layout (scrollback pane + input + status regions) reusing
-  the Slice 11–13 theme/panel vocabulary. Strictly opt-in; the line-stream stays default.
+  the Slice 11–13 theme/panel vocabulary + the Slice 14a prompt shell + modes. Strictly
+  opt-in; the line-stream stays default.
 
 ## Acceptance Criteria
 

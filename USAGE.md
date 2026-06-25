@@ -334,6 +334,32 @@ memory enabled, export also writes a generated `.opencode/plugin/gi-memory.js`
 bridge. No opencode code is vendored. The same verbs are available in the REPL as
 `/opencode`. Full mapping: [`docs/opencode-compat.md`](./docs/opencode-compat.md).
 
+## Operating modes
+
+Gi has four operating modes, a friendly layer over the permission system. Cycle them with
+**Shift+Tab** (at an empty prompt) or `/mode <name>`; the active mode shows in the themed
+prompt box (`╭─ <mode> · <agent> ─╮`):
+
+```
+/mode            # show the active mode + the list
+/mode edit       # switch
+/mode next       # cycle (same as Shift+Tab)
+```
+
+- **default** — workspace-write, but **asks before edits** (write/edit/bash prompt for
+  approval).
+- **edit** — workspace-write, **auto-accepts** edits (no prompts).
+- **plan** — **read-only**: the agent investigates and proposes an approach without changing
+  anything.
+- **mugen** (無限, "limitless") — **danger-full-access**: auto-approves every tool.
+
+Set `"defaultMode": "edit"` in `.gi/settings.json` to pick the startup mode. Non-interactive
+`gi -p` always auto-accepts (it never blocks on a prompt).
+
+> Two deluxe behaviors are still being wired: `plan` will gain a **propose→approve→execute**
+> flow, and `mugen` an **auto-continue** loop (keep working until done / capped / ESC). For
+> now `plan` is read-only and `mugen` auto-approves a single turn.
+
 ## Agents
 
 An agent is a named profile (description + optional model + reasoning effort) defined

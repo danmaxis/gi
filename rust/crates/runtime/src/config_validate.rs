@@ -165,6 +165,10 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::String,
     },
     FieldSpec {
+        name: "defaultMode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
         name: "subagents",
         expected: FieldType::Object,
     },

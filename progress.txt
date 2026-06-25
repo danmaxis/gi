@@ -715,3 +715,21 @@ Opt-in, disabled by default. Local markdown/JSONL under .gi/memory/ (project roo
   then streams the answer), and the redundant final print is removed (streamed text is canonical
   + flushed). Completion marker ("✔ ✨ Done") prints on its own line (Spinner::finish cleared the
   current line, which would erase the answer's last line). Verified clean via `gi -p`.
+
+## Slice 15 (mode system core) — default/plan/edit/mugen (2026-06-25)
+- SessionMode { Default, Plan, Edit, Mugen } in gi-cli maps to permission mode + behavior:
+  default→workspace-write+ask-before-mutate, edit→workspace-write+auto-accept, plan→read-only,
+  mugen→danger-full-access (+auto-continue, wired next). parse/as_str/next/permission_mode/
+  ask_before_mutate/auto_continue/from_permission. MODE_NAMES.
+- default-asks vs edit-auto-accepts: PermissionPolicy::with_ask_tools (runtime) forces a prompt
+  for write_file/edit_file/bash; gi-cli threads it via a thread-local ASK_BEFORE_MUTATE read in
+  permission_policy (leak into read-only subagents is harmless). Policy unit test.
+- LiveCli gains `mode`; set_mode rebuilds the runtime (reuse the /model rebuild path) + updates
+  ASK_BEFORE_MUTATE; LiveCli::new now takes a SessionMode (-p passes from_permission → auto-accept,
+  never blocks on a prompt). Surfaced in the prompt-box header (mode · agent).
+- Switching: /mode [name|next|list] (SlashCommand::Mode + spec + parser; help-count 143→144) and
+  Shift+Tab (input::ReadOutcome::CycleMode, empty-buffer only) → cli.set_mode(next).
+- Config: defaultMode key (RuntimeConfig::default_mode + parse_optional_string_key + FieldSpec);
+  run_repl honors it. Tests: session_mode mapping, with_ask_tools, /mode parse.
+- Still to wire (next): plan→approve→execute (exit_plan_mode tool) and mugen auto-continue loop
+  (task_complete tool + cap + ESC).

@@ -20,6 +20,8 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+    /// Shift+Tab pressed at the prompt — cycle the operating mode. Slice 15.
+    CycleMode,
 }
 
 const POPUP_MAX: usize = 5;
@@ -197,6 +199,14 @@ impl LineEditor {
                     }
                     self.render(&buffer, cursor, None, 0)?;
                     return Ok(ReadOutcome::Submit(buffer));
+                }
+                // Shift+Tab cycles the operating mode (only with an empty buffer
+                // so typed text isn't lost). Slice 15.
+                (KeyCode::BackTab, _) => {
+                    if buffer.is_empty() {
+                        self.render(&buffer, cursor, None, 0)?;
+                        return Ok(ReadOutcome::CycleMode);
+                    }
                 }
                 (KeyCode::Tab, _) => {
                     if let Some(items) = &popup {

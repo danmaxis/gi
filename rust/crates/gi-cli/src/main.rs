@@ -1086,7 +1086,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let resolved_model = resolve_repl_model(model)?;
-            let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+            // Non-interactive `-p`: auto-accept (never block on a prompt).
+            let mut cli = LiveCli::new(
+                resolved_model,
+                true,
+                allowed_tools,
+                SessionMode::from_permission(permission_mode),
+            )?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -7555,6 +7561,10 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
+        SlashCommand::Mode { .. } => Err(
+            "interactive_only: /mode switches the live session mode.\nStart `gi` and run /mode inside the REPL."
+                .into(),
+        ),
         SlashCommand::Skills { args } => {
             if let SkillSlashDispatch::Invoke(_) = classify_skills_slash_command(args.as_deref()) {
                 // #779: use interactive_only: prefix + \n hint so #776 classify/split emits
@@ -7932,7 +7942,18 @@ fn run_repl(
         }
         profile.name
     });
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    // Initial operating mode (Slice 15): a configured `defaultMode` wins; else
+    // workspace-write defaults to `default` (asks before edits), and an explicit
+    // read-only / danger flag maps to plan / mugen.
+    let initial_mode = ConfigLoader::default_for(&repl_cwd)
+        .load()
+        .ok()
+        .and_then(|config| config.default_mode().and_then(SessionMode::parse))
+        .unwrap_or_else(|| match permission_mode {
+            PermissionMode::WorkspaceWrite => SessionMode::Default,
+            other => SessionMode::from_permission(other),
+        });
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, initial_mode)?;
     cli.set_reasoning_effort(effort);
     cli.active_agent = active_agent;
     let mut editor = input::LineEditor::new(
@@ -8002,6 +8023,12 @@ fn run_repl(
                 cli.run_turn(&trimmed)?;
             }
             input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::CycleMode => {
+                let next = cli.mode.next();
+                if let Err(error) = cli.set_mode(next) {
+                    eprintln!("{error}");
+                }
+            }
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -8035,6 +8062,10 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    /// Operating mode (Slice 15). The permission mode is derived from it; the
+    /// distinction default↔edit (ask vs auto-accept) and the plan/mugen
+    /// behaviors live here.
+    mode: SessionMode,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -8852,8 +8883,12 @@ impl LiveCli {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
-        permission_mode: PermissionMode,
+        mode: SessionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let permission_mode = mode.permission_mode();
+        // Make `permission_policy` (called inside build_runtime) apply this
+        // mode's ask-before-mutate behavior.
+        set_ask_before_mutate(mode.ask_before_mutate());
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -8872,6 +8907,7 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
+            mode,
             system_prompt,
             runtime,
             session,
@@ -8970,7 +9006,11 @@ impl LiveCli {
     /// Slice 14a.
     fn prompt_header(&self) -> Option<String> {
         let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-        render::prompt_header(self.active_agent.as_deref(), None, use_color)
+        render::prompt_header(
+            self.active_agent.as_deref(),
+            Some(self.mode.as_str()),
+            use_color,
+        )
     }
 
     fn prepare_turn_runtime(
@@ -9509,6 +9549,12 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Mode { args } => {
+                if let Err(error) = self.handle_mode_command(args.as_deref()) {
+                    eprintln!("{error}");
+                }
+                false
+            }
             SlashCommand::Skills { args } => {
                 match classify_skills_slash_command(args.as_deref()) {
                     SkillSlashDispatch::Invoke(prompt) => self.run_turn(&prompt)?,
@@ -9855,6 +9901,67 @@ impl LiveCli {
             format_permissions_switch_report(&previous, normalized)
         );
         Ok(true)
+    }
+
+    /// Switch the operating mode (Slice 15): updates the derived permission mode
+    /// + ask-before-mutate behavior and rebuilds the runtime, preserving the
+    /// session. Reuses the same rebuild path as `/model` / `/permissions`.
+    fn set_mode(&mut self, mode: SessionMode) -> Result<(), Box<dyn std::error::Error>> {
+        if mode == self.mode {
+            println!("Already in {} mode.", mode.as_str());
+            return Ok(());
+        }
+        let previous = self.mode;
+        self.mode = mode;
+        self.permission_mode = mode.permission_mode();
+        set_ask_before_mutate(mode.ask_before_mutate());
+        let session = self.runtime.session().clone();
+        let runtime = build_runtime(
+            session,
+            &self.session.id,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            None,
+        )?;
+        self.replace_runtime(runtime)?;
+        let note = match mode {
+            SessionMode::Default => "asks before edits",
+            SessionMode::Plan => "read-only · drafts a plan to approve",
+            SessionMode::Edit => "auto-accepts edits",
+            SessionMode::Mugen => "無限 · auto-approve + auto-continue",
+        };
+        println!(
+            "▸ Mode {} → \x1b[1m{}\x1b[0m ({note})",
+            previous.as_str(),
+            mode.as_str()
+        );
+        Ok(())
+    }
+
+    /// `/mode [name|next|list]` handler.
+    fn handle_mode_command(
+        &mut self,
+        args: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match args.map(str::trim).unwrap_or("") {
+            "" | "list" => {
+                println!(
+                    "Mode  {} (active)\n  Available: {}",
+                    self.mode.as_str(),
+                    MODE_NAMES.join(", ")
+                );
+            }
+            "next" => self.set_mode(self.mode.next())?,
+            name => match SessionMode::parse(name) {
+                Some(mode) => self.set_mode(mode)?,
+                None => println!("Unknown mode `{name}`. Try: {}", MODE_NAMES.join(", ")),
+            },
+        }
+        Ok(())
     }
 
     fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
@@ -16467,13 +16574,110 @@ impl ToolExecutor for CliToolExecutor {
     }
 }
 
+/// Operating mode — a friendly layer over the permission system (Slice 15).
+/// `default` asks before edits, `edit` auto-accepts, `plan` is read-only (with a
+/// plan→approve→execute workflow), `mugen` (無限, limitless) auto-approves and
+/// auto-continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMode {
+    Default,
+    Plan,
+    Edit,
+    Mugen,
+}
+
+impl SessionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Plan => "plan",
+            Self::Edit => "edit",
+            Self::Mugen => "mugen",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "normal" => Some(Self::Default),
+            "plan" => Some(Self::Plan),
+            "edit" | "accept" | "accept-edits" | "acceptedits" => Some(Self::Edit),
+            "mugen" | "auto" | "infinite" => Some(Self::Mugen),
+            _ => None,
+        }
+    }
+
+    /// Next mode in the Shift+Tab cycle.
+    fn next(self) -> Self {
+        match self {
+            Self::Default => Self::Plan,
+            Self::Plan => Self::Edit,
+            Self::Edit => Self::Mugen,
+            Self::Mugen => Self::Default,
+        }
+    }
+
+    fn permission_mode(self) -> PermissionMode {
+        match self {
+            Self::Default | Self::Edit => PermissionMode::WorkspaceWrite,
+            Self::Plan => PermissionMode::ReadOnly,
+            Self::Mugen => PermissionMode::DangerFullAccess,
+        }
+    }
+
+    /// `default` prompts before mutating the workspace; the others don't.
+    fn ask_before_mutate(self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    /// `mugen` keeps working across turns until done / capped / interrupted.
+    fn auto_continue(self) -> bool {
+        matches!(self, Self::Mugen)
+    }
+
+    /// Map a raw permission mode to a non-asking session mode (used for
+    /// non-interactive `-p` runs, which must auto-accept rather than block on a
+    /// prompt, and as a fallback). `workspace-write` → `edit` (auto-accept).
+    fn from_permission(mode: PermissionMode) -> Self {
+        match mode {
+            PermissionMode::ReadOnly => Self::Plan,
+            PermissionMode::DangerFullAccess => Self::Mugen,
+            _ => Self::Edit,
+        }
+    }
+}
+
+const MODE_NAMES: [&str; 4] = ["default", "plan", "edit", "mugen"];
+
+thread_local! {
+    /// Set by the active `LiveCli` so `permission_policy` can make "default" mode
+    /// ask before mutating the workspace. Leakage into read-only subagent builds
+    /// is harmless (read-only denies mutating tools anyway). Slice 15.
+    static ASK_BEFORE_MUTATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn set_ask_before_mutate(value: bool) {
+    ASK_BEFORE_MUTATE.with(|cell| cell.set(value));
+}
+
+fn ask_before_mutate() -> bool {
+    ASK_BEFORE_MUTATE.with(std::cell::Cell::get)
+}
+
+/// Mutating tools that `default` mode prompts before running.
+const MUTATING_TOOLS: [&str; 3] = ["write_file", "edit_file", "bash"];
+
 fn permission_policy(
     mode: PermissionMode,
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GlobalToolRegistry,
 ) -> Result<PermissionPolicy, String> {
+    let mut base =
+        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules());
+    if ask_before_mutate() {
+        base = base.with_ask_tools(&MUTATING_TOOLS);
+    }
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
-        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
+        base,
         |policy, (name, required_permission)| {
             policy.with_tool_requirement(name, required_permission)
         },
@@ -19827,7 +20031,7 @@ mod tests {
                 "anthropic/claude-sonnet-4-6".to_string(),
                 true,
                 None,
-                PermissionMode::DangerFullAccess,
+                SessionMode::Mugen,
             )
             .expect("cli should initialize")
             .startup_banner()
@@ -21736,6 +21940,47 @@ UU conflicted.rs",
             .expect("spawn_agent should be advertised when subagents are enabled");
         assert_eq!(spawn.required_permission, PermissionMode::ReadOnly);
         assert_eq!(spawn.input_schema["required"][0].as_str(), Some("prompt"));
+    }
+
+    #[test]
+    fn session_mode_maps_to_permissions_and_behaviors() {
+        use super::SessionMode;
+        // Aliases parse; round-trips through as_str.
+        assert_eq!(SessionMode::parse("plan"), Some(SessionMode::Plan));
+        assert_eq!(SessionMode::parse("accept-edits"), Some(SessionMode::Edit));
+        assert_eq!(SessionMode::parse("auto"), Some(SessionMode::Mugen));
+        assert_eq!(SessionMode::parse("nope"), None);
+        assert_eq!(SessionMode::Default.as_str(), "default");
+
+        // Shift+Tab cycle: default → plan → edit → mugen → default.
+        assert_eq!(SessionMode::Default.next(), SessionMode::Plan);
+        assert_eq!(SessionMode::Mugen.next(), SessionMode::Default);
+
+        // Permission mapping.
+        assert_eq!(
+            SessionMode::Plan.permission_mode(),
+            PermissionMode::ReadOnly
+        );
+        assert_eq!(
+            SessionMode::Edit.permission_mode(),
+            PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            SessionMode::Mugen.permission_mode(),
+            PermissionMode::DangerFullAccess
+        );
+
+        // Only default asks before edits; only mugen auto-continues.
+        assert!(SessionMode::Default.ask_before_mutate());
+        assert!(!SessionMode::Edit.ask_before_mutate());
+        assert!(SessionMode::Mugen.auto_continue());
+        assert!(!SessionMode::Default.auto_continue());
+
+        // `-p`/fallback mapping never asks (workspace-write → edit).
+        assert_eq!(
+            SessionMode::from_permission(PermissionMode::WorkspaceWrite),
+            SessionMode::Edit
+        );
     }
 
     #[test]

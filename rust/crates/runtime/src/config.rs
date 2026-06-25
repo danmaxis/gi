@@ -165,6 +165,7 @@ pub struct RuntimeFeatureConfig {
     provider: RuntimeProviderConfig,
     memory: RuntimeMemoryConfig,
     default_agent: Option<String>,
+    default_mode: Option<String>,
     subagents: RuntimeSubagentConfig,
 }
 
@@ -868,6 +869,7 @@ fn build_runtime_config(
         provider: parse_optional_provider_config(&merged_value)?,
         memory: parse_optional_memory_config(&merged_value)?,
         default_agent: parse_optional_default_agent(&merged_value),
+        default_mode: parse_optional_string_key(&merged_value, "defaultMode"),
         subagents: parse_optional_subagents_config(&merged_value)?,
     };
 
@@ -1008,6 +1010,12 @@ impl RuntimeConfig {
         self.feature_config.default_agent.as_deref()
     }
 
+    /// The initial operating mode at session start (`defaultMode`), if set. Slice 15.
+    #[must_use]
+    pub fn default_mode(&self) -> Option<&str> {
+        self.feature_config.default_mode.as_deref()
+    }
+
     /// Subagent-spawning configuration (`spawn_agent`). Slice 10.
     #[must_use]
     pub fn subagents(&self) -> &RuntimeSubagentConfig {
@@ -1044,6 +1052,12 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn default_agent(&self) -> Option<&str> {
         self.default_agent.as_deref()
+    }
+
+    /// The initial operating mode at session start (`defaultMode`), if set.
+    #[must_use]
+    pub fn default_mode(&self) -> Option<&str> {
+        self.default_mode.as_deref()
     }
 
     /// Subagent-spawning configuration (`spawn_agent`).
@@ -1848,8 +1862,13 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
 
 /// The agent (by name) to activate automatically when a session starts. Slice 9.
 fn parse_optional_default_agent(root: &JsonValue) -> Option<String> {
+    parse_optional_string_key(root, "defaultAgent")
+}
+
+/// Read a top-level non-empty string config value by key.
+fn parse_optional_string_key(root: &JsonValue, key: &str) -> Option<String> {
     root.as_object()
-        .and_then(|object| object.get("defaultAgent"))
+        .and_then(|object| object.get(key))
         .and_then(JsonValue::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())

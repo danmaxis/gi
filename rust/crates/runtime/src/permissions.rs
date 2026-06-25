@@ -132,6 +132,17 @@ impl PermissionPolicy {
         self
     }
 
+    /// Force an approval prompt for the named tools (matching any input),
+    /// regardless of the active mode — used by "default" mode to ask before
+    /// mutating the workspace while "edit" mode auto-accepts. Slice 15.
+    #[must_use]
+    pub fn with_ask_tools(mut self, tools: &[&str]) -> Self {
+        for tool in tools {
+            self.ask_rules.push(PermissionRule::parse(tool));
+        }
+        self
+    }
+
     #[must_use]
     pub fn with_permission_rules(mut self, config: &RuntimePermissionRuleConfig) -> Self {
         self.allow_rules = config
@@ -659,6 +670,36 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("ask rule")));
+    }
+
+    #[test]
+    fn with_ask_tools_makes_default_ask_before_mutate() {
+        // "edit" mode: workspace-write auto-allows write_file (no prompt).
+        let edit = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        let mut p1 = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+        assert_eq!(
+            edit.authorize("write_file", r#"{"path":"a"}"#, Some(&mut p1)),
+            PermissionOutcome::Allow
+        );
+        assert!(p1.seen.is_empty(), "edit mode must not prompt before edits");
+
+        // "default" mode: the same, plus ask-tools → write_file prompts first.
+        let default = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_ask_tools(&["write_file", "edit_file", "bash"]);
+        let mut p2 = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+        assert_eq!(
+            default.authorize("write_file", r#"{"path":"a"}"#, Some(&mut p2)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(p2.seen.len(), 1, "default mode must ask before edits");
     }
 
     #[test]

@@ -266,6 +266,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "mode",
+        aliases: &[],
+        summary: "Switch operating mode: default | plan | edit | mugen",
+        argument_hint: Some("[default | plan | edit | mugen | next]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1135,6 +1142,9 @@ pub enum SlashCommand {
     Agent {
         args: Option<String>,
     },
+    Mode {
+        args: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1266,6 +1276,7 @@ impl SlashCommand {
             Self::Memory { .. } => "/memory",
             Self::Opencode { .. } => "/opencode",
             Self::Agent { .. } => "/agent",
+            Self::Mode { .. } => "/mode",
             Self::History { .. } => "/history",
             Self::Diff => "/diff",
             Self::Status => "/status",
@@ -1427,6 +1438,7 @@ pub fn validate_slash_command_input(
             args: parse_list_or_help_args(command, remainder)?,
         },
         "agent" => SlashCommand::Agent { args: remainder },
+        "mode" => SlashCommand::Mode { args: remainder },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -1955,12 +1967,13 @@ fn slash_command_category(name: &str) -> &'static str {
         | "bookmarks" | "context" | "files" | "focus" | "unfocus" | "retry" | "stop" | "undo" => {
             "Session"
         }
-        "model" | "agent" | "permissions" | "config" | "memory" | "opencode" | "theme" | "vim"
-        | "voice" | "color" | "effort" | "fast" | "brief" | "output-style" | "keybindings"
-        | "privacy-settings" | "stickers" | "language" | "profile" | "max-tokens"
-        | "temperature" | "system-prompt" | "api-key" | "terminal-setup" | "notifications"
-        | "telemetry" | "providers" | "env" | "project" | "reasoning" | "budget" | "rate-limit"
-        | "workspace" | "reset" | "ide" | "desktop" | "upgrade" | "setup" => "Config",
+        "model" | "agent" | "mode" | "permissions" | "config" | "memory" | "opencode" | "theme"
+        | "vim" | "voice" | "color" | "effort" | "fast" | "brief" | "output-style"
+        | "keybindings" | "privacy-settings" | "stickers" | "language" | "profile"
+        | "max-tokens" | "temperature" | "system-prompt" | "api-key" | "terminal-setup"
+        | "notifications" | "telemetry" | "providers" | "env" | "project" | "reasoning"
+        | "budget" | "rate-limit" | "workspace" | "reset" | "ide" | "desktop" | "upgrade"
+        | "setup" => "Config",
         "debug-tool-call" | "doctor" | "sandbox" | "diagnostics" | "tool-details" | "changelog"
         | "metrics" => "Debug",
         _ => "Tools",
@@ -5680,6 +5693,7 @@ pub fn handle_slash_command(
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Agent { .. }
+        | SlashCommand::Mode { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Doctor
         | SlashCommand::Login
@@ -6007,6 +6021,12 @@ mod tests {
             SlashCommand::parse("/agent reviewer"),
             Ok(Some(SlashCommand::Agent {
                 args: Some("reviewer".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/mode plan"),
+            Ok(Some(SlashCommand::Mode {
+                args: Some("plan".to_string())
             }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
@@ -6353,7 +6373,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 143);
+        assert_eq!(slash_command_specs().len(), 144);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

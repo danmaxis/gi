@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 
-use crossterm::cursor::{MoveToColumn, MoveToPreviousLine};
+use crossterm::cursor::{MoveToColumn, MoveToNextLine, MoveToPreviousLine};
 use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
@@ -35,11 +35,22 @@ struct PopupItem {
     needs_arg: bool,
 }
 
+/// Max visible content rows in the input box before it scrolls. Slice 16.
+const MAX_INPUT_ROWS: usize = 7;
+
 pub struct LineEditor {
+    /// Prompt indicator for the non-TTY fallback path only (the interactive box
+    /// draws its own `❯`). Slice 14a.
     prompt: String,
-    /// Visible width of the prompt (ANSI stripped) — used for cursor column math
-    /// so a themed/colored prompt indicator positions correctly. Slice 14a.
-    prompt_width: usize,
+    /// Title shown on the input box's top border (mode · note · agent), and the
+    /// mode key used to pick the box accent color. Slice 16.
+    header_label: Option<String>,
+    header_mode: String,
+    /// Rows the previous box render drew, and the cursor's row offset from the
+    /// box top, so the next render can clear exactly the prior block (fixes the
+    /// wrapped-line duplication bug). Slice 16.
+    last_block_rows: u16,
+    last_cursor_offset: u16,
     completions: Vec<String>,
     history: Vec<String>,
     color: bool,
@@ -48,15 +59,23 @@ pub struct LineEditor {
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
-        let prompt = prompt.into();
-        let prompt_width = crate::render::strip_ansi(&prompt).chars().count();
         Self {
-            prompt,
-            prompt_width,
+            prompt: prompt.into(),
+            header_label: None,
+            header_mode: "default".to_string(),
+            last_block_rows: 0,
+            last_cursor_offset: 0,
             completions: normalize_completions(completions),
             history: Vec::new(),
             color: std::env::var_os("NO_COLOR").is_none(),
         }
+    }
+
+    /// Set the input box's top-border title (`mode · note · agent`) and the mode
+    /// key driving its accent color. Called by the REPL each loop. Slice 16.
+    pub fn set_header(&mut self, label: Option<String>, mode: impl Into<String>) {
+        self.header_label = label.filter(|value| !value.is_empty());
+        self.header_mode = mode.into();
     }
 
     pub fn push_history(&mut self, entry: impl Into<String>) {
@@ -74,11 +93,9 @@ impl LineEditor {
         self.completions = normalize_completions(completions);
     }
 
-    /// Update the prompt indicator (e.g. when the theme changes), recomputing
-    /// its visible width for cursor math. Slice 14a.
+    /// Update the fallback prompt indicator (non-TTY path). Slice 14a.
     pub fn set_prompt(&mut self, prompt: impl Into<String>) {
         self.prompt = prompt.into();
-        self.prompt_width = crate::render::strip_ansi(&self.prompt).chars().count();
     }
 
     /// Build the filtered command popup for the current buffer, or `None` when a
@@ -148,6 +165,9 @@ impl LineEditor {
         let mut dismissed = false;
         let mut hist_pos = self.history.len();
         let mut draft = String::new();
+        // Fresh box: nothing of ours to clear above the first render. Slice 16.
+        self.last_block_rows = 0;
+        self.last_cursor_offset = 0;
 
         loop {
             let popup = if dismissed {
@@ -169,7 +189,7 @@ impl LineEditor {
             let char_count = buffer.chars().count();
             match (key.code, key.modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    self.render(&buffer, cursor, None, 0)?;
+                    self.commit_render(&buffer)?;
                     return Ok(if buffer.is_empty() {
                         ReadOutcome::Exit
                     } else {
@@ -178,7 +198,7 @@ impl LineEditor {
                 }
                 (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                     if buffer.is_empty() {
-                        self.render(&buffer, cursor, None, 0)?;
+                        self.commit_render(&buffer)?;
                         return Ok(ReadOutcome::Exit);
                     }
                 }
@@ -201,18 +221,18 @@ impl LineEditor {
                                 selected = 0;
                                 continue;
                             }
-                            self.render(&item.command, item.command.chars().count(), None, 0)?;
+                            self.commit_render(&item.command)?;
                             return Ok(ReadOutcome::Submit(item.command.clone()));
                         }
                     }
-                    self.render(&buffer, cursor, None, 0)?;
+                    self.commit_render(&buffer)?;
                     return Ok(ReadOutcome::Submit(buffer));
                 }
                 // Shift+Tab cycles the operating mode, carrying any in-progress
                 // text so it's preserved across the switch — the REPL re-seeds
                 // the next prompt with it (command-like). Slice 15.
                 (KeyCode::BackTab, _) => {
-                    self.render(&buffer, cursor, None, 0)?;
+                    self.commit_render(&buffer)?;
                     return Ok(ReadOutcome::CycleMode(std::mem::take(&mut buffer)));
                 }
                 (KeyCode::Tab, _) => {
@@ -231,13 +251,21 @@ impl LineEditor {
                 (KeyCode::Up, _) => {
                     if popup.is_some() {
                         selected = selected.saturating_sub(1);
-                    } else if hist_pos > 0 {
-                        if hist_pos == self.history.len() {
-                            draft = buffer.clone();
+                    } else {
+                        let wrapped = wrap_buffer(&buffer, input_text_width(), cursor);
+                        if wrapped.cursor_row > 0 {
+                            // Move up one visual row within the buffer.
+                            cursor =
+                                char_index_at(&wrapped, wrapped.cursor_row - 1, wrapped.cursor_col);
+                        } else if hist_pos > 0 {
+                            // At the top row → recall older history.
+                            if hist_pos == self.history.len() {
+                                draft = buffer.clone();
+                            }
+                            hist_pos -= 1;
+                            buffer = self.history[hist_pos].clone();
+                            cursor = buffer.chars().count();
                         }
-                        hist_pos -= 1;
-                        buffer = self.history[hist_pos].clone();
-                        cursor = buffer.chars().count();
                     }
                 }
                 (KeyCode::Down, _) => {
@@ -245,14 +273,22 @@ impl LineEditor {
                         if selected + 1 < items.len() {
                             selected += 1;
                         }
-                    } else if hist_pos < self.history.len() {
-                        hist_pos += 1;
-                        buffer = if hist_pos == self.history.len() {
-                            draft.clone()
-                        } else {
-                            self.history[hist_pos].clone()
-                        };
-                        cursor = buffer.chars().count();
+                    } else {
+                        let wrapped = wrap_buffer(&buffer, input_text_width(), cursor);
+                        if wrapped.cursor_row + 1 < wrapped.rows.len() {
+                            // Move down one visual row within the buffer.
+                            cursor =
+                                char_index_at(&wrapped, wrapped.cursor_row + 1, wrapped.cursor_col);
+                        } else if hist_pos < self.history.len() {
+                            // At the bottom row → recall newer history / draft.
+                            hist_pos += 1;
+                            buffer = if hist_pos == self.history.len() {
+                                draft.clone()
+                            } else {
+                                self.history[hist_pos].clone()
+                            };
+                            cursor = buffer.chars().count();
+                        }
                     }
                 }
                 (KeyCode::Left, _) => cursor = cursor.saturating_sub(1),
@@ -287,69 +323,147 @@ impl LineEditor {
         }
     }
 
+    /// Draw the bordered, scrollable input box and leave the cursor at the
+    /// editing position inside it. The previous block is cleared exactly (using
+    /// the tracked row counts) so wrapped/multi-line input never duplicates.
+    /// Slice 16.
     fn render(
-        &self,
+        &mut self,
         buffer: &str,
         cursor: usize,
         popup: Option<&[PopupItem]>,
         selected: usize,
     ) -> io::Result<()> {
         let mut out = io::stdout();
-        queue!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
-        let display = format!("{}{}", self.prompt, buffer).replace('\n', "\r\n");
-        write!(out, "{display}")?;
 
-        let mut popup_rows = 0u16;
-        if let Some(items) = popup {
-            for (index, item) in items.iter().enumerate() {
-                write!(out, "\r\n")?;
-                let arg = if item.needs_arg { " …" } else { "" };
-                if self.color {
-                    if index == selected {
-                        write!(
-                            out,
-                            "  \x1b[7m \x1b[0m \x1b[1;36m{:<14}\x1b[0m\x1b[2m{arg}  {}\x1b[0m",
-                            item.command, item.description
-                        )?;
-                    } else {
-                        write!(
-                            out,
-                            "    \x1b[36m{:<14}\x1b[0m\x1b[2m{arg}  {}\x1b[0m",
-                            item.command, item.description
-                        )?;
-                    }
-                } else {
-                    let marker = if index == selected { '>' } else { ' ' };
-                    write!(
-                        out,
-                        "  {marker} {:<14}{arg}  {}",
-                        item.command, item.description
-                    )?;
-                }
-                popup_rows += 1;
-            }
-        }
-
-        // Reposition the cursor onto the input line at the editing position.
-        let input_rows = buffer.matches('\n').count() as u16;
-        let cursor_row = buffer.chars().take(cursor).filter(|ch| *ch == '\n').count() as u16;
-        let up = (input_rows + popup_rows).saturating_sub(cursor_row);
-        if up > 0 {
-            queue!(out, MoveToPreviousLine(up))?;
+        // Return to the top-left of the previously drawn block, then clear it.
+        if self.last_block_rows > 0 && self.last_cursor_offset > 0 {
+            queue!(out, MoveToPreviousLine(self.last_cursor_offset))?;
         } else {
             queue!(out, MoveToColumn(0))?;
         }
-        let byte_cursor = byte_index(buffer, cursor);
-        let line_start = buffer[..byte_cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        let col_in_line = buffer[line_start..byte_cursor].chars().count();
-        let col = if cursor_row == 0 {
-            self.prompt_width + col_in_line
+        queue!(out, Clear(ClearType::FromCursorDown))?;
+
+        let box_width = crate::render::terminal_width();
+        let text_width = box_width.saturating_sub(6).max(1);
+        let (open, reset) = crate::render::accent_sgr(&self.header_mode, self.color);
+
+        let wrapped = wrap_buffer(buffer, text_width, cursor);
+        let total = wrapped.rows.len();
+        // Scroll so the cursor row stays within the visible window.
+        let offset = if wrapped.cursor_row + 1 > MAX_INPUT_ROWS {
+            (wrapped.cursor_row + 1 - MAX_INPUT_ROWS).min(total.saturating_sub(MAX_INPUT_ROWS))
         } else {
-            col_in_line
+            0
         };
-        queue!(out, MoveToColumn(col as u16))?;
+        let visible_count = (total - offset).min(MAX_INPUT_ROWS);
+
+        let mut lines: Vec<String> = Vec::new();
+
+        // Top border with the mode/agent title.
+        let title = self.header_label.clone().unwrap_or_default();
+        if title.is_empty() {
+            lines.push(format!(
+                "{open}╭{}╮{reset}",
+                "─".repeat(box_width.saturating_sub(2))
+            ));
+        } else {
+            let dashes = box_width
+                .saturating_sub(3 + title.chars().count() + 2)
+                .max(1);
+            lines.push(format!("{open}╭─ {title} {}╮{reset}", "─".repeat(dashes)));
+        }
+
+        // Content rows.
+        for vi in 0..visible_count {
+            let abs = offset + vi;
+            let row_text = &wrapped.rows[abs];
+            let glyph = if abs == 0 {
+                if self.color {
+                    format!("{open}❯{reset} ")
+                } else {
+                    "❯ ".to_string()
+                }
+            } else {
+                "  ".to_string()
+            };
+            let fill = " ".repeat(text_width.saturating_sub(row_text.chars().count()));
+            lines.push(format!(
+                "{open}│{reset} {glyph}{row_text}{fill} {open}│{reset}"
+            ));
+        }
+
+        // Bottom border, with a position hint when the content scrolls.
+        if total > MAX_INPUT_ROWS {
+            let hint = format!(" {}/{} ", wrapped.cursor_row + 1, total);
+            let dashes = box_width.saturating_sub(2 + hint.chars().count()).max(1);
+            lines.push(format!("{open}╰{}{hint}╯{reset}", "─".repeat(dashes)));
+        } else {
+            lines.push(format!(
+                "{open}╰{}╯{reset}",
+                "─".repeat(box_width.saturating_sub(2))
+            ));
+        }
+
+        // Popup rows below the box.
+        if let Some(items) = popup {
+            for (index, item) in items.iter().enumerate() {
+                let arg = if item.needs_arg { " …" } else { "" };
+                lines.push(if self.color {
+                    if index == selected {
+                        format!(
+                            "  \x1b[7m \x1b[0m \x1b[1;36m{:<14}\x1b[0m\x1b[2m{arg}  {}\x1b[0m",
+                            item.command, item.description
+                        )
+                    } else {
+                        format!(
+                            "    \x1b[36m{:<14}\x1b[0m\x1b[2m{arg}  {}\x1b[0m",
+                            item.command, item.description
+                        )
+                    }
+                } else {
+                    let marker = if index == selected { '>' } else { ' ' };
+                    format!("  {marker} {:<14}{arg}  {}", item.command, item.description)
+                });
+            }
+        }
+
+        write!(out, "{}", lines.join("\r\n"))?;
+
+        // Reposition the cursor to the editing spot inside the box.
+        let total_rows = lines.len();
+        let cursor_block_row = 1 + (wrapped.cursor_row - offset); // row 0 = top border
+        let up = (total_rows - 1).saturating_sub(cursor_block_row);
+        if up > 0 {
+            queue!(out, MoveToPreviousLine(up as u16))?;
+        } else {
+            queue!(out, MoveToColumn(0))?;
+        }
+        // Screen column: │(1) + pad(1) + glyph(2) + cursor column.
+        queue!(out, MoveToColumn((4 + wrapped.cursor_col) as u16))?;
+        out.flush()?;
+
+        self.last_block_rows = total_rows as u16;
+        self.last_cursor_offset = cursor_block_row as u16;
+        Ok(())
+    }
+
+    /// Final render before returning an outcome: draw the box, then drop the
+    /// cursor below the whole block so the turn's output starts on a fresh line
+    /// instead of overwriting the box. Slice 16.
+    fn commit_render(&mut self, buffer: &str) -> io::Result<()> {
+        self.render(buffer, buffer.chars().count(), None, 0)?;
+        let mut out = io::stdout();
+        let down = self
+            .last_block_rows
+            .saturating_sub(1)
+            .saturating_sub(self.last_cursor_offset);
+        if down > 0 {
+            queue!(out, MoveToNextLine(down))?;
+        }
+        // Committed: the next edit() starts a fresh block (don't clear this one).
+        self.last_block_rows = 0;
+        self.last_cursor_offset = 0;
         out.flush()
     }
 
@@ -375,6 +489,78 @@ fn byte_index(buffer: &str, char_index: usize) -> usize {
         .char_indices()
         .nth(char_index)
         .map_or(buffer.len(), |(byte, _)| byte)
+}
+
+/// Text-area width inside the input box (box width minus borders/pad/glyph).
+/// Slice 16.
+fn input_text_width() -> usize {
+    crate::render::terminal_width().saturating_sub(6).max(1)
+}
+
+/// Soft-wrapped view of the buffer: the visual rows (text only), where the
+/// cursor lands, and each row's starting char index in the buffer. Splits on
+/// `\n` and wraps at `width` columns (char-based, so cursor math is exact).
+/// Slice 16.
+struct Wrapped {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+    row_start: Vec<usize>,
+}
+
+fn wrap_buffer(buffer: &str, width: usize, cursor: usize) -> Wrapped {
+    let width = width.max(1);
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut row_start: Vec<usize> = Vec::new();
+    let mut line = String::new();
+    let mut start = 0usize;
+    let mut col = 0usize;
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+    let mut cursor_set = false;
+    for (i, &ch) in chars.iter().enumerate() {
+        if i == cursor {
+            cursor_row = rows.len();
+            cursor_col = col;
+            cursor_set = true;
+        }
+        if ch == '\n' {
+            row_start.push(start);
+            rows.push(std::mem::take(&mut line));
+            start = i + 1;
+            col = 0;
+            continue;
+        }
+        line.push(ch);
+        col += 1;
+        if col == width {
+            row_start.push(start);
+            rows.push(std::mem::take(&mut line));
+            start = i + 1;
+            col = 0;
+        }
+    }
+    if !cursor_set {
+        cursor_row = rows.len();
+        cursor_col = col;
+    }
+    row_start.push(start);
+    rows.push(line);
+    Wrapped {
+        rows,
+        cursor_row,
+        cursor_col,
+        row_start,
+    }
+}
+
+/// Char index in the buffer for the (row, col) position in a [`Wrapped`] view —
+/// used to move the cursor up/down a visual row. Slice 16.
+fn char_index_at(wrapped: &Wrapped, row: usize, col: usize) -> usize {
+    let row = row.min(wrapped.rows.len().saturating_sub(1));
+    let row_len = wrapped.rows[row].chars().count();
+    wrapped.row_start[row] + col.min(row_len)
 }
 
 fn insert_char(buffer: &mut String, cursor: &mut usize, ch: char) {
@@ -503,9 +689,45 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_index, command_needs_arg, describe_completion, fuzzy_score, insert_char,
-        normalize_completions, remove_char, starts_with_ci, LineEditor,
+        byte_index, char_index_at, command_needs_arg, describe_completion, fuzzy_score,
+        insert_char, normalize_completions, remove_char, starts_with_ci, wrap_buffer, LineEditor,
     };
+
+    #[test]
+    fn wrap_buffer_splits_on_newlines_and_width() {
+        // Explicit newline → two rows; cursor at end lands on row 1 col 0.
+        let w = wrap_buffer("ab\n", 10, 3);
+        assert_eq!(w.rows, vec!["ab".to_string(), String::new()]);
+        assert_eq!((w.cursor_row, w.cursor_col), (1, 0));
+
+        // Soft wrap at width: "abcdef" / width 3 → ["abc", "def", ""]. The
+        // trailing empty row at an exact-width boundary keeps the cursor's
+        // (row, col) valid when it sits at the very end.
+        let w = wrap_buffer("abcdef", 3, 4);
+        assert_eq!(
+            w.rows,
+            vec!["abc".to_string(), "def".to_string(), String::new()]
+        );
+        // cursor index 4 ('e') sits on row 1, col 1.
+        assert_eq!((w.cursor_row, w.cursor_col), (1, 1));
+
+        // Empty buffer → a single empty row, cursor at origin.
+        let w = wrap_buffer("", 5, 0);
+        assert_eq!(w.rows, vec![String::new()]);
+        assert_eq!((w.cursor_row, w.cursor_col), (0, 0));
+    }
+
+    #[test]
+    fn char_index_at_maps_visual_position_back_to_buffer() {
+        // "abc\ndef": row 0 = "abc" (start 0), row 1 = "def" (start 4, past \n).
+        let buffer = "abc\ndef";
+        let w = wrap_buffer(buffer, 10, 0);
+        assert_eq!(w.rows, vec!["abc".to_string(), "def".to_string()]);
+        // Moving down to row 1, col 2 → char index 6 ('f').
+        assert_eq!(char_index_at(&w, 1, 2), 6);
+        // Col clamped to the row length.
+        assert_eq!(char_index_at(&w, 0, 99), 3);
+    }
 
     fn popup_commands(editor: &LineEditor, buffer: &str) -> Vec<String> {
         editor
@@ -597,13 +819,15 @@ mod tests {
     }
 
     #[test]
-    fn colored_prompt_tracks_visible_width_not_byte_count() {
-        // A themed "❯ " prompt has visible width 2 even with ANSI wrapping, so
-        // the row-0 cursor column stays correct. Slice 14a.
-        let mut editor = LineEditor::new("\x1b[1;36m❯\x1b[0m ", vec![]);
-        assert_eq!(editor.prompt_width, 2);
-        editor.set_prompt("> ");
-        assert_eq!(editor.prompt_width, 2);
+    fn set_header_stores_label_and_mode() {
+        // The box title + accent mode are set each loop by the REPL. Slice 16.
+        let mut editor = LineEditor::new("❯ ", vec![]);
+        editor.set_header(Some("plan · read-only".to_string()), "plan");
+        assert_eq!(editor.header_label.as_deref(), Some("plan · read-only"));
+        assert_eq!(editor.header_mode, "plan");
+        // An empty label normalizes to None (plain box).
+        editor.set_header(Some(String::new()), "default");
+        assert_eq!(editor.header_label, None);
     }
 
     #[test]

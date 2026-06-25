@@ -7995,12 +7995,11 @@ fn run_repl(
             io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
             render::mode_accent(cli.mode.as_str()),
         ));
+        // The mode/agent header is now the input box's top-border title, drawn by
+        // the editor itself (Slice 16) — set it each loop so it tracks the mode.
+        editor.set_header(Some(cli.header_label()), cli.mode.as_str().to_string());
         if io::stdout().is_terminal() {
             println!("{}", cli.status_line(&status_branch));
-            // Themed bounding box naming the active agent (+ mode, from Slice 15).
-            if let Some(header) = cli.prompt_header() {
-                println!("{header}");
-            }
         }
         let outcome = match pending_input.take() {
             Some(seed) => editor.read_line_with_initial(seed)?,
@@ -9116,14 +9115,15 @@ impl LiveCli {
     /// The themed bounding-box header above the prompt, labeling the active
     /// agent (and, from Slice 15, mode). `None` when there's nothing to show.
     /// Slice 14a.
-    fn prompt_header(&self) -> Option<String> {
-        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-        render::prompt_header(
-            self.active_agent.as_deref(),
-            Some(self.mode.as_str()),
-            Some(self.mode.note()),
-            use_color,
-        )
+    /// Plain text for the input box's top-border title: `mode · note` plus the
+    /// active agent when one is selected. Slice 16.
+    fn header_label(&self) -> String {
+        let mut label = format!("{} · {}", self.mode.as_str(), self.mode.note());
+        if let Some(agent) = self.active_agent.as_deref() {
+            label.push_str(" · ");
+            label.push_str(agent);
+        }
+        label
     }
 
     /// Transient system-prompt guidance for the active mode, appended per turn so

@@ -133,6 +133,18 @@ pub fn mode_accent(mode: &str) -> Option<Color> {
     }
 }
 
+/// SGR `(color_on, reset)` pair for the input box's border + `❯` glyph: the
+/// mode accent when non-default, else the theme's code-block border color.
+/// `(empty, empty)` without color. Slice 16.
+#[must_use]
+pub fn accent_sgr(mode: &str, use_color: bool) -> (String, String) {
+    if !use_color {
+        return (String::new(), String::new());
+    }
+    let color = mode_accent(mode).unwrap_or_else(|| ColorTheme::default().code_block_border);
+    (theme_fg(color), "\x1b[0m".to_string())
+}
+
 /// The themed prompt indicator that replaces the bare `> ` (a colored `❯ `).
 /// Its visible width is always 2. `NO_COLOR` → plain `"❯ "`. An `accent` (from
 /// [`mode_accent`]) tints the glyph per active mode; `None` keeps the theme

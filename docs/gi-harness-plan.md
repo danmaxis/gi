@@ -374,6 +374,26 @@ build/fmt/clippy green). The interactive bits (plan-approval prompt + mode flip;
 running across turns + ESC interrupt) need live-terminal smoke (raw-mode tty, not runnable in
 the sandbox).
 
+### Slice 16: input box, plan-mode behavior, answer gutter
+
+- [x] **Plan-mode guidance** injected per turn (`mode_guidance` in `prepare_turn_runtime`) so
+  models actually draft a plan + call `exit_plan_mode` (and work autonomously + `task_complete`
+  in mugen). Plan-approval target is per-agent (`AgentProfile.plan_execute_mode`) or asks
+  `[e]dit/[m]ugen`.
+- [x] **Answer left-gutter** (`render::StreamGutter`) — a `│ ` bar down streamed answers,
+  identity passthrough when piped.
+- [x] **Permission-prompt input summary** (`summarize_permission_input`) — path + size for
+  writes, command for bash, truncation otherwise (no more full escaped-JSON dumps).
+- [x] **Bordered multi-line input box** (`input.rs`): the mode/agent header is the box's
+  top-border title; content wraps + grows to 7 rows then scrolls; arrows move within the
+  buffer; the redraw tracks rendered rows (`last_block_rows`/`last_cursor_offset`) which fixes
+  the wrapped/multi-line first-line **duplication bug**.
+
+Progress 2026-06-25: B/C/D + the input box shipped & unit-tested (wrap/cursor math, gutter,
+summary, frontmatter, target parsing; fmt/clippy green). The box's live rendering (growth,
+scroll, cursor placement, no duplication) and the plan/gutter visuals need real-terminal smoke
+(raw-mode tty, not runnable in the sandbox).
+
 ### Slice 14b: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 
 - [ ] ratatui-based persistent layout (scrollback pane + input + status regions) reusing

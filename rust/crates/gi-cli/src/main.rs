@@ -3587,21 +3587,15 @@ fn format_connected_line(model: &str) -> String {
 }
 
 /// Compose the dim, single-line REPL status indicator shown before each prompt:
-/// `◈ model · agent · ~tokens · branch`. Pure + NO_COLOR-safe. Slice 13.
-fn compose_status_line(
-    model: &str,
-    agent: Option<&str>,
-    tokens: usize,
-    branch: &str,
-    use_color: bool,
-) -> String {
-    let agent_part = agent.map_or_else(String::new, |agent| format!(" · {agent}"));
+/// `◈ model · ~tokens · branch`. The active agent/mode live in the themed prompt
+/// header box (Slice 14a) instead. Pure + NO_COLOR-safe. Slice 13.
+fn compose_status_line(model: &str, tokens: usize, branch: &str, use_color: bool) -> String {
     let tok = if tokens >= 1000 {
         format!("~{:.1}k tok", tokens as f64 / 1000.0)
     } else {
         format!("~{tokens} tok")
     };
-    let line = format!("◈ {model}{agent_part} · {tok} · {branch}");
+    let line = format!("◈ {model} · {tok} · {branch}");
     if use_color {
         format!("\x1b[2m{line}\x1b[0m")
     } else {
@@ -7941,8 +7935,10 @@ fn run_repl(
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(effort);
     cli.active_agent = active_agent;
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        render::prompt_glyph(io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     reveal_banner(&cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
@@ -7955,8 +7951,16 @@ fn run_repl(
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        // Refresh the themed prompt indicator (theme can change via /theme).
+        editor.set_prompt(render::prompt_glyph(
+            io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+        ));
         if io::stdout().is_terminal() {
             println!("{}", cli.status_line(&status_branch));
+            // Themed bounding box naming the active agent (+ mode, from Slice 15).
+            if let Some(header) = cli.prompt_header() {
+                println!("{header}");
+            }
         }
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
@@ -8955,11 +8959,18 @@ impl LiveCli {
         let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
         compose_status_line(
             &self.model,
-            self.active_agent.as_deref(),
             self.runtime.estimated_tokens(),
             branch,
             use_color,
         )
+    }
+
+    /// The themed bounding-box header above the prompt, labeling the active
+    /// agent (and, from Slice 15, mode). `None` when there's nothing to show.
+    /// Slice 14a.
+    fn prompt_header(&self) -> Option<String> {
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        render::prompt_header(self.active_agent.as_deref(), None, use_color)
     }
 
     fn prepare_turn_runtime(
@@ -21729,14 +21740,14 @@ UU conflicted.rs",
 
     #[test]
     fn compose_status_line_is_concise_and_no_color_safe() {
-        let line = super::compose_status_line("mistral", Some("reviewer"), 12_345, "main", false);
-        assert_eq!(line, "◈ mistral · reviewer · ~12.3k tok · main");
+        let line = super::compose_status_line("mistral", 12_345, "main", false);
+        assert_eq!(line, "◈ mistral · ~12.3k tok · main");
         assert!(!line.contains('\u{1b}'));
-        // No agent → omitted; small token counts aren't abbreviated.
-        let line = super::compose_status_line("opus", None, 42, "dev", false);
+        // Small token counts aren't abbreviated.
+        let line = super::compose_status_line("opus", 42, "dev", false);
         assert_eq!(line, "◈ opus · ~42 tok · dev");
         // Colored variant is dim-wrapped.
-        assert!(super::compose_status_line("m", None, 0, "b", true).starts_with("\u{1b}[2m"));
+        assert!(super::compose_status_line("m", 0, "b", true).starts_with("\u{1b}[2m"));
     }
 
     #[test]

@@ -34,6 +34,9 @@ struct PopupItem {
 
 pub struct LineEditor {
     prompt: String,
+    /// Visible width of the prompt (ANSI stripped) — used for cursor column math
+    /// so a themed/colored prompt indicator positions correctly. Slice 14a.
+    prompt_width: usize,
     completions: Vec<String>,
     history: Vec<String>,
     color: bool,
@@ -42,8 +45,11 @@ pub struct LineEditor {
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
+        let prompt = prompt.into();
+        let prompt_width = crate::render::strip_ansi(&prompt).chars().count();
         Self {
-            prompt: prompt.into(),
+            prompt,
+            prompt_width,
             completions: normalize_completions(completions),
             history: Vec::new(),
             color: std::env::var_os("NO_COLOR").is_none(),
@@ -63,6 +69,13 @@ impl LineEditor {
 
     pub fn set_completions(&mut self, completions: Vec<String>) {
         self.completions = normalize_completions(completions);
+    }
+
+    /// Update the prompt indicator (e.g. when the theme changes), recomputing
+    /// its visible width for cursor math. Slice 14a.
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+        self.prompt_width = crate::render::strip_ansi(&self.prompt).chars().count();
     }
 
     /// Build the filtered command popup for the current buffer, or `None` when a
@@ -315,7 +328,7 @@ impl LineEditor {
             .map_or(0, |index| index + 1);
         let col_in_line = buffer[line_start..byte_cursor].chars().count();
         let col = if cursor_row == 0 {
-            self.prompt.chars().count() + col_in_line
+            self.prompt_width + col_in_line
         } else {
             col_in_line
         };
@@ -564,6 +577,16 @@ mod tests {
         assert!(fuzzy_score("/help", "/he").unwrap() > fuzzy_score("/sphere", "/he").unwrap_or(0));
         assert!(fuzzy_score("/status", "/xyz").is_none());
         assert!(starts_with_ci("/Model", "/mod"));
+    }
+
+    #[test]
+    fn colored_prompt_tracks_visible_width_not_byte_count() {
+        // A themed "❯ " prompt has visible width 2 even with ANSI wrapping, so
+        // the row-0 cursor column stays correct. Slice 14a.
+        let mut editor = LineEditor::new("\x1b[1;36m❯\x1b[0m ", vec![]);
+        assert_eq!(editor.prompt_width, 2);
+        editor.set_prompt("> ");
+        assert_eq!(editor.prompt_width, 2);
     }
 
     #[test]

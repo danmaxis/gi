@@ -97,6 +97,57 @@ pub fn theme_swatch(name: &str, use_color: bool) -> String {
     )
 }
 
+/// SGR foreground sequence for a theme `Color` (truecolor / 256-color; named
+/// colors fall back to no explicit color so the bold attribute still reads).
+fn theme_fg(color: Color) -> String {
+    match color {
+        Color::Rgb { r, g, b } => format!("\x1b[38;2;{r};{g};{b}m"),
+        Color::AnsiValue(n) => format!("\x1b[38;5;{n}m"),
+        _ => String::new(),
+    }
+}
+
+/// The themed prompt indicator that replaces the bare `> ` (a colored `❯ `).
+/// Its visible width is always 2. `NO_COLOR` → plain `"❯ "`. Slice 14a.
+#[must_use]
+pub fn prompt_glyph(use_color: bool) -> String {
+    if !use_color {
+        return "❯ ".to_string();
+    }
+    format!(
+        "{}\x1b[1m❯\x1b[0m ",
+        theme_fg(ColorTheme::default().heading)
+    )
+}
+
+/// A themed bounding-box header shown above the prompt, labeling the active
+/// `mode` and `agent` (e.g. `╭─ edit · reviewer ─╮`). Returns `None` when there
+/// is nothing to show. `NO_COLOR` → the plain box-drawing form. Slice 14a.
+#[must_use]
+pub fn prompt_header(agent: Option<&str>, mode: Option<&str>, use_color: bool) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(mode) = mode.filter(|value| !value.is_empty()) {
+        parts.push(mode);
+    }
+    if let Some(agent) = agent.filter(|value| !value.is_empty()) {
+        parts.push(agent);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let label = parts.join(" · ");
+    if !use_color {
+        return Some(format!("╭─ {label} ─╮"));
+    }
+    let theme = ColorTheme::default();
+    let border = theme_fg(theme.code_block_border);
+    let title = theme_fg(theme.heading);
+    let reset = "\x1b[0m";
+    Some(format!(
+        "{border}╭─ {reset}{title}{label}{reset}{border} ─╮{reset}"
+    ))
+}
+
 /// Pure precedence resolver: env over runtime override over built-in default.
 /// Returns the canonical theme name (`None` means the built-in fallback) and
 /// the source it was selected from.
@@ -1384,6 +1435,27 @@ mod tests {
     #[test]
     fn with_gutter_prefixes_every_line() {
         assert_eq!(with_gutter("a\nb", "▏ "), "▏ a\n▏ b");
+    }
+
+    #[test]
+    fn prompt_glyph_and_header_are_themed_and_no_color_safe() {
+        assert_eq!(super::prompt_glyph(false), "❯ ");
+        assert!(super::prompt_glyph(true).contains('❯'));
+        assert!(super::prompt_glyph(true).contains('\u{1b}'));
+
+        // Header labels mode · agent; empty when both absent.
+        assert_eq!(
+            super::prompt_header(Some("reviewer"), Some("edit"), false),
+            Some("╭─ edit · reviewer ─╮".to_string())
+        );
+        assert_eq!(
+            super::prompt_header(Some("reviewer"), None, false),
+            Some("╭─ reviewer ─╮".to_string())
+        );
+        assert_eq!(super::prompt_header(None, None, false), None);
+        assert!(super::prompt_header(None, Some("plan"), true)
+            .unwrap()
+            .contains('\u{1b}'));
     }
 
     #[test]

@@ -3913,6 +3913,126 @@ fn create_agent(name: &str, cwd: &Path) -> std::io::Result<CreatedAgent> {
     Ok(CreatedAgent { name, path })
 }
 
+/// A full agent definition for programmatic create/edit (the `/agents` wizard).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub prompt: Option<String>,
+    pub plan_execute_mode: Option<String>,
+}
+
+/// Serialize an agent as a Markdown file (YAML frontmatter + free-form body).
+/// The body is the system prompt — Markdown handles multi-line prompts cleanly
+/// where single-line TOML cannot.
+#[must_use]
+pub fn render_agent_markdown(def: &AgentDefinition) -> String {
+    let mut out = String::from("---\n");
+    out.push_str(&format!("name: {}\n", def.name));
+    if let Some(value) = &def.description {
+        out.push_str(&format!("description: {value}\n"));
+    }
+    if let Some(value) = &def.model {
+        out.push_str(&format!("model: {value}\n"));
+    }
+    if let Some(value) = &def.reasoning_effort {
+        out.push_str(&format!("model_reasoning_effort: {value}\n"));
+    }
+    if let Some(value) = &def.plan_execute_mode {
+        out.push_str(&format!("plan_execute_mode: {value}\n"));
+    }
+    out.push_str("---\n");
+    if let Some(prompt) = &def.prompt {
+        out.push_str(prompt);
+        if !prompt.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Read an agent file (`.toml` or `.md`) into an [`AgentDefinition`] so edits
+/// can start from its current values.
+pub fn read_agent_definition(path: &Path) -> std::io::Result<AgentDefinition> {
+    let contents = fs::read_to_string(path)?;
+    let fallback_name = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        let (name, description, model, reasoning_effort, instructions, plan_execute_mode) =
+            parse_agent_frontmatter(&contents);
+        Ok(AgentDefinition {
+            name: name.unwrap_or(fallback_name),
+            description,
+            model,
+            reasoning_effort,
+            prompt: instructions,
+            plan_execute_mode,
+        })
+    } else {
+        Ok(AgentDefinition {
+            name: parse_toml_string(&contents, "name").unwrap_or(fallback_name),
+            description: parse_toml_string(&contents, "description"),
+            model: parse_toml_string(&contents, "model"),
+            reasoning_effort: parse_toml_string(&contents, "model_reasoning_effort"),
+            prompt: parse_toml_string(&contents, "prompt")
+                .or_else(|| parse_toml_string(&contents, "instructions")),
+            plan_execute_mode: parse_toml_string(&contents, "plan_execute_mode"),
+        })
+    }
+}
+
+/// Create a new agent at `root/<name>.md`. Errors if an agent with that name
+/// already exists (as `.md` or `.toml`).
+pub fn create_agent_definition(root: &Path, def: &AgentDefinition) -> std::io::Result<PathBuf> {
+    let Some(name) = sanitize_skill_invocation_name(&def.name) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid_agent_name: agent name must contain at least one alphanumeric character",
+        ));
+    };
+    fs::create_dir_all(root)?;
+    let path = root.join(format!("{name}.md"));
+    if path.exists() || root.join(format!("{name}.toml")).exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("agent_already_exists: agent '{name}' already exists"),
+        ));
+    }
+    let def = AgentDefinition {
+        name,
+        ..def.clone()
+    };
+    fs::write(&path, render_agent_markdown(&def))?;
+    Ok(path)
+}
+
+/// Update an existing agent file, normalizing to `.md` (so multi-line prompts and
+/// edits round-trip cleanly). Returns the written path; removes the old file when
+/// the name/extension changed (rename or `.toml`→`.md` migration).
+pub fn update_agent_definition(path: &Path, def: &AgentDefinition) -> std::io::Result<PathBuf> {
+    let Some(name) = sanitize_skill_invocation_name(&def.name) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid_agent_name: agent name must contain at least one alphanumeric character",
+        ));
+    };
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let new_path = root.join(format!("{name}.md"));
+    let def = AgentDefinition {
+        name,
+        ..def.clone()
+    };
+    fs::write(&new_path, render_agent_markdown(&def))?;
+    if path != new_path && path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(new_path)
+}
+
 fn default_skill_install_root() -> std::io::Result<PathBuf> {
     if let Ok(gi_config_home) = env::var("GI_CONFIG_HOME") {
         return Ok(PathBuf::from(gi_config_home).join("skills"));
@@ -4205,6 +4325,8 @@ pub struct AgentProfile {
     pub plan_execute_mode: Option<String>,
     /// Human-readable scope label (e.g. "project", "user").
     pub source: String,
+    /// The file this agent was loaded from (for in-place editing). Slice: agent wizard.
+    pub path: Option<PathBuf>,
 }
 
 impl AgentProfile {
@@ -4217,6 +4339,7 @@ impl AgentProfile {
             instructions: summary.instructions.clone(),
             plan_execute_mode: summary.plan_execute_mode.clone(),
             source: summary.source.label().to_string(),
+            path: summary.path.clone(),
         }
     }
 }
@@ -5778,13 +5901,14 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
+        classify_skills_slash_command, create_agent_definition, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
-        load_agents_from_roots, load_skills_from_roots, render_agents_report,
-        render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
-        render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
-        render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input, AgentCollection,
+        load_agents_from_roots, load_skills_from_roots, read_agent_definition,
+        render_agents_report, render_agents_report_json, render_mcp_report_json_for,
+        render_plugins_report, render_plugins_report_with_failures, render_skills_report,
+        render_slash_command_help, render_slash_command_help_detail, resolve_skill_path,
+        resume_supported_slash_commands, slash_command_specs, suggest_slash_commands,
+        update_agent_definition, validate_slash_command_input, AgentCollection, AgentDefinition,
         DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
@@ -5806,6 +5930,79 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
+    }
+
+    #[test]
+    fn agent_definition_create_read_and_update_round_trip() {
+        let root = temp_dir("agent-def");
+        fs::create_dir_all(&root).expect("mkdir");
+
+        let def = AgentDefinition {
+            name: "reviewer".to_string(),
+            description: Some("Reviews code".to_string()),
+            model: Some("anthropic/claude-opus-4-8".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            prompt: Some("You are a careful reviewer.\nLine two.".to_string()),
+            plan_execute_mode: None,
+        };
+        let path = create_agent_definition(&root, &def).expect("create");
+        assert_eq!(path, root.join("reviewer.md"));
+
+        // Creating the same name again is rejected.
+        assert!(create_agent_definition(&root, &def).is_err());
+
+        // Read back every field, including the multi-line prompt body.
+        let loaded = read_agent_definition(&path).expect("read");
+        assert_eq!(loaded.name, "reviewer");
+        assert_eq!(loaded.model.as_deref(), Some("anthropic/claude-opus-4-8"));
+        assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            loaded.prompt.as_deref().map(str::trim_end),
+            Some("You are a careful reviewer.\nLine two.")
+        );
+
+        // Edit: change effort + rename → old file removed, new fields persisted.
+        let edited = AgentDefinition {
+            name: "senior-reviewer".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+            ..loaded
+        };
+        let new_path = update_agent_definition(&path, &edited).expect("update");
+        assert_eq!(new_path, root.join("senior-reviewer.md"));
+        assert!(!path.exists(), "old file should be removed on rename");
+        let reloaded = read_agent_definition(&new_path).expect("reload");
+        assert_eq!(reloaded.name, "senior-reviewer");
+        assert_eq!(reloaded.reasoning_effort.as_deref(), Some("medium"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn update_agent_definition_migrates_toml_to_markdown() {
+        let root = temp_dir("agent-migrate");
+        fs::create_dir_all(&root).expect("mkdir");
+        let toml_path = root.join("legacy.toml");
+        fs::write(
+            &toml_path,
+            "name = \"legacy\"\ndescription = \"old\"\nmodel_reasoning_effort = \"low\"\n",
+        )
+        .expect("seed toml");
+
+        let mut def = read_agent_definition(&toml_path).expect("read toml");
+        def.prompt = Some("A freshly added multi-line\nsystem prompt.".to_string());
+        let new_path = update_agent_definition(&toml_path, &def).expect("update");
+
+        assert_eq!(new_path, root.join("legacy.md"));
+        assert!(!toml_path.exists(), "toml should be migrated away");
+        let reloaded = read_agent_definition(&new_path).expect("reload");
+        assert_eq!(reloaded.reasoning_effort.as_deref(), Some("low"));
+        assert!(reloaded
+            .prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("multi-line"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn env_lock() -> &'static Mutex<()> {

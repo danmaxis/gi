@@ -16,6 +16,7 @@
 )]
 mod init;
 mod input;
+mod menu;
 mod models_cmd;
 mod opencode_interop;
 mod render;
@@ -8038,6 +8039,9 @@ fn run_repl(
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    // Interactive sessions enforce the read-before-edit rule: the model must read
+    // a file (or have written it) before edit_file will modify it.
+    tools::enable_read_before_edit();
     run_stale_base_preflight(base_commit.as_deref());
     // First run with no configured provider: scan + offer a model before prompting.
     if models_cmd::is_first_run() && io::stdin().is_terminal() {
@@ -8111,6 +8115,11 @@ fn run_repl(
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        // Refresh the @-mention candidates (files + dirs) each prompt so newly
+        // created files appear; gitignore-aware and capped for responsiveness.
+        editor.set_mention_candidates(workspace_mention_candidates(
+            &env::current_dir().unwrap_or_default(),
+        ));
         // Refresh the themed prompt indicator (theme can change via /theme,
         // and the accent tracks the active mode — Slice 15).
         editor.set_prompt(render::prompt_glyph(
@@ -8175,7 +8184,10 @@ fn run_repl(
                     continue;
                 }
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn_and_continue(&trimmed)?;
+                // Expand @path mentions into inline file/dir context before the
+                // turn (history keeps the original, compact line). Slice: @-mentions.
+                let prompt = expand_at_mentions(&trimmed, &cwd);
+                cli.run_turn_and_continue(&prompt)?;
                 cli.run_mugen_loop()?;
             }
             input::ReadOutcome::Cancel => {}
@@ -9125,6 +9137,259 @@ impl HookAbortMonitor {
     }
 }
 
+/// Whether the line REPL should use an interactive selection modal: both stdin
+/// and stdout must be a TTY (piped/non-interactive falls back to textual lists,
+/// which tests and scripts depend on). Slice: selection modals.
+fn menu_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// Whether modal rendering should emit color (TTY + `NO_COLOR` unset).
+fn menu_color() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+/// Max files/dirs offered for `@`-mention completion (keeps the popup snappy).
+const MENTION_CANDIDATE_CAP: usize = 10_000;
+/// Max lines of a referenced file inlined at submit.
+const MENTION_FILE_MAX_LINES: usize = 400;
+
+/// Build the `@`-mention candidate list for `cwd`: workspace files
+/// (gitignore-aware via `git ls-files`, with a plain-walk fallback) plus their
+/// parent directories (suffixed with `/`). Used by the input box's `@` popup.
+fn workspace_mention_candidates(cwd: &Path) -> Vec<String> {
+    let mut files = git_listed_files(cwd).unwrap_or_else(|| walk_files_fallback(cwd));
+    files.truncate(MENTION_CANDIDATE_CAP);
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in &files {
+        let mut path = Path::new(file);
+        while let Some(parent) = path.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            dirs.insert(format!("{}/", parent.display()));
+            path = parent;
+        }
+    }
+    let mut out: Vec<String> = dirs.into_iter().collect();
+    out.extend(files);
+    out.truncate(MENTION_CANDIDATE_CAP);
+    out
+}
+
+/// Tracked + untracked-not-ignored files via git (respects `.gitignore`).
+fn git_listed_files(cwd: &Path) -> Option<Vec<String>> {
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let files: Vec<String> = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect();
+    if files.is_empty() {
+        None
+    } else {
+        Some(files)
+    }
+}
+
+/// Non-git fallback: shallow recursive walk skipping common heavy/hidden dirs.
+fn walk_files_fallback(root: &Path) -> Vec<String> {
+    const SKIP: [&str; 5] = [".git", "target", "node_modules", ".gi", ".sandbox-home"];
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= MENTION_CANDIDATE_CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if SKIP.contains(&name.as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.display().to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Collect unique `@path` tokens (without the `@`) from a submitted prompt.
+fn collect_at_tokens(input: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for word in input.split_whitespace() {
+        if let Some(rest) = word.strip_prefix('@') {
+            if !rest.is_empty() && seen.insert(rest.to_string()) {
+                out.push(rest.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Expand `@path` mentions in `input` by appending the referenced file contents
+/// (or a directory listing) as fenced blocks, so the model sees them inline.
+/// Paths are confined to `cwd` (a `@../../etc/passwd` escape is skipped with a
+/// warning), and unresolved/binary references are noted, never fatal.
+fn expand_at_mentions(input: &str, cwd: &Path) -> String {
+    let tokens = collect_at_tokens(input);
+    if tokens.is_empty() {
+        return input.to_string();
+    }
+    let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut sections = String::new();
+    let mut warnings = Vec::new();
+    for rel in tokens {
+        let label = rel.trim_end_matches('/');
+        let Ok(canon) = std::fs::canonicalize(cwd.join(&rel)) else {
+            warnings.push(format!("@{rel} (not found)"));
+            continue;
+        };
+        if !canon.starts_with(&cwd_canon) {
+            warnings.push(format!("@{rel} (outside workspace — skipped)"));
+            continue;
+        }
+        if canon.is_dir() {
+            sections.push_str(&format!(
+                "\n```text path={label}/\n{}\n```\n",
+                directory_listing(&canon)
+            ));
+        } else if let Ok(content) = std::fs::read_to_string(&canon) {
+            sections.push_str(&format!(
+                "\n```text path={label}\n{}\n```\n",
+                truncate_mention_content(&content)
+            ));
+        } else {
+            warnings.push(format!("@{rel} (binary or unreadable — skipped)"));
+        }
+    }
+    if sections.is_empty() && warnings.is_empty() {
+        return input.to_string();
+    }
+    let mut out = input.to_string();
+    out.push_str("\n\n⟨referenced files⟩");
+    out.push_str(&sections);
+    if !warnings.is_empty() {
+        out.push_str(&format!("\n(unresolved: {})", warnings.join(", ")));
+    }
+    out
+}
+
+/// Immediate-children listing for a referenced directory (names; dirs get `/`).
+fn directory_listing(dir: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return "(unreadable)".to_string();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_dir() {
+                format!("{name}/")
+            } else {
+                name
+            }
+        })
+        .collect();
+    names.sort();
+    names.truncate(200);
+    names.join("\n")
+}
+
+/// Truncate a referenced file's content to a bounded number of lines.
+fn truncate_mention_content(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= MENTION_FILE_MAX_LINES {
+        return content.to_string();
+    }
+    let shown = lines[..MENTION_FILE_MAX_LINES].join("\n");
+    format!(
+        "{shown}\n… (+{} more lines)",
+        lines.len() - MENTION_FILE_MAX_LINES
+    )
+}
+
+/// Read a single trimmed line interactively (cooked mode). `None` if empty or
+/// cancelled. Used for agent name / rename prompts in the wizard.
+fn prompt_one_line(label: &str) -> Option<String> {
+    print!("{label} ");
+    let _ = io::stdout().flush();
+    match read_line_with_timeout(None) {
+        Ok(Some(line)) => {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Read a multi-line value in the bordered input box (Alt+Enter for newlines,
+/// Enter submits), pre-seeded with `initial`. `None` if cancelled.
+fn prompt_multiline(initial: &str) -> Option<String> {
+    let mut editor = input::LineEditor::new("> ", Vec::new());
+    match editor.read_line_with_initial(initial.to_string()) {
+        Ok(input::ReadOutcome::Submit(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// Run a small single-choice menu and return the chosen label. `None` if cancelled.
+fn pick_menu_value(title: &str, choices: &[&str]) -> Option<String> {
+    let items: Vec<menu::MenuItem> = choices
+        .iter()
+        .map(|choice| menu::MenuItem::new(*choice, "select"))
+        .collect();
+    match menu::run_menu(title, items, false, menu_color(), "—") {
+        Ok(menu::MenuOutcome::Selected { item_index, .. }) => Some(choices[item_index].to_string()),
+        _ => None,
+    }
+}
+
+/// Edit `initial` in `$VISUAL`/`$EDITOR`; returns the saved text. Falls back to
+/// the inline multi-line box when no editor is configured or it fails.
+fn edit_in_external_editor(initial: &str) -> std::io::Result<String> {
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let Some(editor) = editor else {
+        return Ok(prompt_multiline(initial).unwrap_or_else(|| initial.to_string()));
+    };
+    let mut tmp = env::temp_dir();
+    tmp.push(format!("gi-agent-prompt-{}.md", std::process::id()));
+    std::fs::write(&tmp, initial)?;
+    let saved = match std::process::Command::new(&editor).arg(&tmp).status() {
+        Ok(status) if status.success() => {
+            std::fs::read_to_string(&tmp).unwrap_or_else(|_| initial.to_string())
+        }
+        _ => initial.to_string(),
+    };
+    let _ = std::fs::remove_file(&tmp);
+    Ok(saved)
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -9418,24 +9683,20 @@ impl LiveCli {
         self.last_response.take()
     }
 
-    /// Re-print the last turn's tool outputs (and thinking, in raw) at the
-    /// current detail level. The line REPL can't re-render scrollback, so Ctrl+O
-    /// re-emits the detail below the prompt instead. No-op when the last turn had
-    /// nothing detail-bearing. Slice 17.
+    /// Re-print the last turn at the current detail level: the assistant answer
+    /// always, plus tool outputs and (in raw) thinking. The line REPL can't
+    /// re-render scrollback, so Ctrl+O / `/verbose` re-emits it below the prompt.
+    /// Never silent — prints a dim note when there's nothing captured, so the
+    /// keypress always has visible feedback. Slice 17.
     fn reprint_last_turn(&self) {
-        let detailful = self.last_turn_entries.iter().any(|entry| {
-            matches!(
-                entry,
-                tui::TranscriptEntry::Tool { .. } | tui::TranscriptEntry::Thinking(_)
-            )
-        });
-        if !detailful {
+        let level = verbosity();
+        println!("\n\x1b[2m↻ last turn · detail: {}\x1b[0m", level.as_str());
+        if self.last_turn_entries.is_empty() {
+            println!("\x1b[2m(nothing to expand from the last turn)\x1b[0m");
             return;
         }
-        println!(
-            "\n\x1b[2m↻ last turn · detail: {}\x1b[0m",
-            verbosity().as_str()
-        );
+        let answer_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        let mut printed_any = false;
         for entry in &self.last_turn_entries {
             match entry {
                 tui::TranscriptEntry::Tool {
@@ -9454,15 +9715,35 @@ impl LiveCli {
                         TOOL_OUTPUT_DISPLAY_MAX_LINES,
                         TOOL_OUTPUT_DISPLAY_MAX_CHARS,
                     );
-                    if !shown.is_empty() {
+                    if shown.is_empty() {
+                        println!("\x1b[2m(no output)\x1b[0m");
+                    } else {
                         println!("{shown}");
                     }
+                    printed_any = true;
                 }
-                tui::TranscriptEntry::Thinking(text) if verbosity().shows_thinking() => {
+                tui::TranscriptEntry::Thinking(text) if level.shows_thinking() => {
                     println!("\x1b[2m▶ Thinking\n{text}\x1b[0m");
+                    printed_any = true;
+                }
+                tui::TranscriptEntry::Assistant(text) => {
+                    println!("\n{}", render::answer_header(answer_color));
+                    println!(
+                        "{}",
+                        truncate_output_for_display(
+                            text,
+                            TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                            TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                        )
+                    );
+                    printed_any = true;
                 }
                 _ => {}
             }
+        }
+        if !printed_any {
+            // e.g. the turn had only thinking but we're not in raw mode yet.
+            println!("\x1b[2m(press Ctrl+O again to reveal more detail)\x1b[0m");
         }
     }
 
@@ -10043,7 +10324,11 @@ impl LiveCli {
             }
             SlashCommand::Model { model } => self.set_model(model)?,
             SlashCommand::Models => {
-                models_cmd::run_models_command(CliOutputFormat::Text, true)?;
+                if menu_tty() {
+                    models_cmd::run_models_menu(menu_color())?;
+                } else {
+                    models_cmd::run_models_command(CliOutputFormat::Text, true)?;
+                }
                 false
             }
             SlashCommand::Permissions { mode } => self.set_permissions(mode)?,
@@ -10068,8 +10353,14 @@ impl LiveCli {
                 false
             }
             SlashCommand::Memory { args } => {
-                let (text, _) = memory_command(args.as_deref())?;
-                println!("{text}");
+                if args.is_none() && menu_tty() {
+                    if let Err(error) = self.memory_menu() {
+                        eprintln!("{error}");
+                    }
+                } else {
+                    let (text, _) = memory_command(args.as_deref())?;
+                    println!("{text}");
+                }
                 false
             }
             SlashCommand::Opencode { args } => {
@@ -10094,13 +10385,33 @@ impl LiveCli {
                 false
             }
             SlashCommand::Session { action, target } => {
-                self.handle_session_command(action.as_deref(), target.as_deref())?
+                if action.is_none() && target.is_none() && menu_tty() {
+                    if let Err(error) = self.sessions_menu() {
+                        eprintln!("{error}");
+                    }
+                    false
+                } else {
+                    self.handle_session_command(action.as_deref(), target.as_deref())?
+                }
             }
             SlashCommand::Plugins { action, target } => {
-                self.handle_plugins_command(action.as_deref(), target.as_deref())?
+                if action.is_none() && target.is_none() && menu_tty() {
+                    if let Err(error) = self.plugins_menu() {
+                        eprintln!("{error}");
+                    }
+                    false
+                } else {
+                    self.handle_plugins_command(action.as_deref(), target.as_deref())?
+                }
             }
             SlashCommand::Agents { args } => {
-                if let Err(error) = Self::print_agents(args.as_deref(), CliOutputFormat::Text) {
+                if args.is_none() && menu_tty() {
+                    if let Err(error) = self.agents_menu() {
+                        eprintln!("{error}");
+                    }
+                } else if let Err(error) =
+                    Self::print_agents(args.as_deref(), CliOutputFormat::Text)
+                {
                     eprintln!("{error}");
                 }
                 false
@@ -10906,6 +11217,324 @@ impl LiveCli {
             export_path.display(),
             self.runtime.session().messages.len(),
         );
+        Ok(())
+    }
+
+    /// Interactive `/agents` selection modal. Enter activates the agent; the
+    /// `→` sub-menu shows/edits; a pinned first row creates a new agent. The
+    /// edit actions chain the create/edit wizard. Slice: agent wizard.
+    fn agents_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::menu::{run_menu, MenuAction, MenuItem, MenuOutcome};
+        let cwd = env::current_dir()?;
+        let profiles = commands::list_agent_profiles(&cwd)?;
+        // Row 0 is the "new agent" entry; the rest map to profiles[index - 1].
+        let mut items: Vec<MenuItem> = vec![MenuItem::new("+ New agent…", "new").badge("✚")];
+        items.extend(profiles.iter().map(|profile| {
+            let detail = profile
+                .description
+                .clone()
+                .or_else(|| profile.model.clone());
+            let mut item = MenuItem::new(&profile.name, "use");
+            if let Some(detail) = detail {
+                item = item.detail(detail);
+            }
+            item.actions(vec![
+                MenuAction::new("show").key('s'),
+                MenuAction::new("edit prompt").key('p'),
+                MenuAction::new("edit prompt in $EDITOR").key('E'),
+                MenuAction::new("change model").key('m'),
+                MenuAction::new("change effort").key('e'),
+                MenuAction::new("rename").key('r'),
+                MenuAction::new("delete").key('d').destructive(),
+            ])
+        }));
+        let outcome = run_menu(
+            "Agents",
+            items,
+            false,
+            menu_color(),
+            "press ↵ on + New agent",
+        )?;
+        let MenuOutcome::Selected { item_index, action } = outcome else {
+            return Ok(());
+        };
+        if item_index == 0 {
+            return self.agent_create_wizard(&cwd);
+        }
+        let profile = &profiles[item_index - 1];
+        let name = profile.name.clone();
+        match action.as_str() {
+            "use" => self.handle_agent_command(Some(&name))?,
+            "show" => {
+                let report =
+                    commands::handle_agents_slash_command(Some(&format!("show {name}")), &cwd)?;
+                println!("{report}");
+            }
+            other => self.agent_apply_edit(profile, other)?,
+        }
+        Ok(())
+    }
+
+    /// Create a new agent by chaining name → scope → model → effort → prompt,
+    /// reusing the existing input box and selection modals. Slice: agent wizard.
+    fn agent_create_wizard(&mut self, cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(name) = prompt_one_line("Agent name:") else {
+            println!("\x1b[2mcancelled\x1b[0m");
+            return Ok(());
+        };
+        let description = prompt_one_line("Description (when to use it):");
+        // Scope: project .gi/agents vs global ~/.gi/agents (asked each time).
+        let root = match pick_menu_value(
+            "Save where?",
+            &["project (.gi/agents)", "global (~/.gi/agents)"],
+        ) {
+            Some(choice) if choice.starts_with("global") => match env::var_os("HOME") {
+                Some(home) => PathBuf::from(home).join(".gi").join("agents"),
+                None => cwd.join(".gi").join("agents"),
+            },
+            Some(_) => cwd.join(".gi").join("agents"),
+            None => {
+                println!("\x1b[2mcancelled\x1b[0m");
+                return Ok(());
+            }
+        };
+        let model = models_cmd::pick_model(menu_color())?;
+        let reasoning_effort =
+            pick_menu_value("Reasoning effort", &["minimal", "low", "medium", "high"]);
+        println!("\x1b[2mWrite the system prompt (Alt+Enter for newlines, Enter to save):\x1b[0m");
+        let prompt = prompt_multiline("");
+
+        let def = commands::AgentDefinition {
+            name,
+            description,
+            model,
+            reasoning_effort,
+            prompt: prompt.filter(|text| !text.trim().is_empty()),
+            plan_execute_mode: None,
+        };
+        match commands::create_agent_definition(&root, &def) {
+            Ok(path) => println!("\x1b[1m✔ Created agent\x1b[0m {}", path.display()),
+            Err(error) => eprintln!("create failed: {error}"),
+        }
+        Ok(())
+    }
+
+    /// Apply a single edit action to an existing agent, then write it back
+    /// (normalizing to `.md`). Slice: agent wizard.
+    fn agent_apply_edit(
+        &mut self,
+        profile: &commands::AgentProfile,
+        action: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = profile.path.clone() else {
+            eprintln!("this agent has no file on disk to edit");
+            return Ok(());
+        };
+        if action == "delete" {
+            match std::fs::remove_file(&path) {
+                Ok(()) => println!("\x1b[1m✔ Deleted\x1b[0m {}", path.display()),
+                Err(error) => eprintln!("delete failed: {error}"),
+            }
+            return Ok(());
+        }
+        let mut def = commands::read_agent_definition(&path)?;
+        match action {
+            "edit prompt" => {
+                let Some(text) = prompt_multiline(def.prompt.as_deref().unwrap_or("")) else {
+                    return Ok(());
+                };
+                def.prompt = Some(text);
+            }
+            "edit prompt in $EDITOR" => {
+                def.prompt = Some(edit_in_external_editor(
+                    def.prompt.as_deref().unwrap_or(""),
+                )?);
+            }
+            "change model" => {
+                if let Some(model) = models_cmd::pick_model(menu_color())? {
+                    def.model = Some(model);
+                } else {
+                    return Ok(());
+                }
+            }
+            "change effort" => {
+                let Some(effort) =
+                    pick_menu_value("Reasoning effort", &["minimal", "low", "medium", "high"])
+                else {
+                    return Ok(());
+                };
+                def.reasoning_effort = Some(effort);
+            }
+            "rename" => {
+                let Some(name) = prompt_one_line("New name:") else {
+                    return Ok(());
+                };
+                def.name = name;
+            }
+            _ => return Ok(()),
+        }
+        match commands::update_agent_definition(&path, &def) {
+            Ok(new_path) => println!("\x1b[1m✔ Updated\x1b[0m {}", new_path.display()),
+            Err(error) => eprintln!("update failed: {error}"),
+        }
+        Ok(())
+    }
+
+    /// Interactive `/sessions` selection modal. Enter switches; the `→` sub-menu
+    /// forks/deletes. Slice: selection modals.
+    fn sessions_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::menu::{run_menu, MenuAction, MenuItem, MenuOutcome};
+        let sessions = list_managed_sessions()?;
+        if sessions.is_empty() {
+            return self.handle_session_command(None, None).map(|_| ());
+        }
+        let items: Vec<MenuItem> = sessions
+            .iter()
+            .map(|summary| {
+                let label = summary
+                    .branch_name
+                    .clone()
+                    .unwrap_or_else(|| summary.id.clone());
+                MenuItem::new(label, "switch")
+                    .detail(format!("{} msgs", summary.message_count))
+                    .actions(vec![
+                        MenuAction::new("fork").key('f'),
+                        MenuAction::new("delete").key('d').destructive(),
+                    ])
+            })
+            .collect();
+        let outcome = run_menu("Sessions", items, false, menu_color(), "no saved sessions")?;
+        if let MenuOutcome::Selected { item_index, action } = outcome {
+            let id = sessions[item_index].id.clone();
+            // The modal already confirmed a destructive delete, so use the
+            // force variant to avoid a second y/N prompt.
+            let action = if action == "delete" {
+                "delete-force"
+            } else {
+                action.as_str()
+            };
+            self.handle_session_command(Some(action), Some(&id))?;
+        }
+        Ok(())
+    }
+
+    /// Interactive `/plugins` selection modal. Enter toggles enable/disable; the
+    /// `→` sub-menu updates/uninstalls. Slice: selection modals.
+    fn plugins_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::menu::{run_menu, MenuAction, MenuItem, MenuOutcome};
+        let cwd = env::current_dir()?;
+        let payload =
+            plugins_command_payload_for(&cwd, None, None, ConfigWarningMode::SuppressStderr)?;
+        if payload.plugins.is_empty() {
+            println!("{}", payload.message);
+            return Ok(());
+        }
+        let items: Vec<MenuItem> = payload
+            .plugins
+            .iter()
+            .map(|plugin| {
+                let name = plugin
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                let enabled = plugin
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let (badge, default_action) = if enabled {
+                    ("●", "disable")
+                } else {
+                    ("○", "enable")
+                };
+                MenuItem::new(name, default_action)
+                    .badge(badge)
+                    .detail(if enabled { "enabled" } else { "disabled" })
+                    .actions(vec![
+                        MenuAction::new("enable").key('e'),
+                        MenuAction::new("disable").key('d'),
+                        MenuAction::new("update").key('u'),
+                        MenuAction::new("uninstall").key('x').destructive(),
+                        MenuAction::new("show").key('s'),
+                    ])
+            })
+            .collect();
+        let outcome = run_menu(
+            "Plugins",
+            items,
+            false,
+            menu_color(),
+            "install one with /plugins install <path>",
+        )?;
+        if let MenuOutcome::Selected { item_index, action } = outcome {
+            let name = payload.plugins[item_index]
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            self.handle_plugins_command(Some(&action), Some(&name))?;
+        }
+        Ok(())
+    }
+
+    /// Interactive `/memory` selection modal. Enter views the note; `p` pins or
+    /// unpins; the `→` sub-menu deletes. Slice: selection modals.
+    fn memory_menu(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::menu::{run_menu, MenuAction, MenuItem, MenuOutcome};
+        let cwd = env::current_dir()?;
+        let notes = open_memory_store(&cwd).list_notes()?;
+        if notes.is_empty() {
+            let (text, _) = memory_command(Some("list"))?;
+            println!("{text}");
+            return Ok(());
+        }
+        let items: Vec<MenuItem> = notes
+            .iter()
+            .map(|note| {
+                let label: String = note
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(72)
+                    .collect();
+                let mut item = MenuItem::new(label, "view");
+                if note.pinned {
+                    item = item.badge("📌");
+                }
+                if !note.tags.is_empty() {
+                    item = item.detail(note.tags.join(" "));
+                }
+                let pin_action = if note.pinned {
+                    MenuAction::new("unpin").key('p')
+                } else {
+                    MenuAction::new("pin").key('p')
+                };
+                item.actions(vec![pin_action])
+            })
+            .collect();
+        let outcome = run_menu(
+            "Memory",
+            items,
+            true,
+            menu_color(),
+            "add one with /memory note <text>",
+        )?;
+        if let MenuOutcome::Selected { item_index, action } = outcome {
+            let note = &notes[item_index];
+            let command = match action.as_str() {
+                "view" => {
+                    println!("\x1b[2m{}\x1b[0m\n{}", note.id, note.text);
+                    return Ok(());
+                }
+                "pin" => format!("pin {}", note.id),
+                "unpin" => format!("unpin {}", note.id),
+                other => other.to_string(),
+            };
+            let (text, _) = memory_command(Some(&command))?;
+            println!("{text}");
+        }
         Ok(())
     }
 
@@ -23796,6 +24425,107 @@ fn write_mcp_server_fixture(script_path: &Path) {
         ]
         .join("\n");
     fs::write(script_path, script).expect("mcp fixture script should write");
+}
+
+#[cfg(test)]
+mod at_mention_tests {
+    use super::{collect_at_tokens, expand_at_mentions};
+    use std::fs;
+
+    #[test]
+    fn collect_at_tokens_extracts_unique_paths() {
+        let tokens = collect_at_tokens("summarize @src/main.rs and @docs/ and @src/main.rs again");
+        assert_eq!(tokens, vec!["src/main.rs".to_string(), "docs/".to_string()]);
+        // No mentions → empty.
+        assert!(collect_at_tokens("nothing here a@b.com").is_empty());
+    }
+
+    #[test]
+    fn expand_at_mentions_inlines_file_and_warns_on_missing() {
+        let root = std::env::temp_dir().join(format!("gi_at_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).expect("mkdir");
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("write");
+
+        let out = expand_at_mentions("look at @src/main.rs and @missing.txt", &root);
+        assert!(out.contains("⟨referenced files⟩"));
+        assert!(out.contains("path=src/main.rs"));
+        assert!(out.contains("fn main() {}"));
+        assert!(out.contains("unresolved"));
+        assert!(out.contains("@missing.txt"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expand_at_mentions_rejects_paths_outside_workspace() {
+        let root = std::env::temp_dir().join(format!("gi_at_esc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        // /etc/hostname exists on Linux but is outside the workspace root.
+        let out = expand_at_mentions("read @../../../../etc/hostname", &root);
+        assert!(!out.contains("⟨referenced files⟩") || out.contains("outside workspace"));
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod capture_tui_entries_tests {
+    use super::capture_tui_entries;
+    use crate::tui::TranscriptEntry;
+    use runtime::{ContentBlock, ConversationMessage, TokenUsage, TurnSummary};
+
+    fn summary(
+        assistant_messages: Vec<ConversationMessage>,
+        tool_results: Vec<ConversationMessage>,
+    ) -> TurnSummary {
+        TurnSummary {
+            assistant_messages,
+            tool_results,
+            prompt_cache_events: Vec::new(),
+            iterations: 1,
+            usage: TokenUsage::default(),
+            auto_compaction: None,
+        }
+    }
+
+    #[test]
+    fn pairs_tool_use_with_its_result_output() {
+        // An assistant turn that called one tool, plus its result keyed by id.
+        let assistant = ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+            id: "call_1".to_string(),
+            name: "read_file".to_string(),
+            input: "{\"path\":\"x\"}".to_string(),
+        }]);
+        let result =
+            ConversationMessage::tool_result("call_1", "read_file", "file contents here", false);
+
+        let entries = capture_tui_entries(&summary(vec![assistant], vec![result]));
+
+        let tool = entries
+            .iter()
+            .find_map(|entry| match entry {
+                TranscriptEntry::Tool { name, output, .. } => {
+                    Some((name.as_str(), output.as_str()))
+                }
+                _ => None,
+            })
+            .expect("a Tool entry should be captured");
+        assert_eq!(tool.0, "read_file");
+        // Regression guard: the output must be the real result, not empty.
+        assert_eq!(tool.1, "file contents here");
+    }
+
+    #[test]
+    fn captures_final_assistant_answer() {
+        let answer = ConversationMessage::assistant(vec![ContentBlock::Text {
+            text: "the answer".to_string(),
+        }]);
+        let entries = capture_tui_entries(&summary(vec![answer], Vec::new()));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, TranscriptEntry::Assistant(text) if text == "the answer")
+        ));
+    }
 }
 
 #[cfg(test)]

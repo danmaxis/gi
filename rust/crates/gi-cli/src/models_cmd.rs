@@ -236,6 +236,21 @@ pub fn run_models_command(
     };
 
     let (entry, model) = choice;
+    persist_default_model(entry, model)?;
+    println!();
+    println!(
+        "Saved: default model `{model}` via {} (~/.gi/settings.json).",
+        entry.provider.label
+    );
+    println!("New `gi` sessions will use it; override anytime with `gi --model <name>`.");
+    Ok(())
+}
+
+/// Persist the chosen provider/model as the user default (~/.gi/settings.json).
+fn persist_default_model(
+    entry: &ProviderModels,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let kind = entry.provider.kind;
     let base_url = entry.provider.effective_base_url();
     let api_key = api_key_for(kind).unwrap_or_else(|| {
@@ -246,13 +261,80 @@ pub fn run_models_command(
         }
     });
     runtime::save_user_provider_settings(kind, &api_key, base_url.as_deref(), Some(model))?;
-    println!();
-    println!(
-        "Saved: default model `{model}` via {} (~/.gi/settings.json).",
-        entry.provider.label
-    );
-    println!("New `gi` sessions will use it; override anytime with `gi --model <name>`.");
     Ok(())
+}
+
+/// Interactive `/models` selection modal (line-REPL TTY path). Falls back to the
+/// textual report when no providers are configured. Slice: selection modals.
+pub fn run_models_menu(use_color: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::menu::{self, MenuItem, MenuOutcome};
+
+    let discovered = discover_provider_models();
+    let options = selectable_options(&discovered);
+    if options.is_empty() {
+        print_report(&discovered);
+        println!();
+        println!(
+            "  No configured providers found. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST"
+        );
+        println!("  (or run `gi setup`), then rerun `gi models`.");
+        return Ok(());
+    }
+
+    let items: Vec<MenuItem> = options
+        .iter()
+        .map(|(entry, model)| {
+            MenuItem::new(format!("{} · {model}", entry.provider.label), "select")
+        })
+        .collect();
+    let outcome = menu::run_menu(
+        "Models",
+        items,
+        true,
+        use_color,
+        "set ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_HOST, then rerun",
+    )?;
+    if let MenuOutcome::Selected { item_index, .. } = outcome {
+        let (entry, model) = options[item_index];
+        persist_default_model(entry, model)?;
+        println!(
+            "Saved: default model `{model}` via {} (~/.gi/settings.json).",
+            entry.provider.label
+        );
+    }
+    Ok(())
+}
+
+/// Interactive model picker that RETURNS the chosen model id (without persisting
+/// it as the default) — used by the `/agents` wizard to set an agent's model.
+/// `None` when cancelled or no providers are configured.
+pub fn pick_model(use_color: bool) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    use crate::menu::{self, MenuItem, MenuOutcome};
+
+    let discovered = discover_provider_models();
+    let options = selectable_options(&discovered);
+    if options.is_empty() {
+        return Ok(None);
+    }
+    let items: Vec<MenuItem> = options
+        .iter()
+        .map(|(entry, model)| {
+            MenuItem::new(format!("{} · {model}", entry.provider.label), "select")
+        })
+        .collect();
+    match menu::run_menu(
+        "Pick a model",
+        items,
+        true,
+        use_color,
+        "no providers configured",
+    )? {
+        MenuOutcome::Selected { item_index, .. } => {
+            let (_, model) = options[item_index];
+            Ok(Some((*model).to_string()))
+        }
+        MenuOutcome::Cancelled => Ok(None),
+    }
 }
 
 /// First-run heuristic: no provider env var and no persisted provider/model.

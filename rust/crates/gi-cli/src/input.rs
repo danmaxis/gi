@@ -60,6 +60,10 @@ pub struct LineEditor {
     last_cursor_offset: u16,
     last_box_width: u16,
     completions: Vec<String>,
+    /// Candidate paths/resources for `@`-mentions (files, `dir/`, `mcp:...`),
+    /// supplied by the REPL. Filtered into a popup when the token under the
+    /// cursor starts with `@`.
+    mention_candidates: Vec<String>,
     history: Vec<String>,
     color: bool,
 }
@@ -76,9 +80,16 @@ impl LineEditor {
             last_cursor_offset: 0,
             last_box_width: 0,
             completions: normalize_completions(completions),
+            mention_candidates: Vec::new(),
             history: Vec::new(),
             color: std::env::var_os("NO_COLOR").is_none(),
         }
+    }
+
+    /// Provide the `@`-mention candidate list (workspace files, `dir/`, and
+    /// `mcp:server/uri` resources). The REPL builds and caches this.
+    pub fn set_mention_candidates(&mut self, candidates: Vec<String>) {
+        self.mention_candidates = candidates;
     }
 
     /// Set the input box's top-border title (`mode · note · agent`) and the mode
@@ -153,6 +164,44 @@ impl LineEditor {
         )
     }
 
+    /// Build the `@`-mention popup for `prefix` (the text after `@`), or `None`
+    /// when there are no candidates / no matches.
+    fn build_mention_popup(&self, prefix: &str) -> Option<Vec<PopupItem>> {
+        if self.mention_candidates.is_empty() {
+            return None;
+        }
+        let mut scored: Vec<(i64, &String)> = if prefix.is_empty() {
+            self.mention_candidates
+                .iter()
+                .map(|candidate| (0i64, candidate))
+                .collect()
+        } else {
+            self.mention_candidates
+                .iter()
+                .filter_map(|candidate| {
+                    fuzzy_score(candidate, prefix).map(|score| (score, candidate))
+                })
+                .collect()
+        };
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        scored.truncate(POPUP_MAX);
+        if scored.is_empty() {
+            return None;
+        }
+        Some(
+            scored
+                .into_iter()
+                .map(|(_, candidate)| PopupItem {
+                    command: format!("@{candidate}"),
+                    description: mention_kind(candidate).to_string(),
+                    // A directory keeps the popup open so the user can drill in;
+                    // a file/resource is a complete token.
+                    needs_arg: candidate.ends_with('/'),
+                })
+                .collect(),
+        )
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         self.read_line_with_initial(String::new())
     }
@@ -198,8 +247,18 @@ impl LineEditor {
         let mut draft = String::new();
 
         loop {
+            // When the token under the cursor starts with `@`, show the
+            // file/dir/resource mention popup (replacing just that token);
+            // otherwise the slash-command popup (replacing the whole buffer).
+            let mut mention_start: Option<usize> = None;
             let popup = if dismissed {
                 None
+            } else if let Some((start, prefix)) = at_mention_prefix(&buffer, cursor) {
+                let items = self.build_mention_popup(&prefix);
+                if items.is_some() {
+                    mention_start = Some(start);
+                }
+                items
             } else {
                 self.build_popup(&buffer)
             };
@@ -242,7 +301,9 @@ impl LineEditor {
                     self.commit_render(&buffer)?;
                     return Ok(ReadOutcome::CycleVerbosity(std::mem::take(&mut buffer)));
                 }
-                (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
+                // Shift+Enter and Alt+Enter both insert a newline (Ctrl+J does too,
+                // above). Alt+Enter is the most discoverable across terminals.
+                (KeyCode::Enter, modifiers) if enter_inserts_newline(modifiers) => {
                     insert_char(&mut buffer, &mut cursor, '\n');
                     selected = 0;
                     dismissed = false;
@@ -250,6 +311,20 @@ impl LineEditor {
                 (KeyCode::Enter, _) => {
                     if let Some(items) = &popup {
                         if let Some(item) = items.get(selected) {
+                            // A mention completion is inserted in place (the line
+                            // continues); only a command popup submits on Enter.
+                            if let Some(start) = mention_start {
+                                let trailing = if item.needs_arg { "" } else { " " };
+                                splice_token(
+                                    &mut buffer,
+                                    &mut cursor,
+                                    start,
+                                    &format!("{}{trailing}", item.command),
+                                );
+                                selected = 0;
+                                dismissed = false;
+                                continue;
+                            }
                             if item.needs_arg {
                                 buffer = format!("{} ", item.command);
                                 cursor = buffer.chars().count();
@@ -275,12 +350,24 @@ impl LineEditor {
                 (KeyCode::Tab, _) => {
                     if let Some(items) = &popup {
                         if let Some(item) = items.get(selected) {
-                            buffer = if item.needs_arg {
-                                format!("{} ", item.command)
+                            if let Some(start) = mention_start {
+                                // Insert the mention in place; a directory keeps a
+                                // trailing `/` (no space) so the user can drill in.
+                                let trailing = if item.needs_arg { "" } else { " " };
+                                splice_token(
+                                    &mut buffer,
+                                    &mut cursor,
+                                    start,
+                                    &format!("{}{trailing}", item.command),
+                                );
                             } else {
-                                item.command.clone()
-                            };
-                            cursor = buffer.chars().count();
+                                buffer = if item.needs_arg {
+                                    format!("{} ", item.command)
+                                } else {
+                                    item.command.clone()
+                                };
+                                cursor = buffer.chars().count();
+                            }
                             selected = 0;
                         }
                     }
@@ -650,6 +737,54 @@ fn remove_char(buffer: &mut String, char_index: usize) {
     buffer.remove(byte);
 }
 
+/// If the whitespace-delimited token ending at `cursor` is an `@`-mention at a
+/// word boundary (line start or preceded by whitespace — so `a@b` emails don't
+/// trigger), return `(char index of '@', prefix after '@')`.
+fn at_mention_prefix(buffer: &str, cursor: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = buffer.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    // Token must be non-empty and begin with '@'. The boundary is guaranteed:
+    // `start` is either 0 or immediately after whitespace.
+    if start >= cursor || chars[start] != '@' {
+        return None;
+    }
+    let prefix: String = chars[start + 1..cursor].iter().collect();
+    Some((start, prefix))
+}
+
+/// Replace buffer chars `[start, cursor)` with `replacement`, leaving the cursor
+/// just past the inserted text.
+fn splice_token(buffer: &mut String, cursor: &mut usize, start: usize, replacement: &str) {
+    let chars: Vec<char> = buffer.chars().collect();
+    let prefix: String = chars[..start.min(chars.len())].iter().collect();
+    let suffix: String = chars[(*cursor).min(chars.len())..].iter().collect();
+    *buffer = format!("{prefix}{replacement}{suffix}");
+    *cursor = start + replacement.chars().count();
+}
+
+/// Kind tag shown next to an `@`-mention candidate.
+fn mention_kind(candidate: &str) -> &'static str {
+    if candidate.starts_with("mcp:") {
+        "mcp"
+    } else if candidate.ends_with('/') {
+        "dir"
+    } else {
+        "file"
+    }
+}
+
+/// Whether an `Enter` keypress should insert a newline rather than submit.
+/// Shift+Enter and Alt+Enter both continue the line (Ctrl+J does too, handled
+/// separately); plain Enter submits. Alt+Enter is the most portable across
+/// terminals.
+fn enter_inserts_newline(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT) || modifiers.contains(KeyModifiers::ALT)
+}
+
 fn starts_with_ci(candidate: &str, query: &str) -> bool {
     candidate
         .to_ascii_lowercase()
@@ -705,8 +840,9 @@ fn empty_filter_rank(candidate: &str, history: &[String]) -> i64 {
 }
 
 /// Fuzzy score: a case-insensitive prefix wins (shorter candidates rank higher),
-/// then a subsequence match, else `None`.
-fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
+/// then a subsequence match, else `None`. Shared with the selection modal so its
+/// type-to-filter ranks identically to the command popup.
+pub(crate) fn fuzzy_score(candidate: &str, query: &str) -> Option<i64> {
     let cand = candidate.to_ascii_lowercase();
     let query = query.to_ascii_lowercase();
     if cand.starts_with(&query) {
@@ -765,9 +901,56 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        byte_index, char_index_at, command_needs_arg, describe_completion, fuzzy_score,
-        insert_char, normalize_completions, remove_char, starts_with_ci, wrap_buffer, LineEditor,
+        at_mention_prefix, byte_index, char_index_at, command_needs_arg, describe_completion,
+        enter_inserts_newline, fuzzy_score, insert_char, mention_kind, normalize_completions,
+        remove_char, splice_token, starts_with_ci, wrap_buffer, LineEditor,
     };
+    use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn at_mention_prefix_detects_token_at_word_boundary() {
+        // Bare @ at start.
+        assert_eq!(at_mention_prefix("@", 1), Some((0, String::new())));
+        // Mid-sentence after a space.
+        assert_eq!(
+            at_mention_prefix("see @src/ma", 11),
+            Some((4, "src/ma".to_string()))
+        );
+        // Email-like a@b does NOT trigger (no whitespace before @).
+        assert_eq!(at_mention_prefix("mail a@b.com", 12), None);
+        // A plain word is not a mention.
+        assert_eq!(at_mention_prefix("hello", 5), None);
+    }
+
+    #[test]
+    fn splice_token_replaces_the_token_span() {
+        let mut buffer = "see @src/ma".to_string();
+        let mut cursor = 11;
+        splice_token(&mut buffer, &mut cursor, 4, "@src/main.rs ");
+        assert_eq!(buffer, "see @src/main.rs ");
+        assert_eq!(cursor, "see @src/main.rs ".chars().count());
+    }
+
+    #[test]
+    fn mention_kind_tags_files_dirs_and_mcp() {
+        assert_eq!(mention_kind("src/main.rs"), "file");
+        assert_eq!(mention_kind("src/"), "dir");
+        assert_eq!(mention_kind("mcp:server/res"), "mcp");
+    }
+
+    #[test]
+    fn enter_inserts_newline_for_shift_and_alt_only() {
+        // Plain Enter submits (no newline); Shift/Alt continue the line.
+        assert!(!enter_inserts_newline(KeyModifiers::NONE));
+        assert!(enter_inserts_newline(KeyModifiers::SHIFT));
+        assert!(enter_inserts_newline(KeyModifiers::ALT));
+        // Combined modifiers still count as a newline.
+        assert!(enter_inserts_newline(
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        ));
+        // Ctrl+Enter is not a newline here (Ctrl+J handles that case).
+        assert!(!enter_inserts_newline(KeyModifiers::CONTROL));
+    }
 
     #[test]
     fn wrap_buffer_splits_on_newlines_and_width() {

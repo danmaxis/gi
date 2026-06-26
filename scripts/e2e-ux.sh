@@ -121,5 +121,31 @@ else
   echo "  SKIP: no model answered (provider not configured?) — answer-render checks skipped"
 fi
 
+echo "[7] boxed approval + session memory (a → no re-prompt) (needs a model)"
+start_pane 90 30
+tmux send-keys -t "$SESSION" 'Run the shell command: echo hello-from-gi'
+sleep 0.4; tmux send-keys -t "$SESSION" Enter
+boxed=0
+for _ in $(seq 1 15); do
+  sleep 2
+  capture | grep -q 'approve · bash' && { boxed=1; break; }
+  capture | grep -qiE 'no model|not configured|unauthor' && break
+done
+if [ "$boxed" -eq 1 ]; then
+  check "approval is a box titled 'approve · bash'" test "$(count_on_screen 'approve · bash')" -ge 1
+  check "box offers [y] [n] [a] [A] choices" \
+    bash -c "tmux capture-pane -t '$SESSION' -p | grep -q '\[a\]lways this tool'"
+  # Approve for the session, then trigger the same tool again — no new box.
+  send "a"
+  for _ in $(seq 1 8); do sleep 2; capture | grep -q 'hello-from-gi' && break; done
+  tmux send-keys -t "$SESSION" 'Run the shell command: echo second-call'
+  sleep 0.4; tmux send-keys -t "$SESSION" Enter
+  for _ in $(seq 1 10); do sleep 2; capture | grep -q 'second-call' && break; done
+  check "second same-tool call did NOT prompt again" \
+    test "$(capture | grep -c 'approve · bash')" -le 1
+else
+  echo "  SKIP: model didn't call bash (provider not configured?) — approval checks skipped"
+fi
+
 echo "== e2e: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

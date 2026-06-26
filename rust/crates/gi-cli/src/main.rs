@@ -15099,33 +15099,98 @@ fn truncate_inline(text: &str, max: usize) -> String {
 
 /// Concise one-line summary of a tool-call input for the approval prompt, so we
 /// don't dump a whole escaped JSON blob (e.g. a full file's contents). Slice 16.
-fn summarize_permission_input(tool_name: &str, input: &str) -> String {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) else {
-        return truncate_inline(input, 200);
-    };
-    let str_field = |keys: &[&str]| -> Option<String> {
+/// Human-readable byte size (e.g. `512 B`, `3.4 KB`, `1.2 MB`). Slice 17.
+fn human_bytes(n: usize) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// A friendly, human-readable action title + a short preview for the approval
+/// box: write→"Write `<path>` (N lines, size)", edit→"Edit `<path>`" + a 1–3
+/// line diff, bash→"Run shell command" + `$ cmd`. Slice 17.
+fn describe_permission_action(tool_name: &str, input: &str) -> (String, Vec<String>) {
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let field = |keys: &[&str]| -> Option<String> {
         keys.iter()
             .find_map(|key| parsed.get(*key).and_then(serde_json::Value::as_str))
             .map(ToOwned::to_owned)
     };
     match tool_name {
-        "write_file" | "Write" | "edit_file" | "Edit" => {
-            let path = str_field(&["path", "file_path"]).unwrap_or_else(|| "?".to_string());
-            match str_field(&["content", "new_string", "new_str"]) {
-                Some(content) => {
-                    let lines = content.lines().count().max(1);
-                    let bytes = content.len();
-                    format!("{path} ({lines} lines, {bytes} bytes)")
-                }
-                None => path,
-            }
+        "write_file" | "Write" => {
+            let path = field(&["path", "file_path"]).unwrap_or_else(|| "file".to_string());
+            let (lines, size) = field(&["content", "new_string", "new_str"])
+                .map_or((0, 0), |c| (c.lines().count().max(1), c.len()));
+            (
+                format!("Write {path} ({lines} lines, {})", human_bytes(size)),
+                Vec::new(),
+            )
         }
-        "bash" | "Bash" => str_field(&["command", "cmd"]).map_or_else(
-            || truncate_inline(input, 200),
-            |cmd| truncate_inline(&cmd, 200),
-        ),
-        _ => truncate_inline(input, 200),
+        "edit_file" | "Edit" => {
+            let path = field(&["path", "file_path"]).unwrap_or_else(|| "file".to_string());
+            let mut preview = Vec::new();
+            if let Some(old) = field(&["old_string", "old_str"]) {
+                for line in old.lines().filter(|l| !l.trim().is_empty()).take(2) {
+                    preview.push(format!("- {}", truncate_inline(line, 68)));
+                }
+            }
+            if let Some(new) = field(&["new_string", "new_str"]) {
+                for line in new.lines().filter(|l| !l.trim().is_empty()).take(2) {
+                    preview.push(format!("+ {}", truncate_inline(line, 68)));
+                }
+            }
+            (format!("Edit {path}"), preview)
+        }
+        "bash" | "Bash" => {
+            let cmd = field(&["command", "cmd"]).unwrap_or_default();
+            (
+                "Run shell command".to_string(),
+                vec![format!("$ {}", truncate_inline(&cmd, 160))],
+            )
+        }
+        other => (format!("Run {other}"), vec![truncate_inline(input, 160)]),
     }
+}
+
+/// Per-session approval memory so the user isn't re-prompted for the same tool:
+/// `a` records the tool, `A` records all tools. Lives outside the prompter
+/// (which is rebuilt each turn) for the session's lifetime. Slice 17.
+#[derive(Default)]
+struct SessionApprovals {
+    all: bool,
+    tools: std::collections::HashSet<String>,
+}
+
+thread_local! {
+    static SESSION_APPROVALS: std::cell::RefCell<SessionApprovals> =
+        std::cell::RefCell::new(SessionApprovals::default());
+}
+
+fn session_approved(tool: &str) -> bool {
+    SESSION_APPROVALS.with(|cell| {
+        let state = cell.borrow();
+        state.all || state.tools.contains(tool)
+    })
+}
+
+fn approve_tool_for_session(tool: &str) {
+    SESSION_APPROVALS.with(|cell| {
+        cell.borrow_mut().tools.insert(tool.to_string());
+    });
+}
+
+fn approve_all_for_session() {
+    SESSION_APPROVALS.with(|cell| cell.borrow_mut().all = true);
+}
+
+#[cfg(test)]
+fn reset_session_approvals() {
+    SESSION_APPROVALS.with(|cell| *cell.borrow_mut() = SessionApprovals::default());
 }
 
 /// Permission prompter used inside the TUI: auto-approves silently (no
@@ -15145,6 +15210,9 @@ impl runtime::PermissionPrompter for TuiAutoPrompter {
 }
 
 struct CliPermissionPrompter {
+    // Kept for the constructor signature; the boxed prompt no longer shows the
+    // mode escalation (Slice 17 dropped that noise).
+    #[allow(dead_code)]
     current_mode: PermissionMode,
     /// When set, held while prompting so the background "thinking" animation is
     /// paused and the spinner line is cleared first.
@@ -15170,6 +15238,10 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Session memory: a previous `a`/`A` already approved this — don't prompt.
+        if session_approved(&request.tool_name) {
+            return runtime::PermissionPromptDecision::Allow;
+        }
         // Pause the thinking animation (and clear its line) for the prompt.
         let _anim_guard = self.anim_lock.as_ref().map(|lock| {
             lock.lock()
@@ -15178,34 +15250,49 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         if _anim_guard.is_some() {
             print!("\r\x1b[2K");
         }
-        println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
-        if let Some(reason) = &request.reason {
-            println!("  Reason           {reason}");
+
+        let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+        let (action, preview) = describe_permission_action(&request.tool_name, &request.input);
+        let mut body = action;
+        for line in &preview {
+            body.push('\n');
+            body.push_str(line);
         }
+        body.push_str("\n[y]es  [n]o  [a]lways this tool  [A]ll tools");
+        println!();
         println!(
-            "  Input            {}",
-            summarize_permission_input(&request.tool_name, &request.input)
+            "{}",
+            render::panel(
+                Some(&format!("approve · {}", request.tool_name)),
+                &body,
+                use_color
+            )
         );
-        print!("Approve this tool call? [y/N]: ");
+        print!("> ");
         let _ = io::stdout().flush();
 
         let mut response = String::new();
         match io::stdin().read_line(&mut response) {
             Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
+                let answer = response.trim();
+                match answer {
+                    "a" => {
+                        approve_tool_for_session(&request.tool_name);
+                        runtime::PermissionPromptDecision::Allow
+                    }
+                    "A" => {
+                        approve_all_for_session();
+                        runtime::PermissionPromptDecision::Allow
+                    }
+                    _ if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") => {
+                        runtime::PermissionPromptDecision::Allow
+                    }
+                    _ => runtime::PermissionPromptDecision::Deny {
                         reason: format!(
                             "tool '{}' denied by user approval prompt",
                             request.tool_name
                         ),
-                    }
+                    },
                 }
             }
             Err(error) => runtime::PermissionPromptDecision::Deny {
@@ -22789,23 +22876,39 @@ UU conflicted.rs",
 
     #[test]
     fn permission_input_summary_elides_large_writes() {
-        // A big write_file content is reduced to path + size, not dumped.
+        // A big write_file is described as a concise action + size, not dumped.
         let big = "x".repeat(5000);
         let input = serde_json::json!({ "path": "song.html", "content": big }).to_string();
-        let summary = super::summarize_permission_input("write_file", &input);
-        assert!(summary.contains("song.html"));
-        assert!(summary.contains("bytes"));
-        assert!(!summary.contains("xxxx"));
-        assert!(summary.chars().count() < 80);
+        let (action, preview) = super::describe_permission_action("write_file", &input);
+        assert!(action.starts_with("Write song.html"));
+        assert!(action.contains("KB"));
+        assert!(!action.contains("xxxx"));
+        assert!(preview.is_empty());
 
-        // A bash call shows the command; an opaque blob is truncated with a note.
+        // bash → "Run shell command" + a `$ cmd` preview.
         let bash = serde_json::json!({ "command": "mkdir country soul" }).to_string();
-        assert_eq!(
-            super::summarize_permission_input("bash", &bash),
-            "mkdir country soul"
-        );
-        let blob = format!("\"{}\"", "y".repeat(500));
-        assert!(super::summarize_permission_input("mystery", &blob).contains("chars total"));
+        let (action, preview) = super::describe_permission_action("bash", &bash);
+        assert_eq!(action, "Run shell command");
+        assert_eq!(preview, vec!["$ mkdir country soul".to_string()]);
+
+        // edit → an old/new diff preview.
+        let edit = serde_json::json!({ "path": "x.rs", "old_string": "let a=1;", "new_string": "let a=2;" })
+            .to_string();
+        let (action, preview) = super::describe_permission_action("edit_file", &edit);
+        assert_eq!(action, "Edit x.rs");
+        assert!(preview.iter().any(|l| l.starts_with("- ")));
+        assert!(preview.iter().any(|l| l.starts_with("+ ")));
+
+        // Session approval memory: `a` approves one tool, `A` approves all, reset clears.
+        super::reset_session_approvals();
+        assert!(!super::session_approved("write_file"));
+        super::approve_tool_for_session("write_file");
+        assert!(super::session_approved("write_file"));
+        assert!(!super::session_approved("bash"));
+        super::approve_all_for_session();
+        assert!(super::session_approved("bash"));
+        super::reset_session_approvals();
+        assert!(!super::session_approved("write_file"));
 
         // Shift+Tab cycle: default → plan → edit → mugen → default.
         assert_eq!(SessionMode::Default.next(), SessionMode::Plan);
@@ -22836,6 +22939,29 @@ UU conflicted.rs",
             SessionMode::from_permission(PermissionMode::WorkspaceWrite),
             SessionMode::Edit
         );
+    }
+
+    #[test]
+    fn session_approved_tool_auto_allows_without_prompting() {
+        // Integration: a session-approved tool routes through the real prompter
+        // and returns Allow on the fast path — BEFORE any stdin read (so this
+        // test can't block). Slice 17.
+        use runtime::PermissionPrompter as _;
+        super::reset_session_approvals();
+        super::approve_tool_for_session("write_file");
+        let mut prompter = super::CliPermissionPrompter::new(PermissionMode::WorkspaceWrite);
+        let request = runtime::PermissionRequest {
+            tool_name: "write_file".to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::WorkspaceWrite,
+            reason: None,
+        };
+        assert!(matches!(
+            prompter.decide(&request),
+            runtime::PermissionPromptDecision::Allow
+        ));
+        super::reset_session_approvals();
     }
 
     #[test]

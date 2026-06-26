@@ -137,6 +137,62 @@ fn char_display_width(ch: char) -> usize {
     }
 }
 
+/// How much detail the REPL/TUI renders. Cycled with Ctrl+O. Slice 17.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderVerbosity {
+    /// Tool outputs truncated (with a `… Ctrl+O` hint); inputs summarized;
+    /// thinking hidden. The default.
+    #[default]
+    Compact,
+    /// Full tool outputs + full tool inputs; thinking still hidden.
+    Verbose,
+    /// Everything in `Verbose` plus the model's thinking text.
+    Raw,
+}
+
+impl RenderVerbosity {
+    /// Next level in the Ctrl+O cycle: compact → verbose → raw → compact.
+    #[must_use]
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Compact => Self::Verbose,
+            Self::Verbose => Self::Raw,
+            Self::Raw => Self::Compact,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Verbose => "verbose",
+            Self::Raw => "raw",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "verbose" => Some(Self::Verbose),
+            "raw" => Some(Self::Raw),
+            _ => None,
+        }
+    }
+
+    /// Whether tool outputs/inputs are shown in full (no truncation/summary).
+    #[must_use]
+    pub fn shows_full(self) -> bool {
+        !matches!(self, Self::Compact)
+    }
+
+    /// Whether the model's thinking text is revealed.
+    #[must_use]
+    pub fn shows_thinking(self) -> bool {
+        matches!(self, Self::Raw)
+    }
+}
+
 /// SGR foreground sequence for a theme `Color` (truecolor / 256-color; named
 /// colors fall back to no explicit color so the bold attribute still reads).
 fn theme_fg(color: Color) -> String {
@@ -1511,6 +1567,20 @@ mod tests {
             out.contains("\n    \n") || out.contains("\n\n"),
             "paragraphs should be separated by a blank line: {out:?}"
         );
+    }
+
+    #[test]
+    fn render_verbosity_cycles_and_parses() {
+        use super::RenderVerbosity::{Compact, Raw, Verbose};
+        assert_eq!(Compact.cycle(), Verbose);
+        assert_eq!(Verbose.cycle(), Raw);
+        assert_eq!(Raw.cycle(), Compact);
+        assert_eq!(super::RenderVerbosity::parse("raw"), Some(Raw));
+        assert_eq!(super::RenderVerbosity::parse("nope"), None);
+        // compact truncates; verbose/raw show everything; only raw shows thinking.
+        assert!(!Compact.shows_full());
+        assert!(Verbose.shows_full() && Raw.shows_full());
+        assert!(!Verbose.shows_thinking() && Raw.shows_thinking());
     }
 
     #[test]

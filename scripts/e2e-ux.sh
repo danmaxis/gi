@@ -88,6 +88,16 @@ check "still exactly one mugen header" test "$(count_on_screen 'mugen ·')" -eq 
 check "box re-fit to width 90" test "$(box_width)" -eq 90
 send Escape  # clear pending input / abort
 
+echo "[4b] Ctrl+O cycles the detail level in the status line"
+start_pane 90 20
+check "default status has no detail tag" test "$(capture | grep -c 'Ctrl+O)')" -eq 0
+send C-o
+check "Ctrl+O → verbose" test "$(count_on_screen 'verbose (Ctrl+O)')" -ge 1
+send C-o
+check "Ctrl+O → raw" test "$(count_on_screen 'raw (Ctrl+O)')" -ge 1
+send C-o
+check "Ctrl+O → back to compact (no tag)" test "$(capture | grep -c 'Ctrl+O)')" -eq 0
+
 echo "[5] gi --tui renders the full-screen layout"
 start_pane 90 24 --tui
 check "transcript title 'gi ·' present" test "$(count_on_screen 'gi ·')" -ge 1

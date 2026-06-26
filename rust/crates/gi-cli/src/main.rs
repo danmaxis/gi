@@ -3642,7 +3642,13 @@ fn compose_status_line(model: &str, tokens: usize, branch: &str, use_color: bool
     } else {
         format!("~{tokens} tok")
     };
-    let line = format!("◈ {model} · {tok} · {branch}");
+    // Surface the detail level only when it's not the default, so the default
+    // status line (and its test) stay unchanged. Slice 17.
+    let detail = match verbosity() {
+        render::RenderVerbosity::Compact => String::new(),
+        other => format!(" · {} (Ctrl+O)", other.as_str()),
+    };
+    let line = format!("◈ {model} · {tok} · {branch}{detail}");
     if use_color {
         format!("\x1b[2m{line}\x1b[0m")
     } else {
@@ -8183,6 +8189,12 @@ fn run_repl(
                 if let Err(error) = cli.set_mode(next, false) {
                     eprintln!("{error}");
                 }
+                pending_input = Some(buffer);
+            }
+            input::ReadOutcome::CycleVerbosity(buffer) => {
+                // Cycle the detail level; the status line shows the new level and
+                // the prompt redraws in place (carrying the typed text). Slice 17.
+                cycle_verbosity();
                 pending_input = Some(buffer);
             }
             input::ReadOutcome::Exit => {
@@ -15647,7 +15659,16 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { thinking } => {
-                        if !block_has_thinking_summary {
+                        // Raw detail reveals the thinking text (dim, streamed);
+                        // otherwise just a one-line summary. Slice 17.
+                        if verbosity().shows_thinking() && self.emit_output {
+                            if !block_has_thinking_summary {
+                                let _ = write!(out, "\n\x1b[2m▶ Thinking\x1b[0m\n");
+                                block_has_thinking_summary = true;
+                            }
+                            let _ = write!(out, "\x1b[2m{thinking}\x1b[0m");
+                            let _ = out.flush();
+                        } else if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
                         }
@@ -16307,8 +16328,27 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
-const DISPLAY_TRUNCATION_NOTICE: &str =
-    "\x1b[2m… output truncated for display; full result preserved in session.\x1b[0m";
+thread_local! {
+    /// Current detail level, cycled with Ctrl+O (`/verbose`). Slice 17.
+    static RENDER_VERBOSITY: std::cell::Cell<render::RenderVerbosity> =
+        const { std::cell::Cell::new(render::RenderVerbosity::Compact) };
+}
+
+fn verbosity() -> render::RenderVerbosity {
+    RENDER_VERBOSITY.with(std::cell::Cell::get)
+}
+
+fn set_verbosity(level: render::RenderVerbosity) {
+    RENDER_VERBOSITY.with(|cell| cell.set(level));
+}
+
+/// Advance the detail level one step (Ctrl+O) and return the new level. Slice 17.
+fn cycle_verbosity() -> render::RenderVerbosity {
+    let next = verbosity().cycle();
+    set_verbosity(next);
+    next
+}
+
 const READ_DISPLAY_MAX_LINES: usize = 80;
 const READ_DISPLAY_MAX_CHARS: usize = 6_000;
 const TOOL_OUTPUT_DISPLAY_MAX_LINES: usize = 60;
@@ -16620,6 +16660,10 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
     if original.is_empty() {
         return String::new();
     }
+    // In verbose/raw detail, show the full output (Ctrl+O). Slice 17.
+    if verbosity().shows_full() {
+        return original.to_string();
+    }
 
     let mut preview_lines = Vec::new();
     let mut used_chars = 0usize;
@@ -16654,7 +16698,13 @@ fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize
         if !preview.is_empty() {
             preview.push('\n');
         }
-        preview.push_str(DISPLAY_TRUNCATION_NOTICE);
+        let hidden = original.lines().count().saturating_sub(preview_lines.len());
+        let hint = if hidden > 0 {
+            format!("… +{hidden} lines — Ctrl+O to expand")
+        } else {
+            "… truncated — Ctrl+O to expand".to_string()
+        };
+        preview.push_str(&format!("\x1b[2m{hint}\x1b[0m"));
     }
     preview
 }
@@ -22400,7 +22450,7 @@ UU conflicted.rs",
         assert!(rendered.contains("line 000"));
         assert!(rendered.contains("line 079"));
         assert!(!rendered.contains("line 199"));
-        assert!(rendered.contains("full result preserved in session"));
+        assert!(rendered.contains("Ctrl+O to expand"));
         assert!(output.contains("line 199"));
     }
 
@@ -22422,7 +22472,7 @@ UU conflicted.rs",
         assert!(rendered.contains("stdout 000"));
         assert!(rendered.contains("stdout 059"));
         assert!(!rendered.contains("stdout 119"));
-        assert!(rendered.contains("full result preserved in session"));
+        assert!(rendered.contains("Ctrl+O to expand"));
         assert!(output.contains("stdout 119"));
     }
 
@@ -22444,7 +22494,7 @@ UU conflicted.rs",
         assert!(rendered.contains("payload 040"));
         assert!(!rendered.contains("payload 080"));
         assert!(!rendered.contains("payload 119"));
-        assert!(rendered.contains("full result preserved in session"));
+        assert!(rendered.contains("Ctrl+O to expand"));
         assert!(output.contains("payload 119"));
     }
 
@@ -22461,7 +22511,7 @@ UU conflicted.rs",
         assert!(rendered.contains("raw 000"));
         assert!(rendered.contains("raw 059"));
         assert!(!rendered.contains("raw 119"));
-        assert!(rendered.contains("full result preserved in session"));
+        assert!(rendered.contains("Ctrl+O to expand"));
         assert!(output.contains("raw 119"));
     }
 
@@ -22962,6 +23012,27 @@ UU conflicted.rs",
             runtime::PermissionPromptDecision::Allow
         ));
         super::reset_session_approvals();
+    }
+
+    #[test]
+    fn tool_output_truncation_respects_verbosity() {
+        // Integration: the shared verbosity level gates truncate_output_for_display
+        // — compact truncates with a Ctrl+O hint, verbose shows everything. Slice 17.
+        let long = (0..100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        super::set_verbosity(crate::render::RenderVerbosity::Compact);
+        let compact = super::truncate_output_for_display(&long, 10, 100_000);
+        assert!(compact.contains("Ctrl+O to expand"));
+        assert!(!compact.contains("line99"));
+
+        super::set_verbosity(crate::render::RenderVerbosity::Verbose);
+        let verbose = super::truncate_output_for_display(&long, 10, 100_000);
+        assert!(!verbose.contains("Ctrl+O"));
+        assert!(verbose.contains("line99"));
+
+        super::set_verbosity(crate::render::RenderVerbosity::Compact); // reset
     }
 
     #[test]

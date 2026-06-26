@@ -23,6 +23,9 @@ pub enum ReadOutcome {
     /// Shift+Tab pressed at the prompt — cycle the operating mode, carrying the
     /// in-progress buffer so the next prompt is re-seeded with it. Slice 15.
     CycleMode(String),
+    /// Ctrl+O pressed — cycle the detail level (compact→verbose→raw), carrying
+    /// the in-progress buffer (re-seeded in place). Slice 17.
+    CycleVerbosity(String),
 }
 
 const POPUP_MAX: usize = 5;
@@ -164,10 +167,13 @@ impl LineEditor {
         enable_raw_mode()?;
         let outcome = self.edit(initial);
         let _ = disable_raw_mode();
-        // A mode cycle keeps the cursor inside the box so the next render can
-        // clear + redraw it in place; everything else commits a newline so the
-        // following output starts on a fresh line. Slice 16.
-        if !matches!(outcome, Ok(ReadOutcome::CycleMode(_))) {
+        // A mode/detail cycle keeps the cursor inside the box so the next render
+        // can clear + redraw it in place; everything else commits a newline so
+        // the following output starts on a fresh line. Slice 16/17.
+        if !matches!(
+            outcome,
+            Ok(ReadOutcome::CycleMode(_) | ReadOutcome::CycleVerbosity(_))
+        ) {
             let mut stdout = io::stdout();
             let _ = write!(stdout, "\r\n");
             let _ = stdout.flush();
@@ -231,6 +237,12 @@ impl LineEditor {
                     insert_char(&mut buffer, &mut cursor, '\n');
                     selected = 0;
                     dismissed = false;
+                }
+                // Ctrl+O cycles the detail level; keep the in-progress text and
+                // redraw in place (like Shift+Tab). Slice 17.
+                (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                    self.render(&buffer, cursor, None, 0)?;
+                    return Ok(ReadOutcome::CycleVerbosity(std::mem::take(&mut buffer)));
                 }
                 (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
                     insert_char(&mut buffer, &mut cursor, '\n');

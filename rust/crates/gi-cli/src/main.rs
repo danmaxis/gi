@@ -8251,6 +8251,9 @@ struct LiveCli {
     /// Final assistant text of the last completed turn, for the TUI transcript.
     /// Slice 14b.
     last_response: Option<String>,
+    /// Structured entries (thinking, tool calls, answer) captured from the last
+    /// TUI turn so Ctrl+O can re-render them at any detail level. Slice 17.
+    last_turn_entries: Vec<tui::TranscriptEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -9162,6 +9165,7 @@ impl LiveCli {
             mugen_max_turns: runtime::DEFAULT_MUGEN_MAX_TURNS,
             plan_execute_mode: None,
             last_response: None,
+            last_turn_entries: Vec::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -9421,10 +9425,11 @@ impl LiveCli {
 
         set_tui_active(true);
         let mut terminal = ratatui::init();
-        let mut transcript: Vec<tui::TranscriptEntry> = vec![tui::TranscriptEntry {
-            role: tui::Role::System,
-            text: format!("Connected: {} · Esc or /exit to quit", self.model),
-        }];
+        let mut transcript: Vec<tui::TranscriptEntry> =
+            vec![tui::TranscriptEntry::System(format!(
+                "Connected: {} · Esc or /exit to quit · Ctrl+O for detail",
+                self.model
+            ))];
         let mut input = String::new();
         let mut scroll_back: u16 = 0;
 
@@ -9457,6 +9462,7 @@ impl LiveCli {
                             status: &status,
                             scroll_back,
                             busy,
+                            verbosity: verbosity(),
                         },
                     )
                 })?;
@@ -9480,6 +9486,11 @@ impl LiveCli {
 
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                // Ctrl+O cycles the detail level — the next draw re-renders the
+                // captured transcript (tool outputs / thinking) at that level. Slice 17.
+                (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                    cycle_verbosity();
+                }
                 (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => input.push('\n'),
                 (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.push('\n'),
                 (KeyCode::Backspace, _) => {
@@ -9497,28 +9508,20 @@ impl LiveCli {
                     if matches!(prompt.as_str(), "/exit" | "/quit") {
                         break Ok(());
                     }
-                    transcript.push(tui::TranscriptEntry {
-                        role: tui::Role::User,
-                        text: prompt.clone(),
-                    });
+                    transcript.push(tui::TranscriptEntry::User(prompt.clone()));
                     // Paint a thinking frame, then run the turn silently on the
                     // same screen (no alt-screen flip) and record the result.
                     let _ = render(&mut terminal, self, &transcript, "", scroll_back, true);
                     self.record_prompt_history(&prompt);
                     match self.run_turn_capture(&prompt) {
                         Ok(()) => {
-                            let response = self.take_last_response().unwrap_or_default();
-                            if !response.trim().is_empty() {
-                                transcript.push(tui::TranscriptEntry {
-                                    role: tui::Role::Assistant,
-                                    text: response.trim().to_string(),
-                                });
-                            }
+                            // Append the structured entries (thinking, tool calls,
+                            // answer) so Ctrl+O can re-render them. Slice 17.
+                            transcript.append(&mut self.last_turn_entries);
                         }
-                        Err(error) => transcript.push(tui::TranscriptEntry {
-                            role: tui::Role::System,
-                            text: format!("error: {error}"),
-                        }),
+                        Err(error) => {
+                            transcript.push(tui::TranscriptEntry::System(format!("error: {error}")))
+                        }
                     }
                 }
                 (KeyCode::Char(ch), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
@@ -9866,6 +9869,7 @@ impl LiveCli {
         let summary = result?;
         self.replace_runtime(runtime)?;
         self.last_response = Some(final_assistant_text(&summary));
+        self.last_turn_entries = capture_tui_entries(&summary);
         maybe_capture_memory_turn(input, &summary);
         self.persist_session()?;
         Ok(())
@@ -15990,6 +15994,62 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/// Build structured TUI transcript entries from a completed turn — thinking,
+/// each tool call paired with its result, then the final answer — so Ctrl+O can
+/// re-render them at any detail level. Slice 17.
+fn capture_tui_entries(summary: &runtime::TurnSummary) -> Vec<tui::TranscriptEntry> {
+    let mut entries = Vec::new();
+
+    let thinking: String = summary
+        .assistant_messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if !thinking.trim().is_empty() {
+        entries.push(tui::TranscriptEntry::Thinking(thinking.trim().to_string()));
+    }
+
+    // Pair each tool call with its result by id.
+    let mut results: std::collections::HashMap<String, (String, bool)> =
+        std::collections::HashMap::new();
+    for message in &summary.tool_results {
+        for block in &message.blocks {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } = block
+            {
+                results.insert(tool_use_id.clone(), (output.clone(), *is_error));
+            }
+        }
+    }
+    for message in &summary.assistant_messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                let (output, is_error) = results.get(id).cloned().unwrap_or_default();
+                entries.push(tui::TranscriptEntry::Tool {
+                    name: name.clone(),
+                    output,
+                    is_error,
+                });
+            }
+        }
+    }
+
+    let answer = final_assistant_text(summary);
+    if !answer.trim().is_empty() {
+        entries.push(tui::TranscriptEntry::Assistant(answer.trim().to_string()));
+    }
+    entries
 }
 
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {

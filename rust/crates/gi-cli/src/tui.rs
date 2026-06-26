@@ -9,17 +9,18 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-/// Who produced a transcript entry.
-pub(crate) enum Role {
-    User,
-    Assistant,
-    System,
-}
-
-/// One line of the scrollback transcript.
-pub(crate) struct TranscriptEntry {
-    pub role: Role,
-    pub text: String,
+/// One entry in the scrollback transcript. Tool/thinking entries keep their raw
+/// data so Ctrl+O can re-render them at any detail level. Slice 17.
+pub(crate) enum TranscriptEntry {
+    User(String),
+    Assistant(String),
+    System(String),
+    Tool {
+        name: String,
+        output: String,
+        is_error: bool,
+    },
+    Thinking(String),
 }
 
 /// Everything the renderer needs for one frame.
@@ -36,6 +37,8 @@ pub(crate) struct TuiState<'a> {
     pub scroll_back: u16,
     /// True while a turn is running (shows a thinking indicator). Slice 14b.
     pub busy: bool,
+    /// Detail level (Ctrl+O): controls tool-output truncation + thinking. Slice 17.
+    pub verbosity: crate::render::RenderVerbosity,
 }
 
 /// Accent color for the active mode (mirrors `render::mode_accent`).
@@ -122,16 +125,74 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
     // Transcript pane.
     let inner_w = chunks[0].width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
+    let block = |body: &str, head_style: Style, rest_dim: bool| -> Vec<Line<'static>> {
+        wrap_line(body, inner_w.max(1))
+            .into_iter()
+            .enumerate()
+            .map(|(i, wl)| {
+                let style = if i == 0 {
+                    head_style
+                } else if rest_dim {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                Line::styled(wl, style)
+            })
+            .collect()
+    };
+    let dim = Style::default().fg(Color::DarkGray);
     for entry in state.transcript {
-        let (prefix, style) = match entry.role {
-            Role::User => ("❯ ", Style::default().fg(accent_color).bold()),
-            Role::Assistant => ("", Style::default()),
-            Role::System => ("· ", Style::default().fg(Color::DarkGray)),
-        };
-        let body = format!("{prefix}{}", entry.text);
-        for (i, wl) in wrap_line(&body, inner_w.max(1)).into_iter().enumerate() {
-            let line_style = if i == 0 { style } else { Style::default() };
-            lines.push(Line::styled(wl, line_style));
+        match entry {
+            TranscriptEntry::User(text) => {
+                lines.extend(block(
+                    &format!("❯ {text}"),
+                    Style::default().fg(accent_color).bold(),
+                    false,
+                ));
+            }
+            TranscriptEntry::Assistant(text) => {
+                lines.extend(block(&format!("◂ gi  {text}"), Style::default(), false));
+            }
+            TranscriptEntry::System(text) => {
+                lines.extend(block(&format!("· {text}"), dim, true));
+            }
+            TranscriptEntry::Thinking(text) => {
+                if !state.verbosity.shows_thinking() {
+                    continue;
+                }
+                lines.extend(block(&format!("▶ thinking  {text}"), dim, true));
+            }
+            TranscriptEntry::Tool {
+                name,
+                output,
+                is_error,
+            } => {
+                let mark = if *is_error { "✘" } else { "⚙" };
+                let head = Style::default().fg(if *is_error {
+                    Color::Rgb(236, 72, 120)
+                } else {
+                    accent_color
+                });
+                lines.extend(block(&format!("{mark} {name}"), head, false));
+                // Output: full in verbose/raw, else first lines + a Ctrl+O hint.
+                let out_lines: Vec<&str> = output.lines().collect();
+                let limit = if state.verbosity.shows_full() {
+                    out_lines.len()
+                } else {
+                    6
+                };
+                for line in out_lines.iter().take(limit) {
+                    lines.extend(block(&format!("  {line}"), dim, true));
+                }
+                if out_lines.len() > limit {
+                    lines.extend(block(
+                        &format!("  … +{} lines — Ctrl+O to expand", out_lines.len() - limit),
+                        dim,
+                        true,
+                    ));
+                }
+            }
         }
         lines.push(Line::raw(""));
     }

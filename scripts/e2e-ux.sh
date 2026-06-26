@@ -157,5 +157,25 @@ else
   echo "  SKIP: model didn't call bash (provider not configured?) — approval checks skipped"
 fi
 
+echo "[8] TUI Ctrl+O re-renders captured tool output per detail level (needs a model)"
+start_pane 90 30 --tui
+tmux send-keys -t "$SESSION" 'Run the shell command: seq 1 40'
+sleep 0.4; tmux send-keys -t "$SESSION" Enter
+tooled=0
+for _ in $(seq 1 18); do
+  sleep 2
+  capture | grep -q '⚙ bash' && { tooled=1; break; }
+done
+if [ "$tooled" -eq 1 ]; then
+  send PageUp; send PageUp; send PageUp; send PageUp
+  check "compact truncates tool output with a Ctrl+O hint" test "$(count_on_screen 'Ctrl+O to expand')" -ge 1
+  send C-o   # → verbose
+  send PageUp; send PageUp; send PageUp; send PageUp
+  check "Ctrl+O → verbose expands (no truncation hint)" test "$(count_on_screen 'Ctrl+O to expand')" -eq 0
+  send Escape
+else
+  echo "  SKIP: model didn't call bash in the TUI — TUI Ctrl+O checks skipped"
+fi
+
 echo "== e2e: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

@@ -34,6 +34,8 @@ pub(crate) struct TuiState<'a> {
     pub status: &'a str,
     /// Lines scrolled up from the bottom (PageUp).
     pub scroll_back: u16,
+    /// True while a turn is running (shows a thinking indicator). Slice 14b.
+    pub busy: bool,
 }
 
 /// Accent color for the active mode (mirrors `render::mode_accent`).
@@ -147,17 +149,29 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         .scroll((scroll, 0));
     frame.render_widget(transcript, chunks[0]);
 
-    // Input box.
-    let input_line = Line::from(vec![
-        Span::styled("❯ ", Style::default().fg(accent_color).bold()),
-        Span::raw(state.input),
-    ]);
+    // Input box — or a thinking indicator while a turn runs.
+    let input_line = if state.busy {
+        Line::from(vec![Span::styled(
+            "技 thinking…",
+            Style::default().fg(accent_color).bold(),
+        )])
+    } else {
+        Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(accent_color).bold()),
+            Span::raw(state.input),
+        ])
+    };
+    let input_title = if state.busy {
+        " working — Ctrl+C to interrupt "
+    } else {
+        " message · Enter to send · Shift+Enter newline · Esc to quit "
+    };
     let input = Paragraph::new(input_line)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border)
-                .title(" message · Enter to send · Shift+Enter newline · Esc to quit "),
+                .title(input_title),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[1]);

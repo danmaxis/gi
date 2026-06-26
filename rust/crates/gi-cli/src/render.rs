@@ -97,6 +97,46 @@ pub fn theme_swatch(name: &str, use_color: bool) -> String {
     )
 }
 
+/// Approximate terminal display width of `text` in columns, counting East-Asian
+/// wide characters (CJK, kana, fullwidth, most emoji) as 2 and combining/control
+/// marks as 0. Used so box borders line up when titles/content contain wide
+/// glyphs like `無限`. Slice 16.
+#[must_use]
+pub fn display_width(text: &str) -> usize {
+    text.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    let c = ch as u32;
+    // C0/C1 controls and DEL → zero width.
+    if c < 0x20 || (0x7f..0xa0).contains(&c) {
+        return 0;
+    }
+    // Common combining-mark ranges → zero width.
+    if (0x0300..0x0370).contains(&c)
+        || (0x1AB0..0x1B00).contains(&c)
+        || (0x20D0..0x2100).contains(&c)
+    {
+        return 0;
+    }
+    // East-Asian wide / fullwidth ranges (covers CJK ideographs, kana, Hangul,
+    // fullwidth forms) and the common emoji/symbol blocks.
+    let wide = (0x1100..=0x115F).contains(&c)
+        || (0x2E80..=0xA4CF).contains(&c)
+        || (0xAC00..=0xD7A3).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFE30..=0xFE4F).contains(&c)
+        || (0xFF00..=0xFF60).contains(&c)
+        || (0xFFE0..=0xFFE6).contains(&c)
+        || (0x1F300..=0x1FAFF).contains(&c)
+        || (0x20000..=0x3FFFD).contains(&c);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
 /// SGR foreground sequence for a theme `Color` (truecolor / 256-color; named
 /// colors fall back to no explicit color so the bold attribute still reads).
 fn theme_fg(color: Color) -> String {
@@ -485,13 +525,9 @@ fn normalize_theme_name(name: &str) -> String {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Spinner {
-    frame_index: usize,
-}
+pub struct Spinner {}
 
 impl Spinner {
-    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -503,15 +539,15 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
-        self.frame_index += 1;
+        // No braille frame — the thinking label animates via the cycling dojo
+        // kanji itself (the `label`). Slice 16.
         queue!(
             out,
             SavePosition,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(theme.spinner_active),
-            Print(format!("{frame} {label}")),
+            Print(label.to_string()),
             ResetColor,
             RestorePosition
         )?;
@@ -524,7 +560,6 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        self.frame_index = 0;
         execute!(
             out,
             MoveToColumn(0),
@@ -542,7 +577,6 @@ impl Spinner {
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
-        self.frame_index = 0;
         execute!(
             out,
             MoveToColumn(0),
@@ -1580,6 +1614,17 @@ mod tests {
                 .unwrap()
                 .contains('\u{1b}')
         );
+    }
+
+    #[test]
+    fn display_width_counts_wide_glyphs_as_two() {
+        assert_eq!(super::display_width("abc"), 3);
+        // 無限 — two CJK ideographs, 4 columns.
+        assert_eq!(super::display_width("無限"), 4);
+        // Mixed: "mugen · 無限" → 8 ascii/punct + 4 = 12.
+        assert_eq!(super::display_width("mugen · 無限"), 12);
+        // The themed glyph and box chars are narrow.
+        assert_eq!(super::display_width("❯ ╭─╮"), 5);
     }
 
     #[test]

@@ -8658,12 +8658,22 @@ fn build_runtime_mcp_state(
     // a subagent. Slices 15b / 15c.
     let plan_enabled = plan_tools() && !subagent_active();
     let mugen_enabled = mugen_tools() && !subagent_active();
-    let local_runtime_tools = local_runtime_tool_definitions(
+    let mut local_runtime_tools = local_runtime_tool_definitions(
         runtime_config.memory().enabled(),
         spawn_enabled,
         plan_enabled,
         mugen_enabled,
     );
+    // The TUI can't service stdin/stdout-driven interactive tools without
+    // corrupting the alt-screen, so drop them while it owns the terminal. Slice 14b.
+    if tui_active() {
+        local_runtime_tools.retain(|tool| {
+            !matches!(
+                tool.name.as_str(),
+                "ask_user" | "exit_plan_mode" | "task_complete"
+            )
+        });
+    }
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, local_runtime_tools));
     };
@@ -9395,6 +9405,7 @@ impl LiveCli {
     fn run_tui_loop(&mut self, status_branch: &str) -> Result<(), Box<dyn std::error::Error>> {
         use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
+        set_tui_active(true);
         let mut terminal = ratatui::init();
         let mut transcript: Vec<tui::TranscriptEntry> = vec![tui::TranscriptEntry {
             role: tui::Role::System,
@@ -9403,28 +9414,42 @@ impl LiveCli {
         let mut input = String::new();
         let mut scroll_back: u16 = 0;
 
+        // Render one frame; `busy` shows the thinking indicator. Helper closure so
+        // the submit path can paint a "thinking" frame before the (blocking) turn.
         let outcome = loop {
-            let status = compose_status_line(
-                &self.model,
-                self.runtime.estimated_tokens(),
-                status_branch,
-                false,
-            );
-            let title = self.header_label();
-            let mode = self.mode.as_str().to_string();
-            if let Err(error) = terminal.draw(|frame| {
-                tui::draw(
-                    frame,
-                    &tui::TuiState {
-                        transcript: &transcript,
-                        input: &input,
-                        title: &title,
-                        mode: &mode,
-                        status: &status,
-                        scroll_back,
-                    },
-                )
-            }) {
+            let render = |terminal: &mut ratatui::DefaultTerminal,
+                          this: &Self,
+                          transcript: &[tui::TranscriptEntry],
+                          input: &str,
+                          scroll_back: u16,
+                          busy: bool|
+             -> std::io::Result<()> {
+                let status = compose_status_line(
+                    &this.model,
+                    this.runtime.estimated_tokens(),
+                    status_branch,
+                    false,
+                );
+                let title = this.header_label();
+                let mode = this.mode.as_str().to_string();
+                terminal.draw(|frame| {
+                    tui::draw(
+                        frame,
+                        &tui::TuiState {
+                            transcript,
+                            input,
+                            title: &title,
+                            mode: &mode,
+                            status: &status,
+                            scroll_back,
+                            busy,
+                        },
+                    )
+                })?;
+                Ok(())
+            };
+            if let Err(error) = render(&mut terminal, self, &transcript, &input, scroll_back, false)
+            {
                 break Err(Box::new(error) as Box<dyn std::error::Error>);
             }
 
@@ -9462,22 +9487,20 @@ impl LiveCli {
                         role: tui::Role::User,
                         text: prompt.clone(),
                     });
-                    // Suspend the TUI, run the turn with normal streaming, resume.
-                    ratatui::restore();
+                    // Paint a thinking frame, then run the turn silently on the
+                    // same screen (no alt-screen flip) and record the result.
+                    let _ = render(&mut terminal, self, &transcript, "", scroll_back, true);
                     self.record_prompt_history(&prompt);
-                    let turn = self
-                        .run_turn_and_continue(&prompt)
-                        .and_then(|()| self.run_mugen_loop());
-                    let response = self.take_last_response().unwrap_or_default();
-                    terminal = ratatui::init();
-                    match turn {
-                        Ok(()) if !response.trim().is_empty() => {
-                            transcript.push(tui::TranscriptEntry {
-                                role: tui::Role::Assistant,
-                                text: response.trim().to_string(),
-                            });
+                    match self.run_turn_capture(&prompt) {
+                        Ok(()) => {
+                            let response = self.take_last_response().unwrap_or_default();
+                            if !response.trim().is_empty() {
+                                transcript.push(tui::TranscriptEntry {
+                                    role: tui::Role::Assistant,
+                                    text: response.trim().to_string(),
+                                });
+                            }
                         }
-                        Ok(()) => {}
                         Err(error) => transcript.push(tui::TranscriptEntry {
                             role: tui::Role::System,
                             text: format!("error: {error}"),
@@ -9492,6 +9515,7 @@ impl LiveCli {
         };
 
         ratatui::restore();
+        set_tui_active(false);
         self.persist_session()?;
         outcome
     }
@@ -9814,6 +9838,22 @@ impl LiveCli {
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
+        Ok(())
+    }
+
+    /// Run a turn for the TUI: silent (no streaming/spinner/stdout, so the
+    /// alt-screen stays intact), auto-approving tool calls. Stores the final
+    /// assistant text in `last_response` for the transcript. Slice 14b.
+    fn run_turn_capture(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
+        let mut prompter = TuiAutoPrompter;
+        let result = runtime.run_turn(input, Some(&mut prompter));
+        hook_abort_monitor.stop();
+        let summary = result?;
+        self.replace_runtime(runtime)?;
+        self.last_response = Some(final_assistant_text(&summary));
+        maybe_capture_memory_turn(input, &summary);
+        self.persist_session()?;
         Ok(())
     }
 
@@ -15086,6 +15126,22 @@ fn summarize_permission_input(tool_name: &str, input: &str) -> String {
     }
 }
 
+/// Permission prompter used inside the TUI: auto-approves silently (no
+/// stdin/stdout, which would corrupt the alt-screen). The interactive
+/// approval/plan tools are disabled in TUI mode, and the user opted into
+/// `--tui` explicitly; in-TUI approval prompts are a documented follow-up.
+/// Slice 14b.
+struct TuiAutoPrompter;
+
+impl runtime::PermissionPrompter for TuiAutoPrompter {
+    fn decide(
+        &mut self,
+        _request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        runtime::PermissionPromptDecision::Allow
+    }
+}
+
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
     /// When set, held while prompting so the background "thinking" animation is
@@ -17322,6 +17378,11 @@ thread_local! {
     /// Set by `run_turn` when the turn was cancelled by the user (ESC/Ctrl+C) so
     /// the mugen loop can break instead of auto-continuing. Slice 15c.
     static TURN_INTERRUPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while the full-screen TUI owns the terminal, so stdin/stdout-driven
+    /// interactive runtime tools (ask_user, exit_plan_mode, task_complete) are
+    /// not advertised (they would corrupt the alt-screen / block on raw stdin).
+    /// Slice 14b.
+    static TUI_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn set_ask_before_mutate(value: bool) {
@@ -17364,6 +17425,14 @@ fn set_task_complete(value: bool) {
 /// Read and clear the task-complete flag (consumed by the mugen loop per turn).
 fn take_task_complete() -> bool {
     TASK_COMPLETE.with(|cell| cell.replace(false))
+}
+
+fn set_tui_active(value: bool) {
+    TUI_ACTIVE.with(|cell| cell.set(value));
+}
+
+fn tui_active() -> bool {
+    TUI_ACTIVE.with(std::cell::Cell::get)
 }
 
 fn set_turn_interrupted(value: bool) {

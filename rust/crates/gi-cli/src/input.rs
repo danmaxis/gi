@@ -377,8 +377,10 @@ impl LineEditor {
                 "─".repeat(box_width.saturating_sub(2))
             ));
         } else {
+            // Use display width so wide glyphs (e.g. `無限`) don't overshoot the
+            // border. Slice 16.
             let dashes = box_width
-                .saturating_sub(3 + title.chars().count() + 2)
+                .saturating_sub(3 + crate::render::display_width(&title) + 2)
                 .max(1);
             lines.push(format!("{open}╭─ {title} {}╮{reset}", "─".repeat(dashes)));
         }
@@ -396,7 +398,8 @@ impl LineEditor {
             } else {
                 "  ".to_string()
             };
-            let fill = " ".repeat(text_width.saturating_sub(row_text.chars().count()));
+            let fill =
+                " ".repeat(text_width.saturating_sub(crate::render::display_width(row_text)));
             lines.push(format!(
                 "{open}│{reset} {glyph}{row_text}{fill} {open}│{reset}"
             ));

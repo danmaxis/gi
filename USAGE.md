@@ -377,10 +377,11 @@ ESC-interruptible. With the loop disabled, `mugen` still auto-approves but runs 
 `gi --tui` opens an experimental full-screen interface: a scrollback transcript, a bordered
 multi-line input, and a status bar (model · tokens · branch), all mode-aware (the border/accent
 follow `default`/`plan`/`edit`/`mugen`). **Enter** sends, **Shift+Enter** adds a newline,
-**PageUp/PageDown** scroll the transcript, **Esc** (or `/exit`) quits. When you send a prompt
-the TUI briefly drops to the normal screen to run the turn (so streaming, tool boxes, approval
-prompts, and ESC-cancel all work as usual), then records the result in the transcript. Plain
-`gi` (the line-stream REPL) is the default and is unchanged.
+**PageUp/PageDown** scroll the transcript, **Esc** (or `/exit`) quits. Sending a prompt runs the
+turn **on the same screen** (a `技 thinking…` indicator shows while it works), then drops the
+response into the transcript — no screen flip. The TUI **auto-approves** tool calls and disables
+the interactive `ask_user`/`exit_plan_mode` tools for now (in-TUI approval + live token streaming
+are the next steps). Plain `gi` (the line-stream REPL) is the default and is unchanged.
 
 ## Agents
 

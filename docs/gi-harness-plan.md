@@ -404,9 +404,15 @@ scroll, cursor placement, no duplication) and the plan/gutter visuals need real-
   prompts, cancellation all intact), then records the result in the transcript and resumes.
   Strictly opt-in (`--tui`); the line-stream REPL stays default and untouched. ratatui 0.29
   reuses the existing crossterm 0.28 (no duplicate).
-- [ ] **Follow-up** (needs live iteration): stream a turn *live into* the scrollback pane
-  (background turn thread + output sink) instead of suspend/resume; in-TUI permission prompts;
-  full in-input cursor editing (left/right, mid-line); independent transcript scroll polish.
+- [x] **Same-screen turns** (2026-06-26): a submitted prompt now runs **on the same screen**
+  (no alt-screen flip) via `run_turn_capture` — a silent (`emit_output=false`) auto-approving
+  turn (`TuiAutoPrompter`) whose final text lands in the transcript; a `技 thinking…` indicator
+  shows while it works. Interactive runtime tools (`ask_user`/`exit_plan_mode`/`task_complete`)
+  are gated off in the TUI (`TUI_ACTIVE`) so they can't block on raw stdin. Verified end-to-end
+  in tmux (prompt → thinking → response, clean Esc exit).
+- [ ] **Follow-up** (needs live iteration): live token streaming into the pane (background turn
+  thread + output sink); in-TUI permission prompts (so it needn't auto-approve); full in-input
+  cursor editing (left/right, mid-line); independent transcript scroll polish.
 
 ## Acceptance Criteria
 

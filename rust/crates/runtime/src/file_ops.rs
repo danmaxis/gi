@@ -273,6 +273,15 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
+    // An empty old_string matches at every position, so `replace` would insert
+    // new_string between every character and shred the file. Reject it — use
+    // write_file to create or replace a whole file's contents instead.
+    if old_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty; use write_file to create or replace a file's contents",
+        ));
+    }
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -809,6 +818,24 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn rejects_empty_old_string_instead_of_shredding_the_file() {
+        // An empty old_string previously inserted new_string between every
+        // character (content.replace("", x)), destroying the file. It must be
+        // rejected, leaving the file untouched.
+        let path = temp_path("edit-empty-old.txt");
+        write_file(path.to_string_lossy().as_ref(), "Hello, World!")
+            .expect("initial write should succeed");
+        let result = edit_file(path.to_string_lossy().as_ref(), "", "👍", true);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must not be empty"));
+        // The file is unchanged — no corruption.
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, "Hello, World!");
     }
 
     #[test]

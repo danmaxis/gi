@@ -46,6 +46,9 @@ pub struct LineEditor {
     /// mode key used to pick the box accent color. Slice 16.
     header_label: Option<String>,
     header_mode: String,
+    /// Status line drawn as the first row of the editor's block (so the editor
+    /// owns + clears it, surviving terminal resizes cleanly). Slice 16.
+    status: Option<String>,
     /// Rows the previous box render drew, the cursor's row offset from the box
     /// top, and the box width it was drawn at — so the next render can clear
     /// exactly the prior block (fixes the wrapped-line duplication bug) and fall
@@ -65,6 +68,7 @@ impl LineEditor {
             prompt: prompt.into(),
             header_label: None,
             header_mode: "default".to_string(),
+            status: None,
             last_block_rows: 0,
             last_cursor_offset: 0,
             last_box_width: 0,
@@ -79,6 +83,12 @@ impl LineEditor {
     pub fn set_header(&mut self, label: Option<String>, mode: impl Into<String>) {
         self.header_label = label.filter(|value| !value.is_empty());
         self.header_mode = mode.into();
+    }
+
+    /// Set the status line drawn above the box as the first row of the editor's
+    /// block. `None` omits it. Slice 16.
+    pub fn set_status(&mut self, status: Option<String>) {
+        self.status = status.filter(|value| !value.is_empty());
     }
 
     pub fn push_history(&mut self, entry: impl Into<String>) {
@@ -154,10 +164,25 @@ impl LineEditor {
         enable_raw_mode()?;
         let outcome = self.edit(initial);
         let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = write!(stdout, "\r\n");
-        let _ = stdout.flush();
+        // A mode cycle keeps the cursor inside the box so the next render can
+        // clear + redraw it in place; everything else commits a newline so the
+        // following output starts on a fresh line. Slice 16.
+        if !matches!(outcome, Ok(ReadOutcome::CycleMode(_))) {
+            let mut stdout = io::stdout();
+            let _ = write!(stdout, "\r\n");
+            let _ = stdout.flush();
+        }
         outcome
+    }
+
+    /// Forget the previously drawn block so the next render starts fresh (no
+    /// move-up clear). The REPL calls this before a prompt that follows printed
+    /// output (a turn, a slash command) — but NOT across a mode cycle, where the
+    /// block is still on screen and should be redrawn in place. Slice 16.
+    pub fn reset_render_state(&mut self) {
+        self.last_block_rows = 0;
+        self.last_cursor_offset = 0;
+        self.last_box_width = 0;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -168,10 +193,6 @@ impl LineEditor {
         let mut dismissed = false;
         let mut hist_pos = self.history.len();
         let mut draft = String::new();
-        // Fresh box: nothing of ours to clear above the first render. Slice 16.
-        self.last_block_rows = 0;
-        self.last_cursor_offset = 0;
-        self.last_box_width = 0;
 
         loop {
             let popup = if dismissed {
@@ -236,7 +257,9 @@ impl LineEditor {
                 // text so it's preserved across the switch — the REPL re-seeds
                 // the next prompt with it (command-like). Slice 15.
                 (KeyCode::BackTab, _) => {
-                    self.commit_render(&buffer)?;
+                    // Render in place (cursor stays in the box) and keep the
+                    // block state so the re-seeded prompt redraws over it. Slice 16.
+                    self.render(&buffer, cursor, None, 0)?;
                     return Ok(ReadOutcome::CycleMode(std::mem::take(&mut buffer)));
                 }
                 (KeyCode::Tab, _) => {
@@ -343,12 +366,20 @@ impl LineEditor {
         let box_width = input_box_width();
 
         // Return to the top-left of the previously drawn block, then clear it.
-        // Only trust the tracked offset when the width is unchanged: after a
-        // resize the terminal reflows the old lines, so moving up by the stale
-        // offset would land mid-content — fall back to clearing from here down.
-        let width_stable = self.last_box_width == box_width as u16;
-        if self.last_block_rows > 0 && self.last_cursor_offset > 0 && width_stable {
-            queue!(out, MoveToPreviousLine(self.last_cursor_offset))?;
+        // When the width is unchanged the tracked offset is exact. After a resize
+        // the terminal reflows the old (wider) lines into more physical rows, so
+        // scale the move-up by the reflow factor to still reach the block top and
+        // clear the remnant rather than leaving a stale header. Slice 16.
+        if self.last_block_rows > 0 && self.last_cursor_offset > 0 {
+            let up = if self.last_box_width == box_width as u16 {
+                self.last_cursor_offset
+            } else {
+                let old = u32::from(self.last_box_width.max(1));
+                let new = box_width.max(1) as u32;
+                let factor = old.div_ceil(new); // physical rows each old line reflowed into
+                (u32::from(self.last_cursor_offset) * factor).min(u32::from(u16::MAX)) as u16
+            };
+            queue!(out, MoveToPreviousLine(up))?;
         } else {
             queue!(out, MoveToColumn(0))?;
         }
@@ -368,6 +399,14 @@ impl LineEditor {
         let visible_count = (total - offset).min(MAX_INPUT_ROWS);
 
         let mut lines: Vec<String> = Vec::new();
+
+        // Status line as the first block row (so resizes clear it too). Slice 16.
+        let status_rows = if let Some(status) = &self.status {
+            lines.push(status.clone());
+            1usize
+        } else {
+            0
+        };
 
         // Top border with the mode/agent title.
         let title = self.header_label.clone().unwrap_or_default();
@@ -444,7 +483,9 @@ impl LineEditor {
 
         // Reposition the cursor to the editing spot inside the box.
         let total_rows = lines.len();
-        let cursor_block_row = 1 + (wrapped.cursor_row - offset); // row 0 = top border
+        // block rows: [status?] + top border + content…; the cursor sits on a
+        // content row.
+        let cursor_block_row = status_rows + 1 + (wrapped.cursor_row - offset);
         let up = (total_rows - 1).saturating_sub(cursor_block_row);
         if up > 0 {
             queue!(out, MoveToPreviousLine(up as u16))?;

@@ -8111,13 +8111,23 @@ fn run_repl(
             io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
             render::mode_accent(cli.mode.as_str()),
         ));
-        // The mode/agent header is now the input box's top-border title, drawn by
-        // the editor itself (Slice 16) — set it each loop so it tracks the mode.
+        // The mode/agent header is the input box's top-border title and the
+        // status line is the block's first row — both drawn by the editor so a
+        // terminal resize clears them cleanly (Slice 16). Set each loop.
         editor.set_header(Some(cli.header_label()), cli.mode.as_str().to_string());
-        if io::stdout().is_terminal() {
-            println!("{}", cli.status_line(&status_branch));
+        editor.set_status(if io::stdout().is_terminal() {
+            Some(cli.status_line(&status_branch))
+        } else {
+            None
+        });
+        let seed = pending_input.take();
+        // A fresh prompt follows printed output (a turn, a slash command, the
+        // banner), so forget the old block. A mode-cycle re-seed (`seed` Some)
+        // keeps it so the prompt redraws in place. Slice 16.
+        if seed.is_none() {
+            editor.reset_render_state();
         }
-        let outcome = match pending_input.take() {
+        let outcome = match seed {
             Some(seed) => editor.read_line_with_initial(seed)?,
             None => editor.read_line()?,
         };
@@ -8166,22 +8176,14 @@ fn run_repl(
             input::ReadOutcome::CycleMode(buffer) => {
                 let next = cli.mode.next();
                 // Quiet switch: no `▸ Mode` log line — the prompt box (with its
-                // mode accent + description) is the indicator, redrawn in place.
+                // mode accent + description) is the indicator. The cursor is still
+                // inside the box, so re-seeding (always, even when empty) makes the
+                // next render clear + redraw the block in place rather than
+                // stacking. Slice 15/16.
                 if let Err(error) = cli.set_mode(next, false) {
                     eprintln!("{error}");
                 }
-                // Erase the just-rendered prompt block (status + header + the
-                // prompt line) so the next iteration redraws the box in place
-                // rather than stacking a new one per Shift+Tab. Slice 15.
-                if io::stdout().is_terminal() {
-                    print!("\x1b[3F\x1b[J");
-                    let _ = io::stdout().flush();
-                }
-                // Re-seed the next prompt with whatever was typed so the switch
-                // doesn't discard in-progress text (Slice 15).
-                if !buffer.is_empty() {
-                    pending_input = Some(buffer);
-                }
+                pending_input = Some(buffer);
             }
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;

@@ -46,11 +46,13 @@ pub struct LineEditor {
     /// mode key used to pick the box accent color. Slice 16.
     header_label: Option<String>,
     header_mode: String,
-    /// Rows the previous box render drew, and the cursor's row offset from the
-    /// box top, so the next render can clear exactly the prior block (fixes the
-    /// wrapped-line duplication bug). Slice 16.
+    /// Rows the previous box render drew, the cursor's row offset from the box
+    /// top, and the box width it was drawn at — so the next render can clear
+    /// exactly the prior block (fixes the wrapped-line duplication bug) and fall
+    /// back to a safe clear when the terminal was resized. Slice 16.
     last_block_rows: u16,
     last_cursor_offset: u16,
+    last_box_width: u16,
     completions: Vec<String>,
     history: Vec<String>,
     color: bool,
@@ -65,6 +67,7 @@ impl LineEditor {
             header_mode: "default".to_string(),
             last_block_rows: 0,
             last_cursor_offset: 0,
+            last_box_width: 0,
             completions: normalize_completions(completions),
             history: Vec::new(),
             color: std::env::var_os("NO_COLOR").is_none(),
@@ -168,6 +171,7 @@ impl LineEditor {
         // Fresh box: nothing of ours to clear above the first render. Slice 16.
         self.last_block_rows = 0;
         self.last_cursor_offset = 0;
+        self.last_box_width = 0;
 
         loop {
             let popup = if dismissed {
@@ -336,15 +340,20 @@ impl LineEditor {
     ) -> io::Result<()> {
         let mut out = io::stdout();
 
+        let box_width = input_box_width();
+
         // Return to the top-left of the previously drawn block, then clear it.
-        if self.last_block_rows > 0 && self.last_cursor_offset > 0 {
+        // Only trust the tracked offset when the width is unchanged: after a
+        // resize the terminal reflows the old lines, so moving up by the stale
+        // offset would land mid-content — fall back to clearing from here down.
+        let width_stable = self.last_box_width == box_width as u16;
+        if self.last_block_rows > 0 && self.last_cursor_offset > 0 && width_stable {
             queue!(out, MoveToPreviousLine(self.last_cursor_offset))?;
         } else {
             queue!(out, MoveToColumn(0))?;
         }
         queue!(out, Clear(ClearType::FromCursorDown))?;
 
-        let box_width = crate::render::terminal_width();
         let text_width = box_width.saturating_sub(6).max(1);
         let (open, reset) = crate::render::accent_sgr(&self.header_mode, self.color);
 
@@ -445,6 +454,7 @@ impl LineEditor {
 
         self.last_block_rows = total_rows as u16;
         self.last_cursor_offset = cursor_block_row as u16;
+        self.last_box_width = box_width as u16;
         Ok(())
     }
 
@@ -491,10 +501,22 @@ fn byte_index(buffer: &str, char_index: usize) -> usize {
         .map_or(buffer.len(), |(byte, _)| byte)
 }
 
+/// The input box fills the *actual* terminal width — never the clamped
+/// `render::terminal_width()` (40..100), which both fails to fill wide terminals
+/// and, on a terminal narrower than 40, makes box lines wider than the screen so
+/// they wrap and the row tracking desyncs (the resize "repeating line" bug).
+/// Slice 16.
+fn input_box_width() -> usize {
+    match crossterm::terminal::size() {
+        Ok((cols, _)) if cols > 0 => cols as usize,
+        _ => 80,
+    }
+}
+
 /// Text-area width inside the input box (box width minus borders/pad/glyph).
 /// Slice 16.
 fn input_text_width() -> usize {
-    crate::render::terminal_width().saturating_sub(6).max(1)
+    input_box_width().saturating_sub(6).max(1)
 }
 
 /// Soft-wrapped view of the buffer: the visual rows (text only), where the

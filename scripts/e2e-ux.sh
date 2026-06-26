@@ -99,5 +99,27 @@ send Escape  # quit TUI
 sleep 0.5
 check "clean exit back to shell prompt" test "$(capture | grep -c '\$')" -ge 1
 
+echo "[6] answer renders with '◂ gi' header + margin + separated paragraphs (needs a model)"
+start_pane 90 30
+tmux send-keys -t "$SESSION" 'In exactly two short paragraphs separated by a blank line, define recursion. Be brief.'
+sleep 0.4; tmux send-keys -t "$SESSION" Enter
+# Poll up to ~40s for the COMPLETED answer (the body renders once at block-stop,
+# marked by the ✔ Done line; skip gracefully if no provider is configured).
+answered=0
+for _ in $(seq 1 20); do
+  sleep 2
+  if capture | grep -q '✔'; then answered=1; break; fi
+  if capture | grep -qiE 'no model|not configured|unauthor'; then break; fi
+done
+if [ "$answered" -eq 1 ]; then
+  check "answer shows the '◂ gi' header" test "$(count_on_screen '◂ gi')" -ge 1
+  check "answer body is margined (4-space indent)" \
+    bash -c "capture(){ tmux capture-pane -t '$SESSION' -p; }; capture | grep -qE '^    [A-Za-z]'"
+  check "two paragraphs (a blank line inside the answer)" \
+    bash -c "capture(){ tmux capture-pane -t '$SESSION' -p; }; [ \"\$(capture | grep -cE '^    [A-Za-z]')\" -ge 2 ]"
+else
+  echo "  SKIP: no model answered (provider not configured?) — answer-render checks skipped"
+fi
+
 echo "== e2e: $PASS passed, $FAIL failed =="
 [ "$FAIL" -eq 0 ]

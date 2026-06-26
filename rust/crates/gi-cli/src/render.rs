@@ -1452,74 +1452,65 @@ pub fn with_gutter(body: &str, prefix: &str) -> String {
         .join("\n")
 }
 
-/// A streaming left-gutter that bounds the assistant's answer with a `│ ` bar
-/// down the left edge while output arrives in chunks. It inserts the prefix at
-/// the start of each visual line and defers a trailing newline's prefix to the
-/// next chunk (so no dangling gutter is emitted). When `enabled` is false (e.g.
-/// piped / non-TTY output) it is an identity passthrough. Slice 16.
-pub struct StreamGutter {
-    prefix: String,
-    at_line_start: bool,
+/// The dim `◂ gi` header line printed before an assistant answer. Slice 17.
+#[must_use]
+pub fn answer_header(use_color: bool) -> String {
+    if use_color {
+        "\x1b[2m◂ gi\x1b[0m".to_string()
+    } else {
+        "◂ gi".to_string()
+    }
 }
 
-impl StreamGutter {
-    #[must_use]
-    pub fn new(enabled: bool, use_color: bool) -> Self {
-        let prefix = if !enabled {
-            String::new()
-        } else if use_color {
-            format!(
-                "{}│\x1b[0m ",
-                theme_fg(ColorTheme::default().code_block_border)
-            )
-        } else {
-            "│ ".to_string()
-        };
-        Self {
-            prefix,
-            at_line_start: true,
-        }
-    }
-
-    /// Wrap one streamed chunk, prefixing each line start with the gutter.
-    pub fn wrap(&mut self, chunk: &str) -> String {
-        if self.prefix.is_empty() {
-            return chunk.to_string();
-        }
-        let mut out = String::with_capacity(chunk.len() + self.prefix.len());
-        for ch in chunk.chars() {
-            if self.at_line_start {
-                out.push_str(&self.prefix);
-                self.at_line_start = false;
-            }
-            out.push(ch);
-            if ch == '\n' {
-                self.at_line_start = true;
-            }
-        }
-        out
-    }
+/// Indent every line of a rendered answer `body` with a left margin (the "tab
+/// margin") so the answer sits under the `◂ gi` header, and end with a newline.
+/// The body keeps its own ANSI/markdown; only a plain-space margin is added.
+/// Slice 17.
+#[must_use]
+pub fn answer_body(body: &str) -> String {
+    const MARGIN: &str = "    ";
+    format!("{}\n", with_gutter(body.trim_end_matches('\n'), MARGIN))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_runtime_theme, effective_theme, panel, resolve_theme, set_runtime_theme, strip_ansi,
-        terminal_width, with_gutter, ColorTheme, MarkdownStreamState, Spinner, StreamGutter,
-        TerminalRenderer, ThemeSource,
+        answer_body, answer_header, clear_runtime_theme, effective_theme, panel, resolve_theme,
+        set_runtime_theme, strip_ansi, terminal_width, with_gutter, ColorTheme,
+        MarkdownStreamState, Spinner, TerminalRenderer, ThemeSource,
     };
 
     #[test]
-    fn stream_gutter_prefixes_lines_across_chunks() {
-        let mut gutter = StreamGutter::new(true, false);
-        // Prefix at the start + after each internal newline; a trailing newline
-        // defers the next prefix to the following chunk.
-        assert_eq!(gutter.wrap("hello\nworld\n"), "│ hello\n│ world\n");
-        // The next chunk starts on a fresh line, so it gets the prefix.
-        assert_eq!(gutter.wrap("again"), "│ again");
-        // Disabled → identity passthrough (piped / non-TTY output stays clean).
-        let mut off = StreamGutter::new(false, false);
-        assert_eq!(off.wrap("a\nb"), "a\nb");
+    fn answer_header_and_body_margin() {
+        assert_eq!(answer_header(false), "◂ gi");
+        assert!(answer_header(true).contains("◂ gi"));
+        assert!(answer_header(true).contains('\u{1b}'));
+        // Every line of the body is indented by the 4-space margin; paragraphs
+        // (blank lines) are preserved and the result ends with a newline.
+        assert_eq!(
+            answer_body("First para.\n\nSecond para."),
+            "    First para.\n    \n    Second para.\n"
+        );
+    }
+
+    #[test]
+    fn multi_paragraph_answer_renders_separated_and_margined() {
+        // Integration: the renderer + answer_body together produce a margined,
+        // paragraph-separated answer (the giant-paragraph bug is gone). Slice 17.
+        let renderer = TerminalRenderer::new();
+        let body = renderer.markdown_to_ansi("First paragraph.\n\nSecond paragraph.");
+        let out = strip_ansi(&answer_body(&body));
+        // Every non-empty line is indented by the 4-space margin.
+        for line in out.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(line.starts_with("    "), "line not margined: {line:?}");
+        }
+        // The two paragraphs survive as distinct text (a blank line between).
+        assert!(out.contains("First paragraph."));
+        assert!(out.contains("Second paragraph."));
+        assert!(
+            out.contains("\n    \n") || out.contains("\n\n"),
+            "paragraphs should be separated by a blank line: {out:?}"
+        );
     }
 
     #[test]

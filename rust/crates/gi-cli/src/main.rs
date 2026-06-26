@@ -15436,12 +15436,11 @@ impl AnthropicRuntimeClient {
             &mut sink
         };
         let renderer = TerminalRenderer::new();
-        let mut markdown_stream = MarkdownStreamState::default();
-        // Bound the streamed answer with a left gutter bar (interactive TTY only;
-        // piped output stays clean). Slice 16.
-        let gutter_on = io::stdout().is_terminal();
-        let mut answer_gutter =
-            render::StreamGutter::new(gutter_on, gutter_on && env::var_os("NO_COLOR").is_none());
+        // Buffer the assistant's answer text and render it once at block/message
+        // stop — rendering the COMPLETE markdown preserves paragraphs (partial
+        // markdown didn't), under a `◂ gi` header + left margin. Slice 17.
+        let mut text_buf = String::new();
+        let answer_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
         let mut events = Vec::new();
         let mut pending_tool: Option<(String, String, String)> = None;
         // 累积 reasoning_content 到 Thinking 块（修复 DeepSeek V4 reasoning_content 协议 bug）
@@ -15543,12 +15542,15 @@ impl AnthropicRuntimeClient {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
-                            if let Some(rendered) = markdown_stream.push(&renderer, &text) {
-                                let rendered = answer_gutter.wrap(&rendered);
-                                write!(out, "{rendered}")
+                            // Print the `◂ gi` header the moment the answer starts
+                            // (so there's no blank wait), then buffer the body and
+                            // render it once when the block completes. Slice 17.
+                            if text_buf.is_empty() && self.emit_output {
+                                write!(out, "\n{}\n", render::answer_header(answer_color))
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
+                            text_buf.push_str(&text);
                             events.push(AssistantEvent::TextDelta(text));
                         }
                     }
@@ -15576,12 +15578,15 @@ impl AnthropicRuntimeClient {
                 },
                 ApiStreamEvent::ContentBlockStop(_) => {
                     block_has_thinking_summary = false;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        let rendered = answer_gutter.wrap(&rendered);
-                        write!(out, "{rendered}")
+                    // Render the complete buffered answer once (correct paragraphs)
+                    // with the left margin under the header. Slice 17.
+                    if !text_buf.is_empty() && self.emit_output {
+                        let body = renderer.markdown_to_ansi(&text_buf);
+                        write!(out, "{}", render::answer_body(&body))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
+                    text_buf.clear();
                     // 把累积的 thinking 转成 AssistantEvent::Thinking（让 build_assistant_message 写入 session）
                     if let Some((thinking, signature)) = pending_thinking.take() {
                         events.push(AssistantEvent::Thinking {
@@ -15605,10 +15610,13 @@ impl AnthropicRuntimeClient {
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
-                    if let Some(rendered) = markdown_stream.flush(&renderer) {
-                        write!(out, "{rendered}")
+                    // Flush any answer text not closed by a ContentBlockStop. Slice 17.
+                    if !text_buf.is_empty() && self.emit_output {
+                        let body = renderer.markdown_to_ansi(&text_buf);
+                        write!(out, "{}", render::answer_body(&body))
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        text_buf.clear();
                     }
                     events.push(AssistantEvent::MessageStop);
                 }

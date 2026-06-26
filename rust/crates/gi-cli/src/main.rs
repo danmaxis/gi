@@ -15710,10 +15710,16 @@ impl AnthropicRuntimeClient {
                         if let Some(progress_reporter) = &self.progress_reporter {
                             progress_reporter.mark_tool_phase(&name, &input);
                         }
-                        // Display tool call now that input is fully accumulated
-                        writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                            .and_then(|()| out.flush())
-                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        // Display the tool-call box now that the input is fully
+                        // accumulated — but NOT for the interactive runtime tools
+                        // (ask_user / exit_plan_mode / task_complete): they render
+                        // their own prompt/panel, so a raw-JSON box is just noise
+                        // that looks conflated with the prompt. Slice 17.
+                        if !is_interactive_runtime_tool(&name) {
+                            writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                 }
@@ -16305,6 +16311,12 @@ fn slash_command_completion_candidates_with_sessions(
     }
 
     completions.into_iter().collect()
+}
+
+/// Interactive runtime tools that render their own UI (a prompt / panel), so the
+/// generic tool-call box should be suppressed for them. Slice 17.
+fn is_interactive_runtime_tool(name: &str) -> bool {
+    matches!(name, "ask_user" | "exit_plan_mode" | "task_complete")
 }
 
 fn format_tool_call_start(name: &str, input: &str) -> String {
@@ -17433,7 +17445,9 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
-                if self.emit_output {
+                // Interactive runtime tools already showed their own UI, so don't
+                // dump their JSON result too (it reads as garbled noise). Slice 17.
+                if self.emit_output && !is_interactive_runtime_tool(tool_name) {
                     let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
@@ -23049,6 +23063,17 @@ UU conflicted.rs",
             SessionMode::from_permission(PermissionMode::WorkspaceWrite),
             SessionMode::Edit
         );
+    }
+
+    #[test]
+    fn interactive_runtime_tools_skip_the_generic_box() {
+        // ask_user / exit_plan_mode / task_complete render their own UI, so the
+        // raw-JSON tool box (and result dump) is suppressed for them. Slice 17.
+        assert!(super::is_interactive_runtime_tool("ask_user"));
+        assert!(super::is_interactive_runtime_tool("exit_plan_mode"));
+        assert!(super::is_interactive_runtime_tool("task_complete"));
+        assert!(!super::is_interactive_runtime_tool("bash"));
+        assert!(!super::is_interactive_runtime_tool("write_file"));
     }
 
     #[test]

@@ -721,6 +721,8 @@ fn get_simple_doing_tasks_section() -> String {
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
+        "To create or modify files, always use the write_file and edit_file tools; never write file contents through shell redirection (>, >>) or heredocs (cat << EOF) — the shell mangles newlines and can execute file content as commands.".to_string(),
+        "Always read a file with read_file before modifying it with edit_file.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),

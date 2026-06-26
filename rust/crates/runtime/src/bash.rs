@@ -70,6 +70,16 @@ pub struct BashCommandOutput {
 
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
+    // A NUL byte can't be passed to the OS shell (`Command::arg` would fail with
+    // an opaque "nul byte found in provided data"). Reject it up front with a
+    // clear, actionable message — this usually means the model tried to stuff
+    // file content through the shell; it should use write_file instead.
+    if input.command.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command contains a NUL byte and cannot be run; to write file contents use the write_file tool instead of shell redirection",
+        ));
+    }
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
@@ -360,6 +370,24 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
 mod tests {
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    #[test]
+    fn rejects_commands_with_nul_bytes() {
+        let error = execute_bash(BashCommandInput {
+            command: String::from("echo a\0b"),
+            timeout: Some(1_000),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(false),
+            isolate_network: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect_err("a NUL byte should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("write_file"));
+    }
 
     #[test]
     fn executes_simple_command() {

@@ -238,6 +238,20 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         ),
     ];
 
+    // Surface the very first user message verbatim so the original goal survives
+    // compaction — without this a weak model latches onto the most recent turn
+    // and loses sight of the actual task.
+    if let Some(task) = messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(first_text_block)
+    {
+        lines.push(format!(
+            "- Original task (do not lose sight of this): {}",
+            truncate_summary(task, 240)
+        ));
+    }
+
     if !tool_names.is_empty() {
         lines.push(format!("- Tools mentioned: {}.", tool_names.join(", ")));
     }

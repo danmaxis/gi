@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aspect_macros::aspect;
@@ -485,7 +487,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. To create or modify files, use write_file/edit_file instead — never write file contents with shell redirection (>, >>) or heredocs (<< EOF), which mangle newlines and can execute the content as commands.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -521,7 +523,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description: "Write a text file in the workspace (creating parent directories). Use this — not shell redirection — to create or overwrite files: content is written verbatim with no shell quoting or newline issues.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -535,7 +537,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description: "Replace text in a workspace file. Use this — not sed/awk or shell redirection — to modify existing files.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1364,6 +1366,56 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(None, name, input)
 }
 
+/// Whether `edit_file` requires the target to have been read (or written) first.
+/// Off by default so stateless callers/tests are unaffected; the interactive
+/// runtime turns it on via [`enable_read_before_edit`].
+static READ_BEFORE_EDIT: AtomicBool = AtomicBool::new(false);
+
+/// Files the model has read or written this process — the knowledge set checked
+/// by the read-before-edit rule. Process-global so it survives across the
+/// per-turn tool calls regardless of which thread runs them.
+fn known_files() -> &'static Mutex<HashSet<PathBuf>> {
+    static KNOWN: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    KNOWN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Enable the read-before-edit rule (call once when an interactive session
+/// starts). Mirrors Claude Code: a file must be read before it can be edited.
+pub fn enable_read_before_edit() {
+    READ_BEFORE_EDIT.store(true, Ordering::Relaxed);
+}
+
+/// Canonical key for a path (falls back to the raw path when it can't be
+/// canonicalized, e.g. not yet created), so reads and edits compare equal.
+fn file_key(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Record that `path` has been read or written, satisfying read-before-edit.
+fn mark_file_known(path: &str) {
+    if let Ok(mut set) = known_files().lock() {
+        set.insert(file_key(path));
+    }
+}
+
+/// `Err` with a clear message when read-before-edit is on and `path` is unread.
+fn check_read_before_edit(path: &str) -> Result<(), String> {
+    if !READ_BEFORE_EDIT.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let known = known_files()
+        .lock()
+        .map(|set| set.contains(&file_key(path)))
+        .unwrap_or(true);
+    if known {
+        Ok(())
+    } else {
+        Err(format!(
+            "must read {path} with read_file before editing it; read it first, then edit_file"
+        ))
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[aspect(LoggingAspect::new().log_args().log_result())]
 fn execute_tool_with_enforcer(
@@ -1383,16 +1435,25 @@ fn execute_tool_with_enforcer(
             let file_input: ReadFileInput = from_value(input)?;
             let required_mode = classify_read_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_read_file(file_input)
+            let path = file_input.path.clone();
+            let result = run_read_file(file_input)?;
+            // The model has now seen this file, so it may be edited.
+            mark_file_known(&path);
+            Ok(result)
         }
         "write_file" => {
             let file_input: WriteFileInput = from_value(input)?;
             let required_mode = classify_file_path_permission(&file_input.path, true);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
-            run_write_file(file_input)
+            let path = file_input.path.clone();
+            let result = run_write_file(file_input)?;
+            // Writing establishes the file's contents — subsequent edits are fine.
+            mark_file_known(&path);
+            Ok(result)
         }
         "edit_file" => {
             let file_input: EditFileInput = from_value(input)?;
+            check_read_before_edit(&file_input.path)?;
             let required_mode = classify_file_path_permission(&file_input.path, false);
             maybe_enforce_permission_check_with_mode(enforcer, name, input, required_mode)?;
             run_edit_file(file_input)
@@ -9735,6 +9796,56 @@ mod tests {
             "preflight_blocked:branch_divergence"
         );
 
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_before_edit_rule_blocks_unread_edits() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("rbe-suite");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        // Create the file outside the tools so it is neither read nor written.
+        fs::write(root.join("note.txt"), "alpha\n").expect("seed file");
+        if let Ok(mut set) = super::known_files().lock() {
+            set.clear();
+        }
+        super::enable_read_before_edit();
+
+        // Editing without reading first is rejected with an actionable message.
+        let blocked = execute_tool(
+            "edit_file",
+            &json!({ "path": "note.txt", "old_string": "alpha", "new_string": "omega" }),
+        )
+        .expect_err("editing an unread file should be blocked");
+        assert!(blocked.contains("read_file"), "message was: {blocked}");
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read"),
+            "alpha\n"
+        );
+
+        // After reading, the edit is allowed.
+        execute_tool("read_file", &json!({ "path": "note.txt" })).expect("read should succeed");
+        execute_tool(
+            "edit_file",
+            &json!({ "path": "note.txt", "old_string": "alpha", "new_string": "omega" }),
+        )
+        .expect("edit after read should succeed");
+        assert_eq!(
+            fs::read_to_string(root.join("note.txt")).expect("read"),
+            "omega\n"
+        );
+
+        // Reset global state so other tests are unaffected.
+        super::READ_BEFORE_EDIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut set) = super::known_files().lock() {
+            set.clear();
+        }
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
     }

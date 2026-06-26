@@ -414,6 +414,30 @@ scroll, cursor placement, no duplication) and the plan/gutter visuals need real-
   thread + output sink); in-TUI permission prompts (so it needn't auto-approve); full in-input
   cursor editing (left/right, mid-line); independent transcript scroll polish.
 
+### Slice 17: approvals, Ctrl+O verbosity, answer rendering (done 2026-06-26)
+
+- [x] **Answer rendering** (`render::answer_header`/`answer_body`, `consume_stream`): buffer the
+  answer and render the complete markdown once at block/message stop (fixes the collapsed
+  paragraphs — partial markdown emitted no `\n\n`), under a dim `◂ gi` header + 4-space left
+  margin; the per-line `StreamGutter` is retired. Tool boxes still stream live.
+- [x] **Approvals** (`main.rs`): boxed `╭─ approve · <tool> ─╮` prompt with a concise action +
+  preview (`describe_permission_action`: write→path+size, edit→diff, bash→`$ cmd`); session
+  memory (`SESSION_APPROVALS` thread-local) — `a` = always this tool, `A` = all tools, so no
+  re-prompt.
+- [x] **Ctrl+O verbosity** (`render::RenderVerbosity` + `RENDER_VERBOSITY` thread-local):
+  3-level cycle compact→verbose→raw. Line REPL gates `truncate_output_for_display` (hint reads
+  `… +N lines — Ctrl+O to expand`) + thinking; Ctrl+O re-prints the last turn's detail
+  (`reprint_last_turn`, from `capture_tui_entries`). TUI re-renders captured tool/thinking
+  entries per level (typed `tui::TranscriptEntry`). Level shows in the status line.
+- [x] **Fixes**: `edit_file` rejects an empty `old_string` (was `replace("", x)` → shredded the
+  file); interactive runtime tools (`ask_user`/`exit_plan_mode`/`task_complete`) no longer emit
+  the generic JSON tool-call box/result dump (`is_interactive_runtime_tool`); code blocks render
+  a complete `╭─ lang ─╮`/`╰─╯` frame (`code_frame_width`) instead of half-drawn corners.
+- [ ] **Follow-up**: answer margin only covers each paragraph's first line — long paragraphs'
+  terminal-wrapped continuation rows aren't margined (needs ANSI+code-aware wrapping); a
+  `/verbose [compact|verbose|raw]` command (Ctrl+O is the only switch today). Tested via
+  unit + integration + in-crate tests **and** `scripts/e2e-ux.sh` (24 tmux checks).
+
 ## Acceptance Criteria
 
 - `cargo build --workspace` succeeds.

@@ -372,6 +372,37 @@ The mugen loop is **off by default** — enable it explicitly in `.gi/settings.j
 `maxTurns` (default 25) caps autonomous turns per prompt so the loop is always bounded and
 ESC-interruptible. With the loop disabled, `mugen` still auto-approves but runs a single turn.
 
+## Approving tool calls
+
+In **default** mode, mutating tools (`write_file` / `edit_file` / `bash`) show a boxed prompt
+with the action + a short preview (a write's path/size, an edit's `-/+` diff, a bash command):
+
+```
+╭─ approve · edit_file ────────────────────────╮
+│ Edit main.rs                                 │
+│ - let x = 1;                                 │
+│ + let x = 2;                                 │
+│ [y]es  [n]o  [a]lways this tool  [A]ll tools │
+╰──────────────────────────────────────────────╯
+```
+
+Answer **`y`** (allow once), **`n`** (deny), **`a`** (allow *this* tool for the rest of the
+session — no more prompts for it), or **`A`** (allow *all* tools this session). `edit` / `mugen`
+modes auto-accept; `plan` is read-only.
+
+## Detail levels — Ctrl+O
+
+Press **Ctrl+O** to cycle how much detail is shown: **compact → verbose → raw → compact** (the
+level appears in the status line, e.g. `· verbose (Ctrl+O)`; default is compact).
+
+- **compact** — tool output is truncated with a `… +N lines — Ctrl+O to expand` hint; thinking
+  is hidden.
+- **verbose** — full tool output + inputs.
+- **raw** — also reveals the model's thinking text.
+
+In the **line REPL**, Ctrl+O re-prints the *last* turn's detail at the new level (it can't
+re-render scrollback in place). In the **TUI** it re-renders the transcript in place.
+
 ## Full-screen TUI (opt-in)
 
 `gi --tui` opens an experimental full-screen interface: a scrollback transcript, a bordered

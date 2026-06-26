@@ -135,7 +135,7 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Build CLI for Windows smoke
-        run: cargo build -p rusty-claude-cli
+        run: cargo build -p gi-cli
       - name: Smoke local commands without live credentials
         env:
           ANTHROPIC_API_KEY: ""

@@ -12,7 +12,7 @@ prefix.
 
 > Gi is a fork of [`ultraworkers/claw-code`](https://github.com/ultraworkers/claw-code)
 > (MIT). It keeps that workspace as its implementation base and rebrands it to `gi`.
-> See the [ownership disclaimer](#ownership--affiliation) below.
+> See the [ownership disclaimer](#ownership-and-affiliation) below.
 
 ## What Gi adds
 
@@ -91,7 +91,7 @@ cargo test --workspace
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
 - [`LICENSE`](./LICENSE) — MIT
 
-## Ownership / affiliation
+## Ownership and affiliation
 
 - Gi is a fork of [`ultraworkers/claw-code`](https://github.com/ultraworkers/claw-code)
   (MIT), which is itself part of the broader agent-code / Claude Code lineage.

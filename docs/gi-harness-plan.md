@@ -396,9 +396,17 @@ scroll, cursor placement, no duplication) and the plan/gutter visuals need real-
 
 ### Slice 14b: Opt-in full-screen TUI (`gi --tui`, Phase 2)
 
-- [ ] ratatui-based persistent layout (scrollback pane + input + status regions) reusing
-  the Slice 11–13 theme/panel vocabulary + the Slice 14a prompt shell + modes. Strictly
-  opt-in; the line-stream stays default.
+- [x] **Foundation** (2026-06-26): ratatui-based full-screen layout — status bar + scrollback
+  transcript + bordered multi-line input — in `crates/gi-cli/src/tui.rs`, driven by
+  `run_tui`/`run_tui_loop` (`main.rs`). Mode-aware accent + header title; PageUp/PageDown
+  scroll; Shift+Enter newline; `Esc`/`/exit` to quit. A submitted prompt **suspends** the TUI,
+  runs the turn with the normal streaming output (markdown, gutter, tool boxes, permission
+  prompts, cancellation all intact), then records the result in the transcript and resumes.
+  Strictly opt-in (`--tui`); the line-stream REPL stays default and untouched. ratatui 0.29
+  reuses the existing crossterm 0.28 (no duplicate).
+- [ ] **Follow-up** (needs live iteration): stream a turn *live into* the scrollback pane
+  (background turn thread + output sink) instead of suspend/resume; in-TUI permission prompts;
+  full in-input cursor editing (left/right, mid-line); independent transcript scroll polish.
 
 ## Acceptance Criteria
 

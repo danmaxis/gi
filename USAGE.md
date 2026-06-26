@@ -372,6 +372,16 @@ The mugen loop is **off by default** — enable it explicitly in `.gi/settings.j
 `maxTurns` (default 25) caps autonomous turns per prompt so the loop is always bounded and
 ESC-interruptible. With the loop disabled, `mugen` still auto-approves but runs a single turn.
 
+## Full-screen TUI (opt-in)
+
+`gi --tui` opens an experimental full-screen interface: a scrollback transcript, a bordered
+multi-line input, and a status bar (model · tokens · branch), all mode-aware (the border/accent
+follow `default`/`plan`/`edit`/`mugen`). **Enter** sends, **Shift+Enter** adds a newline,
+**PageUp/PageDown** scroll the transcript, **Esc** (or `/exit`) quits. When you send a prompt
+the TUI briefly drops to the normal screen to run the turn (so streaming, tool boxes, approval
+prompts, and ESC-cancel all work as usual), then records the result in the transcript. Plain
+`gi` (the line-stream REPL) is the default and is unchanged.
+
 ## Agents
 
 An agent is a named profile (description + optional model + reasoning effort) defined

@@ -20,6 +20,7 @@ mod models_cmd;
 mod opencode_interop;
 mod render;
 mod setup_wizard;
+mod tui;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -873,6 +874,7 @@ fn global_flag_without_value(flag: &str) -> bool {
             | "--skip-permissions"
             | "--compact"
             | "--allow-broad-cwd"
+            | "--tui"
             | "--print"
             | "--acp"
             | "-acp"
@@ -1210,6 +1212,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reasoning_effort,
             allow_broad_cwd,
         )?,
+        CliAction::Tui {
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+        } => run_tui(
+            model,
+            allowed_tools,
+            permission_mode,
+            base_commit,
+            reasoning_effort,
+            allow_broad_cwd,
+        )?,
         CliAction::HelpTopic {
             topic,
             output_format,
@@ -1338,6 +1355,15 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Repl {
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        base_commit: Option<String>,
+        reasoning_effort: Option<String>,
+        allow_broad_cwd: bool,
+    },
+    /// Opt-in full-screen ratatui TUI (`--tui`). Slice 14b.
+    Tui {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
@@ -1572,6 +1598,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut tui = false;
 
     // #755: -p prompt text captured as single token; remaining args continue
     // flag parsing. None until `-p <text>` is seen.
@@ -1721,6 +1748,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--allow-broad-cwd" => {
                 allow_broad_cwd = true;
+                index += 1;
+            }
+            "--tui" => {
+                tui = true;
                 index += 1;
             }
             "--" => {
@@ -1951,6 +1982,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             #[cfg(not(test))]
             // #746: newline before remediation so split_error_hint populates hint field
             return Err("interactive_only: gi requires an interactive terminal.\nStdin is not a TTY and no prompt was provided — pipe a prompt with `echo 'task' | gi` or run `gi` in an interactive terminal.".into());
+        }
+        if tui {
+            return Ok(CliAction::Tui {
+                model,
+                allowed_tools,
+                permission_mode,
+                base_commit,
+                reasoning_effort: reasoning_effort.clone(),
+                allow_broad_cwd,
+            });
         }
         return Ok(CliAction::Repl {
             model,
@@ -7906,6 +7947,81 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
     }
 }
 
+/// Build a live session for the interactive REPL / TUI: resolve the model +
+/// default agent, initial mode, and mugen config. Shared by `run_repl` and
+/// `run_tui`. Returns the CLI plus the resolved status-line git branch.
+#[allow(clippy::needless_pass_by_value)]
+fn build_interactive_cli(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    reasoning_effort: Option<String>,
+) -> Result<(LiveCli, String), Box<dyn std::error::Error>> {
+    let provenance = ModelProvenance::from_env_or_config_or_default(&model)?;
+    let model_was_flag = matches!(provenance.source, ModelSource::Flag);
+    let mut resolved_model = provenance.resolved;
+    let mut effort = reasoning_effort;
+    let cwd = env::current_dir()?;
+    let mut plan_execute_mode: Option<SessionMode> = None;
+    let active_agent = default_agent_profile(&cwd)?.map(|profile| {
+        if let Some(agent_model) = profile.model.as_deref() {
+            if !model_was_flag {
+                resolved_model = resolve_model_alias_with_config(agent_model);
+            }
+        }
+        if effort.is_none() {
+            effort.clone_from(&profile.reasoning_effort);
+        }
+        plan_execute_mode = profile
+            .plan_execute_mode
+            .as_deref()
+            .and_then(SessionMode::parse_execute_target);
+        profile.name
+    });
+    let config = ConfigLoader::default_for(&cwd).load().ok();
+    let initial_mode = config
+        .as_ref()
+        .and_then(|config| config.default_mode().and_then(SessionMode::parse))
+        .unwrap_or_else(|| match permission_mode {
+            PermissionMode::WorkspaceWrite => SessionMode::Default,
+            other => SessionMode::from_permission(other),
+        });
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, initial_mode)?;
+    cli.set_reasoning_effort(effort);
+    cli.active_agent = active_agent;
+    cli.plan_execute_mode = plan_execute_mode;
+    if let Some(config) = &config {
+        cli.set_mugen_config(config.mugen().enabled(), config.mugen().max_turns());
+    }
+    let status_branch = status_context(None)
+        .ok()
+        .and_then(|context| context.git_branch.clone())
+        .unwrap_or_else(|| "no-git".to_string());
+    Ok((cli, status_branch))
+}
+
+/// Opt-in full-screen ratatui TUI (`gi --tui`). The default line-stream REPL is
+/// untouched; this is a foundation (Slice 14b) — turns run by suspending the TUI
+/// for normal streaming output, then recording the result in the transcript.
+#[allow(clippy::needless_pass_by_value)]
+fn run_tui(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    base_commit: Option<String>,
+    reasoning_effort: Option<String>,
+    allow_broad_cwd: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
+    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
+        return Err("interactive_only: gi --tui requires an interactive terminal.".into());
+    }
+    run_stale_base_preflight(base_commit.as_deref());
+    let (mut cli, status_branch) =
+        build_interactive_cli(model, allowed_tools, permission_mode, reasoning_effort)?;
+    cli.run_tui_loop(&status_branch)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_repl(
     model: String,
@@ -8118,6 +8234,9 @@ struct LiveCli {
     /// Target mode plan-approval switches into for the active agent (`edit` /
     /// `mugen`); `None` → ask each time. Slice 16.
     plan_execute_mode: Option<SessionMode>,
+    /// Final assistant text of the last completed turn, for the TUI transcript.
+    /// Slice 14b.
+    last_response: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -9018,6 +9137,7 @@ impl LiveCli {
             mugen_enabled: false,
             mugen_max_turns: runtime::DEFAULT_MUGEN_MAX_TURNS,
             plan_execute_mode: None,
+            last_response: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -9263,6 +9383,119 @@ impl LiveCli {
         Ok(())
     }
 
+    /// Take the last turn's assistant text (consumed by the TUI). Slice 14b.
+    fn take_last_response(&mut self) -> Option<String> {
+        self.last_response.take()
+    }
+
+    /// Full-screen TUI control loop (Slice 14b foundation). Renders a status bar
+    /// + scrollback transcript + bordered input via ratatui; a submitted prompt
+    /// suspends the TUI, runs the turn with normal streaming output, then records
+    /// the result in the transcript and resumes.
+    fn run_tui_loop(&mut self, status_branch: &str) -> Result<(), Box<dyn std::error::Error>> {
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+        let mut terminal = ratatui::init();
+        let mut transcript: Vec<tui::TranscriptEntry> = vec![tui::TranscriptEntry {
+            role: tui::Role::System,
+            text: format!("Connected: {} · Esc or /exit to quit", self.model),
+        }];
+        let mut input = String::new();
+        let mut scroll_back: u16 = 0;
+
+        let outcome = loop {
+            let status = compose_status_line(
+                &self.model,
+                self.runtime.estimated_tokens(),
+                status_branch,
+                false,
+            );
+            let title = self.header_label();
+            let mode = self.mode.as_str().to_string();
+            if let Err(error) = terminal.draw(|frame| {
+                tui::draw(
+                    frame,
+                    &tui::TuiState {
+                        transcript: &transcript,
+                        input: &input,
+                        title: &title,
+                        mode: &mode,
+                        status: &status,
+                        scroll_back,
+                    },
+                )
+            }) {
+                break Err(Box::new(error) as Box<dyn std::error::Error>);
+            }
+
+            match event::poll(std::time::Duration::from_millis(200)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => break Err(Box::new(error) as Box<dyn std::error::Error>),
+            }
+            let key = match event::read() {
+                Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => key,
+                Ok(_) => continue,
+                Err(error) => break Err(Box::new(error) as Box<dyn std::error::Error>),
+            };
+
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => input.push('\n'),
+                (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.push('\n'),
+                (KeyCode::Backspace, _) => {
+                    input.pop();
+                }
+                (KeyCode::PageUp, _) => scroll_back = scroll_back.saturating_add(3),
+                (KeyCode::PageDown, _) => scroll_back = scroll_back.saturating_sub(3),
+                (KeyCode::Enter, _) => {
+                    let prompt = input.trim().to_string();
+                    input.clear();
+                    scroll_back = 0;
+                    if prompt.is_empty() {
+                        continue;
+                    }
+                    if matches!(prompt.as_str(), "/exit" | "/quit") {
+                        break Ok(());
+                    }
+                    transcript.push(tui::TranscriptEntry {
+                        role: tui::Role::User,
+                        text: prompt.clone(),
+                    });
+                    // Suspend the TUI, run the turn with normal streaming, resume.
+                    ratatui::restore();
+                    self.record_prompt_history(&prompt);
+                    let turn = self
+                        .run_turn_and_continue(&prompt)
+                        .and_then(|()| self.run_mugen_loop());
+                    let response = self.take_last_response().unwrap_or_default();
+                    terminal = ratatui::init();
+                    match turn {
+                        Ok(()) if !response.trim().is_empty() => {
+                            transcript.push(tui::TranscriptEntry {
+                                role: tui::Role::Assistant,
+                                text: response.trim().to_string(),
+                            });
+                        }
+                        Ok(()) => {}
+                        Err(error) => transcript.push(tui::TranscriptEntry {
+                            role: tui::Role::System,
+                            text: format!("error: {error}"),
+                        }),
+                    }
+                }
+                (KeyCode::Char(ch), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
+                    input.push(ch);
+                }
+                _ => {}
+            }
+        };
+
+        ratatui::restore();
+        self.persist_session()?;
+        outcome
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -9343,6 +9576,9 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
+                // Stash the final assistant text so the TUI can record it in the
+                // transcript after a suspended turn. Slice 14b.
+                self.last_response = Some(final_assistant_text(&summary));
                 // The assistant text already streamed live during the turn (and
                 // was flushed on block/message stop), so don't re-print it here —
                 // that re-print plus the running spinner was the duplicated,

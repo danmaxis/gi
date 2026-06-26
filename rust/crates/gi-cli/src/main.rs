@@ -8192,9 +8192,11 @@ fn run_repl(
                 pending_input = Some(buffer);
             }
             input::ReadOutcome::CycleVerbosity(buffer) => {
-                // Cycle the detail level; the status line shows the new level and
-                // the prompt redraws in place (carrying the typed text). Slice 17.
+                // Cycle the detail level and re-print the last turn's detail at
+                // that level (the line REPL can't re-render the scrollback in
+                // place). Carry the typed text into a fresh prompt. Slice 17.
                 cycle_verbosity();
+                cli.reprint_last_turn();
                 pending_input = Some(buffer);
             }
             input::ReadOutcome::Exit => {
@@ -9416,6 +9418,54 @@ impl LiveCli {
         self.last_response.take()
     }
 
+    /// Re-print the last turn's tool outputs (and thinking, in raw) at the
+    /// current detail level. The line REPL can't re-render scrollback, so Ctrl+O
+    /// re-emits the detail below the prompt instead. No-op when the last turn had
+    /// nothing detail-bearing. Slice 17.
+    fn reprint_last_turn(&self) {
+        let detailful = self.last_turn_entries.iter().any(|entry| {
+            matches!(
+                entry,
+                tui::TranscriptEntry::Tool { .. } | tui::TranscriptEntry::Thinking(_)
+            )
+        });
+        if !detailful {
+            return;
+        }
+        println!(
+            "\n\x1b[2m↻ last turn · detail: {}\x1b[0m",
+            verbosity().as_str()
+        );
+        for entry in &self.last_turn_entries {
+            match entry {
+                tui::TranscriptEntry::Tool {
+                    name,
+                    output,
+                    is_error,
+                } => {
+                    let mark = if *is_error {
+                        "\x1b[1;31m✘"
+                    } else {
+                        "\x1b[1;36m⚙"
+                    };
+                    println!("{mark} {name}\x1b[0m");
+                    let shown = truncate_output_for_display(
+                        output,
+                        TOOL_OUTPUT_DISPLAY_MAX_LINES,
+                        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
+                    );
+                    if !shown.is_empty() {
+                        println!("{shown}");
+                    }
+                }
+                tui::TranscriptEntry::Thinking(text) if verbosity().shows_thinking() => {
+                    println!("\x1b[2m▶ Thinking\n{text}\x1b[0m");
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Full-screen TUI control loop (Slice 14b foundation). Renders a status bar
     /// + scrollback transcript + bordered input via ratatui; a submitted prompt
     /// suspends the TUI, runs the turn with normal streaming output, then records
@@ -9620,6 +9670,9 @@ impl LiveCli {
                 // Stash the final assistant text so the TUI can record it in the
                 // transcript after a suspended turn. Slice 14b.
                 self.last_response = Some(final_assistant_text(&summary));
+                // Capture the turn's structured tool/thinking entries so Ctrl+O
+                // can re-print them expanded in the line REPL. Slice 17.
+                self.last_turn_entries = capture_tui_entries(&summary);
                 // The assistant text already streamed live during the turn (and
                 // was flushed on block/message stop), so don't re-print it here —
                 // that re-print plus the running spinner was the duplicated,

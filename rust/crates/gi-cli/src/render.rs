@@ -986,25 +986,35 @@ impl TerminalRenderer {
 
     fn start_code_block(&self, code_language: &str, output: &mut String) {
         let label = if code_language.is_empty() {
-            "code".to_string()
+            "code"
         } else {
-            code_language.to_string()
+            code_language
         };
+        // A complete top border `╭─ lang ────╮` (not just a corner). The width is
+        // kept a touch under the terminal so it still fits inside the answer's
+        // left margin without wrapping. Slice 17.
+        let width = code_frame_width();
+        let used = 3 + display_width(label) + 1; // "╭─ " + label + " "
+        let dashes = width.saturating_sub(used + 1).max(1);
+        let line = format!("╭─ {label} {}╮", "─".repeat(dashes));
         let _ = writeln!(
             output,
             "{}",
-            format!("╭─ {label}")
-                .bold()
-                .with(self.color_theme.code_block_border)
+            line.bold().with(self.color_theme.code_block_border)
         );
     }
 
     fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
         output.push_str(&self.highlight_code(code_buffer, code_language));
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        let width = code_frame_width();
+        let line = format!("╰{}╯", "─".repeat(width.saturating_sub(2).max(1)));
         let _ = write!(
             output,
             "{}",
-            "╰─".bold().with(self.color_theme.code_block_border)
+            line.bold().with(self.color_theme.code_block_border)
         );
         output.push_str("\n\n");
     }
@@ -1447,6 +1457,13 @@ pub fn terminal_width() -> usize {
     crossterm::terminal::size()
         .map_or(80, |(cols, _)| cols as usize)
         .clamp(40, 100)
+}
+
+/// Width of the top/bottom rules framing a code block — a little under the
+/// terminal so it still fits inside the answer's 4-space left margin without
+/// wrapping. Slice 17.
+fn code_frame_width() -> usize {
+    terminal_width().saturating_sub(6).max(20)
 }
 
 /// Render `body` inside a width-aware rounded panel matching gi's tool-call box

@@ -219,7 +219,10 @@ impl LineEditor {
         // A mode/detail cycle keeps the cursor inside the box so the next render
         // can clear + redraw it in place; everything else commits a newline so
         // the following output starts on a fresh line. Slice 16/17.
-        if !matches!(outcome, Ok(ReadOutcome::CycleMode(_))) {
+        if !matches!(
+            outcome,
+            Ok(ReadOutcome::CycleMode(_)) | Ok(ReadOutcome::CycleVerbosity(_))
+        ) {
             let mut stdout = io::stdout();
             let _ = write!(stdout, "\r\n");
             let _ = stdout.flush();
@@ -294,11 +297,12 @@ impl LineEditor {
                     selected = 0;
                     dismissed = false;
                 }
-                // Ctrl+O cycles the detail level and re-prints the last turn's
-                // detail below the prompt — so commit the line (cursor below the
-                // box) and carry the typed text. Slice 17.
+                // Ctrl+O cycles the detail level. Re-render in place (cursor stays
+                // in the box) and keep the block state so the re-seeded prompt
+                // redraws over it — the status line reflects the new level and no
+                // duplicate box is committed to scrollback. Slice 17.
                 (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
-                    self.commit_render(&buffer)?;
+                    self.render(&buffer, cursor, None, 0)?;
                     return Ok(ReadOutcome::CycleVerbosity(std::mem::take(&mut buffer)));
                 }
                 // Shift+Enter and Alt+Enter both insert a newline (Ctrl+J does too,

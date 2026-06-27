@@ -8204,11 +8204,11 @@ fn run_repl(
                 pending_input = Some(buffer);
             }
             input::ReadOutcome::CycleVerbosity(buffer) => {
-                // Cycle the detail level and re-print the last turn's detail at
-                // that level (the line REPL can't re-render the scrollback in
-                // place). Carry the typed text into a fresh prompt. Slice 17.
+                // Cycle the detail level in place: the prompt box redraws over
+                // itself with its status line showing the new level, carrying the
+                // typed text. The level applies to subsequent output; the
+                // full-screen TUI re-renders existing scrollback. Slice 17.
                 cycle_verbosity();
-                cli.reprint_last_turn();
                 pending_input = Some(buffer);
             }
             input::ReadOutcome::Exit => {
@@ -9681,70 +9681,6 @@ impl LiveCli {
     /// Take the last turn's assistant text (consumed by the TUI). Slice 14b.
     fn take_last_response(&mut self) -> Option<String> {
         self.last_response.take()
-    }
-
-    /// Re-print the last turn at the current detail level: the assistant answer
-    /// always, plus tool outputs and (in raw) thinking. The line REPL can't
-    /// re-render scrollback, so Ctrl+O / `/verbose` re-emits it below the prompt.
-    /// Never silent — prints a dim note when there's nothing captured, so the
-    /// keypress always has visible feedback. Slice 17.
-    fn reprint_last_turn(&self) {
-        let level = verbosity();
-        println!("\n\x1b[2m↻ last turn · detail: {}\x1b[0m", level.as_str());
-        if self.last_turn_entries.is_empty() {
-            println!("\x1b[2m(nothing to expand from the last turn)\x1b[0m");
-            return;
-        }
-        let answer_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
-        let mut printed_any = false;
-        for entry in &self.last_turn_entries {
-            match entry {
-                tui::TranscriptEntry::Tool {
-                    name,
-                    output,
-                    is_error,
-                } => {
-                    let mark = if *is_error {
-                        "\x1b[1;31m✘"
-                    } else {
-                        "\x1b[1;36m⚙"
-                    };
-                    println!("{mark} {name}\x1b[0m");
-                    let shown = truncate_output_for_display(
-                        output,
-                        TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                        TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-                    );
-                    if shown.is_empty() {
-                        println!("\x1b[2m(no output)\x1b[0m");
-                    } else {
-                        println!("{shown}");
-                    }
-                    printed_any = true;
-                }
-                tui::TranscriptEntry::Thinking(text) if level.shows_thinking() => {
-                    println!("\x1b[2m▶ Thinking\n{text}\x1b[0m");
-                    printed_any = true;
-                }
-                tui::TranscriptEntry::Assistant(text) => {
-                    println!("\n{}", render::answer_header(answer_color));
-                    println!(
-                        "{}",
-                        truncate_output_for_display(
-                            text,
-                            TOOL_OUTPUT_DISPLAY_MAX_LINES,
-                            TOOL_OUTPUT_DISPLAY_MAX_CHARS,
-                        )
-                    );
-                    printed_any = true;
-                }
-                _ => {}
-            }
-        }
-        if !printed_any {
-            // e.g. the turn had only thinking but we're not in raw mode yet.
-            println!("\x1b[2m(press Ctrl+O again to reveal more detail)\x1b[0m");
-        }
     }
 
     /// Full-screen TUI control loop (Slice 14b foundation). Renders a status bar

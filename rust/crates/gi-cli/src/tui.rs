@@ -16,7 +16,13 @@ pub(crate) enum TranscriptEntry {
     Assistant(String),
     System(String),
     Tool {
+        /// Tool-use id, used to pair a streamed result with its call. Empty for
+        /// entries captured post-turn where the id isn't needed.
+        id: String,
         name: String,
+        /// One-line call detail (e.g. `$ ls -la`, `📄 Reading x`), shown while the
+        /// tool runs and above its output. Empty when not captured.
+        summary: String,
         output: String,
         is_error: bool,
     },
@@ -167,6 +173,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                 name,
                 output,
                 is_error,
+                ..
             } => {
                 let mark = if *is_error { "✘" } else { "⚙" };
                 let head = Style::default().fg(if *is_error {

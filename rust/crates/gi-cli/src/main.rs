@@ -22,6 +22,7 @@ mod opencode_interop;
 mod render;
 mod setup_wizard;
 mod tui;
+mod tui_stream;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -16661,7 +16662,9 @@ fn capture_tui_entries(summary: &runtime::TurnSummary) -> Vec<tui::TranscriptEnt
             if let ContentBlock::ToolUse { id, name, .. } = block {
                 let (output, is_error) = results.get(id).cloned().unwrap_or_default();
                 entries.push(tui::TranscriptEntry::Tool {
+                    id: id.clone(),
                     name: name.clone(),
+                    summary: String::new(),
                     output,
                     is_error,
                 });

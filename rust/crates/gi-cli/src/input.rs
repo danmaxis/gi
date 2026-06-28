@@ -32,10 +32,82 @@ const POPUP_MAX: usize = 5;
 
 /// One row in the command popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PopupItem {
-    command: String,
-    description: String,
-    needs_arg: bool,
+pub(crate) struct PopupItem {
+    pub(crate) command: String,
+    pub(crate) description: String,
+    pub(crate) needs_arg: bool,
+}
+
+/// Build the slash-command popup for `buffer` against `completions` (ranked by
+/// recency/usefulness via `history`), or `None` when it isn't a bare command.
+/// Shared by the line REPL and the full-screen input. Slice: unified mode.
+pub(crate) fn command_popup(
+    buffer: &str,
+    completions: &[String],
+    history: &[String],
+) -> Option<Vec<PopupItem>> {
+    if !buffer.starts_with('/') || buffer.contains(' ') || buffer.contains('\n') {
+        return None;
+    }
+    let mut scored: Vec<(i64, &String)> = if buffer == "/" {
+        completions
+            .iter()
+            .filter(|candidate| !candidate.contains(' '))
+            .map(|candidate| (empty_filter_rank(candidate, history), candidate))
+            .collect()
+    } else {
+        completions
+            .iter()
+            .filter(|candidate| !candidate.contains(' '))
+            .filter_map(|candidate| fuzzy_score(candidate, buffer).map(|score| (score, candidate)))
+            .collect()
+    };
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.truncate(POPUP_MAX);
+    Some(
+        scored
+            .into_iter()
+            .map(|(_, candidate)| PopupItem {
+                command: candidate.clone(),
+                description: describe_completion(candidate).unwrap_or("").to_string(),
+                needs_arg: command_needs_arg(candidate),
+            })
+            .collect(),
+    )
+}
+
+/// Build the `@`-mention popup for `prefix` against `mention_candidates`, or
+/// `None` when there are no matches. Shared with the full-screen input.
+pub(crate) fn mention_popup(prefix: &str, mention_candidates: &[String]) -> Option<Vec<PopupItem>> {
+    if mention_candidates.is_empty() {
+        return None;
+    }
+    let mut scored: Vec<(i64, &String)> = if prefix.is_empty() {
+        mention_candidates
+            .iter()
+            .map(|candidate| (0i64, candidate))
+            .collect()
+    } else {
+        mention_candidates
+            .iter()
+            .filter_map(|candidate| fuzzy_score(candidate, prefix).map(|score| (score, candidate)))
+            .collect()
+    };
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    scored.truncate(POPUP_MAX);
+    if scored.is_empty() {
+        return None;
+    }
+    Some(
+        scored
+            .into_iter()
+            .map(|(_, candidate)| PopupItem {
+                command: format!("@{candidate}"),
+                description: mention_kind(candidate).to_string(),
+                needs_arg: candidate.ends_with('/'),
+            })
+            .collect(),
+    )
 }
 
 /// Max visible content rows in the input box before it scrolls. Slice 16.
@@ -128,78 +200,13 @@ impl LineEditor {
     /// Build the filtered command popup for the current buffer, or `None` when a
     /// command menu should not be shown (not a bare slash command).
     fn build_popup(&self, buffer: &str) -> Option<Vec<PopupItem>> {
-        if !buffer.starts_with('/') || buffer.contains(' ') || buffer.contains('\n') {
-            return None;
-        }
-        let mut scored: Vec<(i64, &String)> = if buffer == "/" {
-            // Empty filter: order by context/usefulness (curated priorities +
-            // recent use), not shortest-length, and keep answer-style tokens
-            // (`/y`, `/n`, …) out of the initial suggestions. Slice 11.
-            self.completions
-                .iter()
-                .filter(|candidate| !candidate.contains(' '))
-                .map(|candidate| (empty_filter_rank(candidate, &self.history), candidate))
-                .collect()
-        } else {
-            self.completions
-                .iter()
-                .filter(|candidate| !candidate.contains(' '))
-                .filter_map(|candidate| {
-                    fuzzy_score(candidate, buffer).map(|score| (score, candidate))
-                })
-                .collect()
-        };
-        // Sort by score descending; tie-break by name for deterministic order.
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.truncate(POPUP_MAX);
-        Some(
-            scored
-                .into_iter()
-                .map(|(_, candidate)| PopupItem {
-                    command: candidate.clone(),
-                    description: describe_completion(candidate).unwrap_or("").to_string(),
-                    needs_arg: command_needs_arg(candidate),
-                })
-                .collect(),
-        )
+        command_popup(buffer, &self.completions, &self.history)
     }
 
     /// Build the `@`-mention popup for `prefix` (the text after `@`), or `None`
     /// when there are no candidates / no matches.
     fn build_mention_popup(&self, prefix: &str) -> Option<Vec<PopupItem>> {
-        if self.mention_candidates.is_empty() {
-            return None;
-        }
-        let mut scored: Vec<(i64, &String)> = if prefix.is_empty() {
-            self.mention_candidates
-                .iter()
-                .map(|candidate| (0i64, candidate))
-                .collect()
-        } else {
-            self.mention_candidates
-                .iter()
-                .filter_map(|candidate| {
-                    fuzzy_score(candidate, prefix).map(|score| (score, candidate))
-                })
-                .collect()
-        };
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.truncate(POPUP_MAX);
-        if scored.is_empty() {
-            return None;
-        }
-        Some(
-            scored
-                .into_iter()
-                .map(|(_, candidate)| PopupItem {
-                    command: format!("@{candidate}"),
-                    description: mention_kind(candidate).to_string(),
-                    // A directory keeps the popup open so the user can drill in;
-                    // a file/resource is a complete token.
-                    needs_arg: candidate.ends_with('/'),
-                })
-                .collect(),
-        )
+        mention_popup(prefix, &self.mention_candidates)
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -730,13 +737,13 @@ fn char_index_at(wrapped: &Wrapped, row: usize, col: usize) -> usize {
     wrapped.row_start[row] + col.min(row_len)
 }
 
-fn insert_char(buffer: &mut String, cursor: &mut usize, ch: char) {
+pub(crate) fn insert_char(buffer: &mut String, cursor: &mut usize, ch: char) {
     let byte = byte_index(buffer, *cursor);
     buffer.insert(byte, ch);
     *cursor += 1;
 }
 
-fn remove_char(buffer: &mut String, char_index: usize) {
+pub(crate) fn remove_char(buffer: &mut String, char_index: usize) {
     let byte = byte_index(buffer, char_index);
     buffer.remove(byte);
 }
@@ -744,7 +751,7 @@ fn remove_char(buffer: &mut String, char_index: usize) {
 /// If the whitespace-delimited token ending at `cursor` is an `@`-mention at a
 /// word boundary (line start or preceded by whitespace — so `a@b` emails don't
 /// trigger), return `(char index of '@', prefix after '@')`.
-fn at_mention_prefix(buffer: &str, cursor: usize) -> Option<(usize, String)> {
+pub(crate) fn at_mention_prefix(buffer: &str, cursor: usize) -> Option<(usize, String)> {
     let chars: Vec<char> = buffer.chars().collect();
     let cursor = cursor.min(chars.len());
     let mut start = cursor;
@@ -762,7 +769,12 @@ fn at_mention_prefix(buffer: &str, cursor: usize) -> Option<(usize, String)> {
 
 /// Replace buffer chars `[start, cursor)` with `replacement`, leaving the cursor
 /// just past the inserted text.
-fn splice_token(buffer: &mut String, cursor: &mut usize, start: usize, replacement: &str) {
+pub(crate) fn splice_token(
+    buffer: &mut String,
+    cursor: &mut usize,
+    start: usize,
+    replacement: &str,
+) {
     let chars: Vec<char> = buffer.chars().collect();
     let prefix: String = chars[..start.min(chars.len())].iter().collect();
     let suffix: String = chars[(*cursor).min(chars.len())..].iter().collect();

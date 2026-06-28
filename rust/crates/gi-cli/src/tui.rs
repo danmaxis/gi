@@ -47,6 +47,12 @@ pub(crate) struct TuiState<'a> {
     pub verbosity: crate::render::RenderVerbosity,
     /// When set, a permission approval overlay is drawn over the transcript.
     pub approval: Option<&'a ApprovalView>,
+    /// Cursor position (char index) within `input`.
+    pub input_cursor: usize,
+    /// Command/`@`-mention popup rows (label, description); empty = no popup.
+    pub popup: &'a [(String, String)],
+    /// Highlighted popup row.
+    pub popup_selected: usize,
 }
 
 /// A pending permission request rendered as a centered overlay. Slice: unified
@@ -129,11 +135,14 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
     let accent_color = accent(state.mode);
     let border = Style::default().fg(accent_color);
 
-    // Input box grows with its content (up to 7 rows), plus borders.
+    // Input box grows with its content (up to 7 rows), plus borders. A popup
+    // (slash commands / @-mentions) gets its own band below the input.
     let input_rows = state.input.split('\n').count().clamp(1, 7) as u16;
+    let popup_rows = (state.popup.len() as u16).min(6);
     let chunks = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(input_rows + 2),
+        Constraint::Length(popup_rows),
         Constraint::Length(1),
     ])
     .split(area);
@@ -267,20 +276,56 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[1]);
 
-    // Cursor: after the `❯ ` glyph on the (last) input line. Foundation: the
-    // cursor lives at the end of the buffer.
-    let last_input_line = state.input.rsplit('\n').next().unwrap_or("");
-    let extra_rows = state.input.matches('\n').count().min(6) as u16;
-    let cursor_x = chunks[1].x + 1 + 2 + last_input_line.chars().count() as u16;
+    // Cursor: derive (row, col) from the char index so Left/Right/Home/End and
+    // mid-buffer edits land the caret correctly.
+    let before: String = state.input.chars().take(state.input_cursor).collect();
+    let cursor_row = before.matches('\n').count().min(6) as u16;
+    let cursor_col = before.rsplit('\n').next().unwrap_or("").chars().count() as u16;
+    let cursor_x = chunks[1].x + 1 + 2 + cursor_col;
     let max_x = chunks[1].x + chunks[1].width.saturating_sub(2);
-    frame.set_cursor_position((cursor_x.min(max_x), chunks[1].y + 1 + extra_rows));
+    frame.set_cursor_position((cursor_x.min(max_x), chunks[1].y + 1 + cursor_row));
+
+    // Popup (slash commands / @-mentions) below the input box.
+    if !state.popup.is_empty() {
+        let rows: Vec<Line> = state
+            .popup
+            .iter()
+            .enumerate()
+            .map(|(i, (label, desc))| {
+                let marker = if i == state.popup_selected {
+                    "❯ "
+                } else {
+                    "  "
+                };
+                let mut spans = vec![
+                    Span::styled(marker, Style::default().fg(accent_color)),
+                    Span::styled(
+                        label.clone(),
+                        if i == state.popup_selected {
+                            Style::default().fg(accent_color).bold()
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                ];
+                if !desc.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  {desc}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(rows), chunks[2]);
+    }
 
     // Status bar.
     let status = Paragraph::new(Line::styled(
         format!(" {} ", state.status),
         Style::default().fg(Color::DarkGray),
     ));
-    frame.render_widget(status, chunks[2]);
+    frame.render_widget(status, chunks[3]);
 
     // Permission approval overlay (centered, over the transcript).
     if let Some(approval) = state.approval {

@@ -22,6 +22,7 @@ mod opencode_interop;
 mod render;
 mod setup_wizard;
 mod tui;
+mod tui_input;
 mod tui_stream;
 
 use std::collections::BTreeSet;
@@ -9721,7 +9722,9 @@ impl LiveCli {
     }
 
     /// Draw one full-screen frame. `busy` shows the thinking indicator; when
-    /// `approval` is set a centered approval overlay is drawn. Slice: unified mode.
+    /// `approval` is set a centered approval overlay is drawn. `input`/`cursor`
+    /// and `popup` render the editable prompt and its completion popup. Slice:
+    /// unified full-screen mode.
     #[allow(clippy::too_many_arguments)]
     fn tui_draw(
         &self,
@@ -9729,6 +9732,9 @@ impl LiveCli {
         status_branch: &str,
         transcript: &[tui::TranscriptEntry],
         input: &str,
+        input_cursor: usize,
+        popup: &[(String, String)],
+        popup_selected: usize,
         scroll_back: u16,
         busy: bool,
         approval: Option<&tui::ApprovalView>,
@@ -9754,6 +9760,9 @@ impl LiveCli {
                     busy,
                     verbosity: verbosity(),
                     approval,
+                    input_cursor,
+                    popup,
+                    popup_selected,
                 },
             );
         })?;
@@ -9773,15 +9782,34 @@ impl LiveCli {
                 "Connected: {} · Esc or /exit to quit · Ctrl+O for detail",
                 self.model
             ))];
-        let mut input = String::new();
+        let mut tinput = tui_input::TuiInput::new();
+        // Seed input history from this session's prompts.
+        tinput.set_history(
+            self.prompt_history
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect(),
+        );
+        let cwd = env::current_dir().unwrap_or_default();
         let mut scroll_back: u16 = 0;
 
         let outcome = loop {
+            // Refresh completion + @-mention candidates each frame.
+            tinput.set_completions(self.repl_completion_candidates().unwrap_or_default());
+            tinput.set_mentions(workspace_mention_candidates(&cwd));
+            let popup = tinput.popup_view();
+            let (popup_rows, popup_selected) = popup
+                .as_ref()
+                .map_or((Vec::new(), 0), |(rows, sel)| (rows.clone(), *sel));
+
             if let Err(error) = self.tui_draw(
                 &mut terminal,
                 status_branch,
                 &transcript,
-                &input,
+                tinput.buffer(),
+                tinput.cursor(),
+                &popup_rows,
+                popup_selected,
                 scroll_back,
                 false,
                 None,
@@ -9800,44 +9828,67 @@ impl LiveCli {
             };
 
             match (key.code, key.modifiers) {
-                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                // Esc dismisses an open popup first; otherwise it exits.
+                (KeyCode::Esc, _) => {
+                    if tinput.has_popup() {
+                        tinput.dismiss_popup();
+                    } else {
+                        break Ok(());
+                    }
+                }
                 (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                     cycle_verbosity();
                 }
-                (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => input.push('\n'),
-                (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => input.push('\n'),
-                (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.push('\n'),
-                (KeyCode::Backspace, _) => {
-                    input.pop();
-                }
                 (KeyCode::PageUp, _) => scroll_back = scroll_back.saturating_add(3),
                 (KeyCode::PageDown, _) => scroll_back = scroll_back.saturating_sub(3),
-                (KeyCode::Enter, _) => {
-                    let prompt = input.trim().to_string();
-                    input.clear();
-                    scroll_back = 0;
-                    if prompt.is_empty() {
-                        continue;
-                    }
-                    if matches!(prompt.as_str(), "/exit" | "/quit") {
-                        break Ok(());
-                    }
-                    transcript.push(tui::TranscriptEntry::User(prompt.clone()));
-                    self.record_prompt_history(&prompt);
-                    if let Err(error) = self.run_streaming_turn(
-                        &mut terminal,
-                        status_branch,
-                        &mut transcript,
-                        &mut scroll_back,
-                        &prompt,
-                    ) {
-                        transcript.push(tui::TranscriptEntry::System(format!("error: {error}")));
+                (code, mods) => {
+                    if let tui_input::InputAction::Submit(text) = tinput.on_key(code, mods) {
+                        let prompt = text.trim().to_string();
+                        scroll_back = 0;
+                        if prompt.is_empty() {
+                            continue;
+                        }
+                        tinput.push_history(&prompt);
+                        if matches!(prompt.as_str(), "/exit" | "/quit") {
+                            break Ok(());
+                        }
+                        // Slash commands (incl. modals like /agents) run outside the
+                        // alt-screen: suspend it, run the command, then re-enter.
+                        match SlashCommand::parse(&prompt) {
+                            Ok(Some(command)) => {
+                                ratatui::restore();
+                                set_tui_active(false);
+                                if let Err(error) = self.handle_repl_command(command) {
+                                    eprintln!("{error}");
+                                }
+                                let _ = self.persist_session();
+                                terminal = ratatui::init();
+                                set_tui_active(true);
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                transcript.push(tui::TranscriptEntry::System(format!("{error}")));
+                                continue;
+                            }
+                        }
+                        transcript.push(tui::TranscriptEntry::User(prompt.clone()));
+                        self.record_prompt_history(&prompt);
+                        // Expand @path mentions into inline context before the turn.
+                        let expanded = expand_at_mentions(&prompt, &cwd);
+                        if let Err(error) = self.run_streaming_turn(
+                            &mut terminal,
+                            status_branch,
+                            &mut transcript,
+                            &mut scroll_back,
+                            &expanded,
+                        ) {
+                            transcript
+                                .push(tui::TranscriptEntry::System(format!("error: {error}")));
+                        }
                     }
                 }
-                (KeyCode::Char(ch), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
-                    input.push(ch);
-                }
-                _ => {}
             }
         };
 
@@ -9875,6 +9926,9 @@ impl LiveCli {
                 status_branch,
                 transcript,
                 "",
+                0,
+                &[],
+                0,
                 *scroll_back,
                 true,
                 approval.as_ref(),
@@ -10284,23 +10338,6 @@ impl LiveCli {
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
-        Ok(())
-    }
-
-    /// Run a turn for the TUI: silent (no streaming/spinner/stdout, so the
-    /// alt-screen stays intact), auto-approving tool calls. Stores the final
-    /// assistant text in `last_response` for the transcript. Slice 14b.
-    fn run_turn_capture(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut prompter = TuiAutoPrompter;
-        let result = runtime.run_turn(input, Some(&mut prompter));
-        hook_abort_monitor.stop();
-        let summary = result?;
-        self.replace_runtime(runtime)?;
-        self.last_response = Some(final_assistant_text(&summary));
-        self.last_turn_entries = capture_tui_entries(&summary);
-        maybe_capture_memory_turn(input, &summary);
-        self.persist_session()?;
         Ok(())
     }
 
@@ -16029,22 +16066,6 @@ fn approve_all_for_session() {
 #[cfg(test)]
 fn reset_session_approvals() {
     SESSION_APPROVALS.with(|cell| *cell.borrow_mut() = SessionApprovals::default());
-}
-
-/// Permission prompter used inside the TUI: auto-approves silently (no
-/// stdin/stdout, which would corrupt the alt-screen). The interactive
-/// approval/plan tools are disabled in TUI mode, and the user opted into
-/// `--tui` explicitly; in-TUI approval prompts are a documented follow-up.
-/// Slice 14b.
-struct TuiAutoPrompter;
-
-impl runtime::PermissionPrompter for TuiAutoPrompter {
-    fn decide(
-        &mut self,
-        _request: &runtime::PermissionRequest,
-    ) -> runtime::PermissionPromptDecision {
-        runtime::PermissionPromptDecision::Allow
-    }
 }
 
 struct CliPermissionPrompter {

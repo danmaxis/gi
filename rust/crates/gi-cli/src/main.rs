@@ -9175,6 +9175,31 @@ impl HookAbortMonitor {
     }
 }
 
+/// Pure-output slash commands whose text can be safely captured into the
+/// full-screen transcript: no interactive modal, and no stdin reads (so they
+/// can't deadlock under the alt-screen). Anything not listed suspends the
+/// alt-screen instead — the safe default for unknown/interactive commands.
+fn is_capturable_text_command(command: &SlashCommand) -> bool {
+    matches!(
+        command,
+        SlashCommand::Help
+            | SlashCommand::Status
+            | SlashCommand::Cost
+            | SlashCommand::Diff
+            | SlashCommand::Version
+            | SlashCommand::Doctor
+            | SlashCommand::Config { .. }
+            | SlashCommand::History { .. }
+            | SlashCommand::Mcp { .. }
+            | SlashCommand::Memory { args: Some(_) }
+            | SlashCommand::Agents { args: Some(_) }
+            | SlashCommand::Plugins {
+                action: Some(_),
+                ..
+            }
+    )
+}
+
 /// Whether the line REPL should use an interactive selection modal: both stdin
 /// and stdout must be a TTY (piped/non-interactive falls back to textual lists,
 /// which tests and scripts depend on). Slice: selection modals.
@@ -9792,11 +9817,12 @@ impl LiveCli {
         );
         let cwd = env::current_dir().unwrap_or_default();
         let mut scroll_back: u16 = 0;
+        // Candidates are cached and only refreshed after a turn or command (not
+        // per frame) — `workspace_mention_candidates` shells out to git.
+        tinput.set_completions(self.repl_completion_candidates().unwrap_or_default());
+        tinput.set_mentions(workspace_mention_candidates(&cwd));
 
         let outcome = loop {
-            // Refresh completion + @-mention candidates each frame.
-            tinput.set_completions(self.repl_completion_candidates().unwrap_or_default());
-            tinput.set_mentions(workspace_mention_candidates(&cwd));
             let popup = tinput.popup_view();
             let (popup_rows, popup_selected) = popup
                 .as_ref()
@@ -9857,14 +9883,36 @@ impl LiveCli {
                         // alt-screen: suspend it, run the command, then re-enter.
                         match SlashCommand::parse(&prompt) {
                             Ok(Some(command)) => {
-                                ratatui::restore();
-                                set_tui_active(false);
-                                if let Err(error) = self.handle_repl_command(command) {
-                                    eprintln!("{error}");
+                                transcript.push(tui::TranscriptEntry::User(prompt.clone()));
+                                if is_capturable_text_command(&command) {
+                                    // Pure-output command: capture its text into the
+                                    // transcript instead of leaking onto the screen.
+                                    let output = self.run_slash_capturing(command);
+                                    let _ = self.persist_session();
+                                    let trimmed = output.trim_end();
+                                    if !trimmed.is_empty() {
+                                        transcript.push(tui::TranscriptEntry::System(
+                                            trimmed.to_string(),
+                                        ));
+                                    }
+                                } else {
+                                    // Modal / interactive (may read stdin): suspend
+                                    // the alt-screen, run on the real terminal, then
+                                    // re-enter.
+                                    ratatui::restore();
+                                    set_tui_active(false);
+                                    if let Err(error) = self.handle_repl_command(command) {
+                                        eprintln!("{error}");
+                                    }
+                                    let _ = self.persist_session();
+                                    terminal = ratatui::init();
+                                    set_tui_active(true);
                                 }
-                                let _ = self.persist_session();
-                                terminal = ratatui::init();
-                                set_tui_active(true);
+                                // A command may change model/agents/files.
+                                tinput.set_completions(
+                                    self.repl_completion_candidates().unwrap_or_default(),
+                                );
+                                tinput.set_mentions(workspace_mention_candidates(&cwd));
                                 continue;
                             }
                             Ok(None) => {}
@@ -9887,6 +9935,8 @@ impl LiveCli {
                             transcript
                                 .push(tui::TranscriptEntry::System(format!("error: {error}")));
                         }
+                        // Refresh @-mention candidates: the turn may have created files.
+                        tinput.set_mentions(workspace_mention_candidates(&cwd));
                     }
                 }
             }
@@ -10015,6 +10065,34 @@ impl LiveCli {
         }
         self.persist_session()?;
         Ok(())
+    }
+
+    /// Run a non-interactive slash command while the alt-screen stays up,
+    /// capturing its stdout (by redirecting fd 1 to a temp file) so the output
+    /// can be shown inside the transcript instead of leaking onto the real
+    /// terminal. ANSI-stripped. Unix-only. Slice: unified full-screen mode.
+    fn run_slash_capturing(&mut self, command: SlashCommand) -> String {
+        use std::os::fd::AsRawFd;
+        let _ = io::stdout().flush();
+        let path = env::temp_dir().join(format!("gi-slash-{}.out", std::process::id()));
+        let Ok(file) = std::fs::File::create(&path) else {
+            let _ = self.handle_repl_command(command);
+            return String::new();
+        };
+        let stdout_fd = io::stdout().as_raw_fd();
+        let Ok(saved) = nix::unistd::dup(stdout_fd) else {
+            let _ = self.handle_repl_command(command);
+            return String::new();
+        };
+        let _ = nix::unistd::dup2(file.as_raw_fd(), stdout_fd);
+        let _ = self.handle_repl_command(command);
+        let _ = io::stdout().flush();
+        let _ = nix::unistd::dup2(saved, stdout_fd);
+        let _ = nix::unistd::close(saved);
+        drop(file);
+        let captured = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        render::strip_ansi(&captured)
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {

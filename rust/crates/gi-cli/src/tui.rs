@@ -7,7 +7,7 @@
 //! the result here. The default line-stream REPL is untouched.
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 /// One entry in the scrollback transcript. Tool/thinking entries keep their raw
 /// data so Ctrl+O can re-render them at any detail level. Slice 17.
@@ -45,6 +45,16 @@ pub(crate) struct TuiState<'a> {
     pub busy: bool,
     /// Detail level (Ctrl+O): controls tool-output truncation + thinking. Slice 17.
     pub verbosity: crate::render::RenderVerbosity,
+    /// When set, a permission approval overlay is drawn over the transcript.
+    pub approval: Option<&'a ApprovalView>,
+}
+
+/// A pending permission request rendered as a centered overlay. Slice: unified
+/// full-screen mode.
+pub(crate) struct ApprovalView {
+    pub tool_name: String,
+    pub action: String,
+    pub preview: Vec<String>,
 }
 
 /// Accent color for the active mode (mirrors `render::mode_accent`).
@@ -158,7 +168,12 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                 ));
             }
             TranscriptEntry::Assistant(text) => {
-                lines.extend(block(&format!("◂ gi  {text}"), Style::default(), false));
+                // `◂ gi` header on its own dim line, then the answer body with a
+                // small left gutter — mirrors the inline default look. Slice 17.
+                lines.extend(block("◂ gi", dim, false));
+                for line in text.lines() {
+                    lines.extend(block(&format!("  {line}"), Style::default(), false));
+                }
             }
             TranscriptEntry::System(text) => {
                 lines.extend(block(&format!("· {text}"), dim, true));
@@ -171,6 +186,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
             }
             TranscriptEntry::Tool {
                 name,
+                summary,
                 output,
                 is_error,
                 ..
@@ -182,6 +198,13 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                     accent_color
                 });
                 lines.extend(block(&format!("{mark} {name}"), head, false));
+                // The call detail (args) under the header, while running and after.
+                for line in summary.lines().filter(|line| !line.trim().is_empty()) {
+                    lines.extend(block(&format!("  {line}"), dim, true));
+                }
+                if output.is_empty() {
+                    lines.extend(block("  …", dim, true));
+                }
                 // Output: full in verbose/raw, else first lines + a Ctrl+O hint.
                 let out_lines: Vec<&str> = output.lines().collect();
                 let limit = if state.verbosity.shows_full() {
@@ -258,6 +281,41 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         Style::default().fg(Color::DarkGray),
     ));
     frame.render_widget(status, chunks[2]);
+
+    // Permission approval overlay (centered, over the transcript).
+    if let Some(approval) = state.approval {
+        let mut body: Vec<Line> = Vec::new();
+        body.push(Line::styled(
+            approval.action.clone(),
+            Style::default().bold(),
+        ));
+        for line in &approval.preview {
+            body.push(Line::styled(line.clone(), dim));
+        }
+        body.push(Line::raw(""));
+        body.push(Line::styled(
+            "[y]es   [n]o   [a]lways this tool   [A]ll tools",
+            Style::default().fg(accent_color).bold(),
+        ));
+        let height = (body.len() as u16 + 2).min(area.height);
+        let width = (area.width * 3 / 4).clamp(20, area.width.saturating_sub(2));
+        let popup = Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(Clear, popup);
+        let overlay = Paragraph::new(body)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(236, 72, 120)))
+                    .title(format!(" approve · {} ", approval.tool_name)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(overlay, popup);
+    }
 }
 
 #[cfg(test)]

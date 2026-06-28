@@ -55,7 +55,9 @@ pub enum HookProgressEvent {
     },
 }
 
-pub trait HookProgressReporter {
+/// `Send` so a `ConversationRuntime` carrying a boxed reporter can run on a
+/// worker thread (the full-screen mode streams turns off the UI thread).
+pub trait HookProgressReporter: Send {
     fn on_event(&mut self, event: &HookProgressEvent);
 }
 

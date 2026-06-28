@@ -877,6 +877,8 @@ fn global_flag_without_value(flag: &str) -> bool {
             | "--compact"
             | "--allow-broad-cwd"
             | "--tui"
+            | "--inline"
+            | "--no-tui"
             | "--print"
             | "--acp"
             | "-acp"
@@ -1600,7 +1602,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
-    let mut tui = false;
+    // `--inline`/`--no-tui` opt out of the default full-screen mode and use the
+    // classic inline streaming REPL.
+    let mut inline = false;
 
     // #755: -p prompt text captured as single token; remaining args continue
     // flag parsing. None until `-p <text>` is seen.
@@ -1753,7 +1757,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 index += 1;
             }
             "--tui" => {
-                tui = true;
+                // Full-screen is the default now; accept --tui as a no-op alias.
+                index += 1;
+            }
+            "--inline" | "--no-tui" => {
+                inline = true;
                 index += 1;
             }
             "--" => {
@@ -1803,9 +1811,33 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
             }
             "--print" => {
-                // Gi Code compat: --print makes output non-interactive
-                output_format = CliOutputFormat::Text;
-                index += 1;
+                // `--print "text"` is a one-shot console answer (alias of -p).
+                // Bare `--print` (no prompt token, e.g. piped) keeps its legacy
+                // meaning: force non-interactive text output.
+                match args.get(index + 1).map(String::as_str) {
+                    Some(tok) if !tok.is_empty() && (!tok.starts_with('-') || tok == "--") => {
+                        let (prompt_text, skip) = if tok == "--" {
+                            match args.get(index + 2) {
+                                Some(t) => (t.as_str(), 3usize),
+                                None => {
+                                    return Err("missing_prompt: --print -- requires a prompt string after `--`.\nUsage: gi --print -- <text>".to_string());
+                                }
+                            }
+                        } else {
+                            (tok, 2usize)
+                        };
+                        if !prompt_text.trim().is_empty() {
+                            short_p_prompt = Some(prompt_text.to_string());
+                        }
+                        output_format = CliOutputFormat::Text;
+                        index += skip;
+                        continue;
+                    }
+                    _ => {
+                        output_format = CliOutputFormat::Text;
+                        index += 1;
+                    }
+                }
             }
             "--resume" if rest.is_empty() => {
                 rest.push("--resume".to_string());
@@ -1985,7 +2017,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             // #746: newline before remediation so split_error_hint populates hint field
             return Err("interactive_only: gi requires an interactive terminal.\nStdin is not a TTY and no prompt was provided — pipe a prompt with `echo 'task' | gi` or run `gi` in an interactive terminal.".into());
         }
-        if tui {
+        // Full-screen is the default interactive mode. `--inline`/`--no-tui` opts
+        // into the classic inline REPL, and a non-TTY stdout (redirected output)
+        // falls back to it too since the alt-screen needs a real terminal.
+        let use_fullscreen = !inline && io::stdout().is_terminal();
+        if use_fullscreen {
             return Ok(CliAction::Tui {
                 model,
                 allowed_tools,
@@ -9684,10 +9720,49 @@ impl LiveCli {
         self.last_response.take()
     }
 
-    /// Full-screen TUI control loop (Slice 14b foundation). Renders a status bar
-    /// + scrollback transcript + bordered input via ratatui; a submitted prompt
-    /// suspends the TUI, runs the turn with normal streaming output, then records
-    /// the result in the transcript and resumes.
+    /// Draw one full-screen frame. `busy` shows the thinking indicator; when
+    /// `approval` is set a centered approval overlay is drawn. Slice: unified mode.
+    #[allow(clippy::too_many_arguments)]
+    fn tui_draw(
+        &self,
+        terminal: &mut ratatui::DefaultTerminal,
+        status_branch: &str,
+        transcript: &[tui::TranscriptEntry],
+        input: &str,
+        scroll_back: u16,
+        busy: bool,
+        approval: Option<&tui::ApprovalView>,
+    ) -> std::io::Result<()> {
+        let status = compose_status_line(
+            &self.model,
+            self.runtime.estimated_tokens(),
+            status_branch,
+            false,
+        );
+        let title = self.header_label();
+        let mode = self.mode.as_str().to_string();
+        terminal.draw(|frame| {
+            tui::draw(
+                frame,
+                &tui::TuiState {
+                    transcript,
+                    input,
+                    title: &title,
+                    mode: &mode,
+                    status: &status,
+                    scroll_back,
+                    busy,
+                    verbosity: verbosity(),
+                    approval,
+                },
+            );
+        })?;
+        Ok(())
+    }
+
+    /// The unified full-screen interactive loop: streams each turn live into the
+    /// transcript, prompts for approvals in-UI, repaints the whole session on
+    /// Ctrl+O, and dumps the transcript to scrollback on exit. Slice: unified mode.
     fn run_tui_loop(&mut self, status_branch: &str) -> Result<(), Box<dyn std::error::Error>> {
         use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -9701,46 +9776,18 @@ impl LiveCli {
         let mut input = String::new();
         let mut scroll_back: u16 = 0;
 
-        // Render one frame; `busy` shows the thinking indicator. Helper closure so
-        // the submit path can paint a "thinking" frame before the (blocking) turn.
         let outcome = loop {
-            let render = |terminal: &mut ratatui::DefaultTerminal,
-                          this: &Self,
-                          transcript: &[tui::TranscriptEntry],
-                          input: &str,
-                          scroll_back: u16,
-                          busy: bool|
-             -> std::io::Result<()> {
-                let status = compose_status_line(
-                    &this.model,
-                    this.runtime.estimated_tokens(),
-                    status_branch,
-                    false,
-                );
-                let title = this.header_label();
-                let mode = this.mode.as_str().to_string();
-                terminal.draw(|frame| {
-                    tui::draw(
-                        frame,
-                        &tui::TuiState {
-                            transcript,
-                            input,
-                            title: &title,
-                            mode: &mode,
-                            status: &status,
-                            scroll_back,
-                            busy,
-                            verbosity: verbosity(),
-                        },
-                    )
-                })?;
-                Ok(())
-            };
-            if let Err(error) = render(&mut terminal, self, &transcript, &input, scroll_back, false)
-            {
+            if let Err(error) = self.tui_draw(
+                &mut terminal,
+                status_branch,
+                &transcript,
+                &input,
+                scroll_back,
+                false,
+                None,
+            ) {
                 break Err(Box::new(error) as Box<dyn std::error::Error>);
             }
-
             match event::poll(std::time::Duration::from_millis(200)) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -9754,12 +9801,11 @@ impl LiveCli {
 
             match (key.code, key.modifiers) {
                 (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
-                // Ctrl+O cycles the detail level — the next draw re-renders the
-                // captured transcript (tool outputs / thinking) at that level. Slice 17.
                 (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
                     cycle_verbosity();
                 }
                 (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => input.push('\n'),
+                (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => input.push('\n'),
                 (KeyCode::Char('j'), KeyModifiers::CONTROL) => input.push('\n'),
                 (KeyCode::Backspace, _) => {
                     input.pop();
@@ -9777,19 +9823,15 @@ impl LiveCli {
                         break Ok(());
                     }
                     transcript.push(tui::TranscriptEntry::User(prompt.clone()));
-                    // Paint a thinking frame, then run the turn silently on the
-                    // same screen (no alt-screen flip) and record the result.
-                    let _ = render(&mut terminal, self, &transcript, "", scroll_back, true);
                     self.record_prompt_history(&prompt);
-                    match self.run_turn_capture(&prompt) {
-                        Ok(()) => {
-                            // Append the structured entries (thinking, tool calls,
-                            // answer) so Ctrl+O can re-render them. Slice 17.
-                            transcript.append(&mut self.last_turn_entries);
-                        }
-                        Err(error) => {
-                            transcript.push(tui::TranscriptEntry::System(format!("error: {error}")))
-                        }
+                    if let Err(error) = self.run_streaming_turn(
+                        &mut terminal,
+                        status_branch,
+                        &mut transcript,
+                        &mut scroll_back,
+                        &prompt,
+                    ) {
+                        transcript.push(tui::TranscriptEntry::System(format!("error: {error}")));
                     }
                 }
                 (KeyCode::Char(ch), m) if m.is_empty() || m == KeyModifiers::SHIFT => {
@@ -9801,8 +9843,124 @@ impl LiveCli {
 
         ratatui::restore();
         set_tui_active(false);
+        // Hybrid: flush the transcript to the real terminal so the conversation
+        // persists in scrollback after the alt-screen is torn down.
+        dump_transcript_to_scrollback(&transcript, verbosity());
         self.persist_session()?;
         outcome
+    }
+
+    /// Run one turn on a worker thread, applying streamed updates to `transcript`
+    /// and rendering each tick, handling the approval overlay, Ctrl+O, scroll, and
+    /// Ctrl+C interrupt; then join and finalize. Slice: unified full-screen mode.
+    fn run_streaming_turn(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        status_branch: &str,
+        transcript: &mut Vec<tui::TranscriptEntry>,
+        scroll_back: &mut u16,
+        prompt: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+        use std::sync::mpsc::TryRecvError;
+
+        let (handle, rx, reply_tx, abort_signal) = self.spawn_turn(prompt)?;
+        let mut inflight = tui_stream::InFlight::new();
+        let mut approval: Option<tui::ApprovalView> = None;
+        let mut done = false;
+
+        while !done {
+            self.tui_draw(
+                terminal,
+                status_branch,
+                transcript,
+                "",
+                *scroll_back,
+                true,
+                approval.as_ref(),
+            )?;
+
+            if event::poll(std::time::Duration::from_millis(33))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Release {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
+                                abort_signal.abort();
+                                if approval.take().is_some() {
+                                    let _ = reply_tx.send(tui_stream::ApprovalChoice::No);
+                                }
+                            }
+                            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                                cycle_verbosity();
+                            }
+                            (KeyCode::PageUp, _) => {
+                                *scroll_back = scroll_back.saturating_add(3);
+                            }
+                            (KeyCode::PageDown, _) => {
+                                *scroll_back = scroll_back.saturating_sub(3);
+                            }
+                            (KeyCode::Char(choice), _) if approval.is_some() => {
+                                let reply = match choice {
+                                    'y' | 'Y' => Some(tui_stream::ApprovalChoice::Yes),
+                                    'n' | 'N' => Some(tui_stream::ApprovalChoice::No),
+                                    'a' => Some(tui_stream::ApprovalChoice::AlwaysTool),
+                                    'A' => Some(tui_stream::ApprovalChoice::All),
+                                    _ => None,
+                                };
+                                if let Some(reply) = reply {
+                                    let _ = reply_tx.send(reply);
+                                    approval = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            loop {
+                match rx.try_recv() {
+                    Ok(tui_stream::TurnUpdate::PermissionRequest {
+                        tool_name,
+                        action,
+                        preview,
+                        ..
+                    }) => {
+                        approval = Some(tui::ApprovalView {
+                            tool_name,
+                            action,
+                            preview,
+                        });
+                    }
+                    Ok(update) => {
+                        if tui_stream::apply_update(transcript, &mut inflight, update).is_some() {
+                            done = true;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (rebuilt, result) = handle
+            .join()
+            .map_err(|_| Box::<dyn std::error::Error>::from("turn worker panicked"))?;
+        self.replace_runtime(rebuilt)?;
+        match result {
+            Ok(summary) => {
+                self.last_response = Some(final_assistant_text(&summary));
+                maybe_capture_memory_turn(prompt, &summary);
+            }
+            Err(error) => {
+                transcript.push(tui::TranscriptEntry::System(format!("error: {error}")));
+            }
+        }
+        self.persist_session()?;
+        Ok(())
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -10144,6 +10302,51 @@ impl LiveCli {
         maybe_capture_memory_turn(input, &summary);
         self.persist_session()?;
         Ok(())
+    }
+
+    /// Spawn the turn on a worker thread that streams structured `TurnUpdate`s
+    /// to the returned receiver and asks for approvals over the returned reply
+    /// sender. Returns the join handle (yielding the runtime + result so the UI
+    /// thread can finalize) and the abort signal (fire it to cancel). Used by the
+    /// full-screen loop. Slice: unified full-screen mode.
+    #[allow(clippy::type_complexity)]
+    fn spawn_turn(
+        &self,
+        prompt: &str,
+    ) -> Result<
+        (
+            std::thread::JoinHandle<(BuiltRuntime, Result<runtime::TurnSummary, String>)>,
+            std::sync::mpsc::Receiver<tui_stream::TurnUpdate>,
+            std::sync::mpsc::Sender<tui_stream::ApprovalChoice>,
+            runtime::HookAbortSignal,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (mut runtime, hook_abort_monitor, abort_signal) = self.prepare_turn_runtime(false)?;
+        let (tx, rx) = std::sync::mpsc::channel::<tui_stream::TurnUpdate>();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<tui_stream::ApprovalChoice>();
+        runtime.api_client_mut().set_structured_sink(tx.clone());
+        runtime.tool_executor_mut().set_structured_sink(tx.clone());
+        let prompt = prompt.to_string();
+        let handle = std::thread::spawn(move || {
+            let mut prompter = ChannelPermissionPrompter {
+                tx: tx.clone(),
+                reply_rx,
+                next_id: 0,
+            };
+            let result = runtime.run_turn(&prompt, Some(&mut prompter));
+            hook_abort_monitor.stop();
+            let (mapped, done) = match result {
+                Ok(summary) => (Ok(summary), Ok(())),
+                Err(error) => {
+                    let message = error.to_string();
+                    (Err(message.clone()), Err(message))
+                }
+            };
+            let _ = tx.send(tui_stream::TurnUpdate::TurnDone(done));
+            (runtime, mapped)
+        });
+        Ok((handle, rx, reply_tx, abort_signal))
     }
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -15937,6 +16140,63 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
+/// Permission prompter for the full-screen mode. Runs on the turn's worker
+/// thread: it sends a `PermissionRequest` to the UI loop and blocks on the reply
+/// channel until the user answers (y/n/a/A), so the alt-screen renders the
+/// approval overlay rather than reading stdin. Session-scope approvals (a/A) are
+/// applied here on the worker thread for consistent thread-local state.
+struct ChannelPermissionPrompter {
+    tx: std::sync::mpsc::Sender<tui_stream::TurnUpdate>,
+    reply_rx: std::sync::mpsc::Receiver<tui_stream::ApprovalChoice>,
+    next_id: u64,
+}
+
+impl runtime::PermissionPrompter for ChannelPermissionPrompter {
+    fn decide(
+        &mut self,
+        request: &runtime::PermissionRequest,
+    ) -> runtime::PermissionPromptDecision {
+        if session_approved(&request.tool_name) {
+            return runtime::PermissionPromptDecision::Allow;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let (action, preview) = describe_permission_action(&request.tool_name, &request.input);
+        if self
+            .tx
+            .send(tui_stream::TurnUpdate::PermissionRequest {
+                id,
+                tool_name: request.tool_name.clone(),
+                action,
+                preview,
+            })
+            .is_err()
+        {
+            // UI gone — deny so the turn unwinds rather than hanging.
+            return runtime::PermissionPromptDecision::Deny {
+                reason: "approval cancelled".to_string(),
+            };
+        }
+        match self.reply_rx.recv() {
+            Ok(tui_stream::ApprovalChoice::All) => {
+                approve_all_for_session();
+                runtime::PermissionPromptDecision::Allow
+            }
+            Ok(tui_stream::ApprovalChoice::AlwaysTool) => {
+                approve_tool_for_session(&request.tool_name);
+                runtime::PermissionPromptDecision::Allow
+            }
+            Ok(tui_stream::ApprovalChoice::Yes) => runtime::PermissionPromptDecision::Allow,
+            Ok(tui_stream::ApprovalChoice::No) => runtime::PermissionPromptDecision::Deny {
+                reason: format!("tool '{}' denied by user", request.tool_name),
+            },
+            Err(_) => runtime::PermissionPromptDecision::Deny {
+                reason: "approval cancelled".to_string(),
+            },
+        }
+    }
+}
+
 // NOTE: Despite the historical name `AnthropicRuntimeClient`, this struct
 // now holds an `ApiProviderClient` which dispatches to Anthropic, xAI,
 // OpenAI, or DashScope at construction time based on
@@ -15965,6 +16225,10 @@ struct AnthropicRuntimeClient {
     /// Shared with the thinking-spinner thread so clearing the spinner line on
     /// first output is coordinated with (doesn't interleave) a spinner tick.
     anim_lock: Option<Arc<Mutex<()>>>,
+    /// When set (full-screen mode), streamed text/thinking/tool events are sent
+    /// as structured `TurnUpdate`s to the UI loop instead of ANSI to stdout.
+    /// `emit_output` is forced false so nothing leaks under the alt-screen.
+    structured_sink: Option<std::sync::mpsc::Sender<tui_stream::TurnUpdate>>,
 }
 
 /// Marker text for a user-initiated cancellation, recognized in `run_turn` so
@@ -16051,6 +16315,7 @@ impl AnthropicRuntimeClient {
             abort_signal: None,
             first_output: None,
             anim_lock: None,
+            structured_sink: None,
         })
     }
 
@@ -16068,6 +16333,13 @@ impl AnthropicRuntimeClient {
 
     fn set_anim_lock(&mut self, lock: Arc<Mutex<()>>) {
         self.anim_lock = Some(lock);
+    }
+
+    /// Route streamed events to the UI loop as structured updates (full-screen
+    /// mode). Forces `emit_output` off so nothing is written to the real stdout.
+    fn set_structured_sink(&mut self, sink: std::sync::mpsc::Sender<tui_stream::TurnUpdate>) {
+        self.structured_sink = Some(sink);
+        self.emit_output = false;
     }
 }
 
@@ -16272,6 +16544,9 @@ impl AnthropicRuntimeClient {
                                     .and_then(|()| out.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                             }
+                            if let Some(sink) = &self.structured_sink {
+                                let _ = sink.send(tui_stream::TurnUpdate::TextDelta(text.clone()));
+                            }
                             text_buf.push_str(&text);
                             events.push(AssistantEvent::TextDelta(text));
                         }
@@ -16282,6 +16557,13 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { thinking } => {
+                        // Full-screen mode streams thinking unconditionally; the
+                        // UI gates display by verbosity (which is thread-local and
+                        // independent on this worker thread).
+                        if let Some(sink) = &self.structured_sink {
+                            let _ =
+                                sink.send(tui_stream::TurnUpdate::ThinkingDelta(thinking.clone()));
+                        }
                         // Raw detail reveals the thinking text (dim, streamed);
                         // otherwise just a one-line summary. Slice 17.
                         if verbosity().shows_thinking() && self.emit_output {
@@ -16338,6 +16620,13 @@ impl AnthropicRuntimeClient {
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        if let Some(sink) = &self.structured_sink {
+                            let _ = sink.send(tui_stream::TurnUpdate::ToolCallStarted {
+                                id: id.clone(),
+                                name: name.clone(),
+                                summary: render::strip_ansi(&tool_call_detail(&name, &input)),
+                            });
                         }
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
@@ -16624,6 +16913,50 @@ fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
 /// Build structured TUI transcript entries from a completed turn — thinking,
 /// each tool call paired with its result, then the final answer — so Ctrl+O can
 /// re-render them at any detail level. Slice 17.
+/// Print the full transcript to the real terminal (after the alt-screen is torn
+/// down) so the conversation persists in scrollback. Reuses the line-REPL ANSI
+/// formatters so the persisted history matches the inline look. Slice: unified
+/// full-screen mode.
+fn dump_transcript_to_scrollback(
+    transcript: &[tui::TranscriptEntry],
+    verbosity: render::RenderVerbosity,
+) {
+    let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    let renderer = TerminalRenderer::new();
+    for entry in transcript {
+        match entry {
+            tui::TranscriptEntry::User(text) => {
+                if color {
+                    println!("\n\x1b[1m❯ {text}\x1b[0m");
+                } else {
+                    println!("\n❯ {text}");
+                }
+            }
+            tui::TranscriptEntry::Assistant(text) => {
+                println!("\n{}", render::answer_header(color));
+                print!("{}", render::answer_body(&renderer.markdown_to_ansi(text)));
+            }
+            tui::TranscriptEntry::Tool {
+                name,
+                output,
+                is_error,
+                ..
+            } => {
+                println!("\n{}", format_tool_result(name, output, *is_error));
+            }
+            tui::TranscriptEntry::Thinking(text) => {
+                if verbosity.shows_thinking() {
+                    println!("\x1b[2m▶ Thinking\n{text}\x1b[0m");
+                }
+            }
+            tui::TranscriptEntry::System(text) => {
+                println!("\x1b[2m· {text}\x1b[0m");
+            }
+        }
+    }
+    let _ = io::stdout().flush();
+}
+
 fn capture_tui_entries(summary: &runtime::TurnSummary) -> Vec<tui::TranscriptEntry> {
     let mut entries = Vec::new();
 
@@ -16941,10 +17274,20 @@ fn is_interactive_runtime_tool(name: &str) -> bool {
 }
 
 fn format_tool_call_start(name: &str, input: &str) -> String {
+    let detail = tool_call_detail(name, input);
+    let border = "─".repeat(name.len() + 8);
+    format!(
+        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
+    )
+}
+
+/// The one-line (or short) call detail shown for a tool — `$ cmd`, `📄 Reading
+/// x`, an edit patch preview, etc. Shared by `format_tool_call_start` (boxed,
+/// line REPL) and the full-screen transcript `summary` (ANSI-stripped).
+fn tool_call_detail(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
-
-    let detail = match name {
+    match name {
         "bash" | "Bash" => format_bash_call(&parsed),
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
@@ -16985,12 +17328,7 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             .unwrap_or("?")
             .to_string(),
         _ => summarize_tool_payload(input),
-    };
-
-    let border = "─".repeat(name.len() + 8);
-    format!(
-        "\x1b[38;5;245m╭─ \x1b[1;36m{name}\x1b[0;38;5;245m ─╮\x1b[0m\n\x1b[38;5;245m│\x1b[0m {detail}\n\x1b[38;5;245m╰{border}╯\x1b[0m"
-    )
+    }
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
@@ -17529,6 +17867,10 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    /// Full-screen mode: send each tool result to the UI loop instead of
+    /// printing ANSI. The reducer pairs it to the most recent unfilled tool
+    /// entry (the executor doesn't surface the tool_use_id).
+    structured_sink: Option<std::sync::mpsc::Sender<tui_stream::TurnUpdate>>,
 }
 
 impl CliToolExecutor {
@@ -17544,7 +17886,14 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            structured_sink: None,
         }
+    }
+
+    /// Route tool results to the UI loop (full-screen mode); silences ANSI output.
+    fn set_structured_sink(&mut self, sink: std::sync::mpsc::Sender<tui_stream::TurnUpdate>) {
+        self.structured_sink = Some(sink);
+        self.emit_output = false;
     }
 
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
@@ -18074,6 +18423,15 @@ impl ToolExecutor for CliToolExecutor {
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|error| ToolError::new(error.to_string()))?;
                 }
+                if let Some(sink) = &self.structured_sink {
+                    if !is_interactive_runtime_tool(tool_name) {
+                        let _ = sink.send(tui_stream::TurnUpdate::ToolResult {
+                            id: String::new(),
+                            output: output.clone(),
+                            is_error: false,
+                        });
+                    }
+                }
                 Ok(output)
             }
             Err(error) => {
@@ -18082,6 +18440,13 @@ impl ToolExecutor for CliToolExecutor {
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
                         .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
+                }
+                if let Some(sink) = &self.structured_sink {
+                    let _ = sink.send(tui_stream::TurnUpdate::ToolResult {
+                        id: String::new(),
+                        output: error.to_string(),
+                        is_error: true,
+                    });
                 }
                 Err(error)
             }
@@ -18948,6 +19313,34 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn inline_flag_selects_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert!(matches!(
+            parse_args(&["--inline".to_string()]).expect("args should parse"),
+            CliAction::Repl { .. }
+        ));
+    }
+
+    #[test]
+    fn print_flag_with_prompt_is_one_shot_text() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        match parse_args(&["--print".to_string(), "say hi".to_string()]).expect("args should parse")
+        {
+            CliAction::Prompt {
+                prompt,
+                output_format,
+                ..
+            } => {
+                assert_eq!(prompt, "say hi");
+                assert_eq!(output_format, CliOutputFormat::Text);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
     }
 
     #[test]
@@ -23715,6 +24108,57 @@ UU conflicted.rs",
         };
         assert!(matches!(
             prompter.decide(&request),
+            runtime::PermissionPromptDecision::Allow
+        ));
+        super::reset_session_approvals();
+    }
+
+    #[test]
+    fn channel_prompter_maps_approval_choices() {
+        use runtime::PermissionPrompter as _;
+        super::reset_session_approvals();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut prompter = super::ChannelPermissionPrompter {
+            tx,
+            reply_rx,
+            next_id: 0,
+        };
+        let request = |tool: &str| runtime::PermissionRequest {
+            tool_name: tool.to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::WorkspaceWrite,
+            reason: None,
+        };
+        // Yes → Allow (pre-load the reply so decide() doesn't block).
+        reply_tx
+            .send(super::tui_stream::ApprovalChoice::Yes)
+            .unwrap();
+        assert!(matches!(
+            prompter.decide(&request("bash")),
+            runtime::PermissionPromptDecision::Allow
+        ));
+        // No → Deny.
+        reply_tx
+            .send(super::tui_stream::ApprovalChoice::No)
+            .unwrap();
+        assert!(matches!(
+            prompter.decide(&request("bash")),
+            runtime::PermissionPromptDecision::Deny { .. }
+        ));
+        // AlwaysTool → Allow + remembers the tool for the session.
+        reply_tx
+            .send(super::tui_stream::ApprovalChoice::AlwaysTool)
+            .unwrap();
+        assert!(matches!(
+            prompter.decide(&request("edit_file")),
+            runtime::PermissionPromptDecision::Allow
+        ));
+        assert!(super::session_approved("edit_file"));
+        // A remembered tool now short-circuits without consuming a reply.
+        assert!(matches!(
+            prompter.decide(&request("edit_file")),
             runtime::PermissionPromptDecision::Allow
         ));
         super::reset_session_approvals();

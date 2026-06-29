@@ -9756,7 +9756,7 @@ impl LiveCli {
         scroll_back: u16,
         busy: bool,
         approval: Option<&tui::ApprovalView>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<u16> {
         let status = compose_status_line(
             &self.model,
             self.runtime.estimated_tokens(),
@@ -9765,8 +9765,10 @@ impl LiveCli {
         );
         let title = self.header_label();
         let mode = self.mode.as_str().to_string();
+        let palette = render::ColorTheme::default().tui_palette();
+        let mut max_scroll = 0u16;
         terminal.draw(|frame| {
-            tui::draw(
+            max_scroll = tui::draw(
                 frame,
                 &tui::TuiState {
                     transcript,
@@ -9781,10 +9783,11 @@ impl LiveCli {
                     input_cursor,
                     popup,
                     popup_selected,
+                    theme: &palette,
                 },
             );
         })?;
-        Ok(())
+        Ok(max_scroll)
     }
 
     /// The unified full-screen interactive loop: streams each turn live into the
@@ -9829,7 +9832,7 @@ impl LiveCli {
                 .as_ref()
                 .map_or((Vec::new(), 0), |(rows, sel)| (rows.clone(), *sel));
 
-            if let Err(error) = self.tui_draw(
+            let max_scroll = match self.tui_draw(
                 &mut terminal,
                 status_branch,
                 &transcript,
@@ -9841,8 +9844,11 @@ impl LiveCli {
                 false,
                 None,
             ) {
-                break Err(Box::new(error) as Box<dyn std::error::Error>);
-            }
+                Ok(max_scroll) => max_scroll,
+                Err(error) => break Err(Box::new(error) as Box<dyn std::error::Error>),
+            };
+            // Keep scroll_back within the scrollable range.
+            scroll_back = scroll_back.min(max_scroll);
             match event::poll(std::time::Duration::from_millis(200)) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -10001,7 +10007,7 @@ impl LiveCli {
         let mut done = false;
 
         while !done {
-            self.tui_draw(
+            let max_scroll = self.tui_draw(
                 terminal,
                 status_branch,
                 transcript,
@@ -10013,6 +10019,7 @@ impl LiveCli {
                 true,
                 approval.as_ref(),
             )?;
+            *scroll_back = (*scroll_back).min(max_scroll);
 
             if event::poll(std::time::Duration::from_millis(33))? {
                 if let Event::Key(key) = event::read()? {
@@ -10102,7 +10109,7 @@ impl LiveCli {
     /// can be shown inside the transcript instead of leaking onto the real
     /// terminal. ANSI-stripped. Unix-only. Slice: unified full-screen mode.
     fn run_slash_capturing(&mut self, command: SlashCommand) -> String {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsRawFd, RawFd};
         let _ = io::stdout().flush();
         let path = env::temp_dir().join(format!("gi-slash-{}.out", std::process::id()));
         let Ok(file) = std::fs::File::create(&path) else {
@@ -10115,13 +10122,38 @@ impl LiveCli {
             return String::new();
         };
         let _ = nix::unistd::dup2(file.as_raw_fd(), stdout_fd);
-        let _ = self.handle_repl_command(command);
+
+        // Restore fd 1 on every exit path — including a panic in the command —
+        // so the alt-screen terminal can never be left redirected to the file.
+        struct FdRestore {
+            saved: RawFd,
+            target: RawFd,
+        }
+        impl Drop for FdRestore {
+            fn drop(&mut self) {
+                let _ = nix::unistd::dup2(self.saved, self.target);
+                let _ = nix::unistd::close(self.saved);
+            }
+        }
+        let guard = FdRestore {
+            saved,
+            target: stdout_fd,
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.handle_repl_command(command)
+        }));
         let _ = io::stdout().flush();
-        let _ = nix::unistd::dup2(saved, stdout_fd);
-        let _ = nix::unistd::close(saved);
+        drop(guard); // restore fd 1 before reading the capture file
         drop(file);
-        let captured = std::fs::read_to_string(&path).unwrap_or_default();
+
+        let mut captured = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => captured.push_str(&format!("\n{error}")),
+            Err(_) => captured.push_str("\n(command failed)"),
+        }
         // Return the raw ANSI — the transcript renders it colored via ansi-to-tui.
         captured
     }

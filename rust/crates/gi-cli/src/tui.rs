@@ -8,9 +8,12 @@
 
 use ansi_to_tui::IntoText;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 
-use crate::render::TerminalRenderer;
+use crate::render::{display_width, TerminalRenderer, TuiPalette};
 
 /// One entry in the scrollback transcript. Tool/thinking entries keep their raw
 /// data so Ctrl+O can re-render them at any detail level. Slice 17.
@@ -59,6 +62,8 @@ pub(crate) struct TuiState<'a> {
     pub popup: &'a [(String, String)],
     /// Highlighted popup row.
     pub popup_selected: usize,
+    /// Active theme colors for content styling (borders stay mode-accent).
+    pub theme: &'a TuiPalette,
 }
 
 /// A pending permission request rendered as a centered overlay. Slice: unified
@@ -135,43 +140,173 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Accent-highlight a line of plain slash-command output: section headers (no
-/// indent, not a `/command`) in bold accent, and `/command  description` rows
-/// with the command token in accent and the description dimmed.
-fn style_command_line(line: &str, accent_color: Color) -> Line<'static> {
+/// Whether a word looks like a key-press reference (`Ctrl+O`, `Shift+Enter`,
+/// `Tab`, `Esc`, `PageUp`, `Up/Down`), tolerating trailing punctuation.
+fn is_key_token(word: &str) -> bool {
+    let w = word.trim_end_matches([')', '.', ',', ':', ';']);
+    w.starts_with("Ctrl+")
+        || w.starts_with("Ctrl-")
+        || w.starts_with("Shift+")
+        || w.starts_with("Alt+")
+        || matches!(w, "Tab" | "Esc" | "PageUp" | "PageDown" | "Up/Down")
+}
+
+/// Split `text` into spans, highlighting key-press references with the theme's
+/// `inline_code` color and styling the rest with `rest_style`. Spacing is
+/// preserved (whitespace runs become raw spans).
+fn key_reference_spans(text: &str, palette: &TuiPalette, rest_style: Style) -> Vec<Span<'static>> {
+    let key_style = Style::default().fg(palette.inline_code).bold();
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_space: Option<bool> = None;
+    let flush = |buf: &mut String, is_space: bool, spans: &mut Vec<Span<'static>>| {
+        if buf.is_empty() {
+            return;
+        }
+        let token = std::mem::take(buf);
+        if is_space {
+            spans.push(Span::raw(token));
+        } else if is_key_token(&token) {
+            spans.push(Span::styled(token, key_style));
+        } else {
+            spans.push(Span::styled(token, rest_style));
+        }
+    };
+    for ch in text.chars() {
+        let is_space = ch.is_whitespace();
+        if buf_is_space != Some(is_space) {
+            if let Some(prev) = buf_is_space {
+                flush(&mut buf, prev, &mut spans);
+            }
+            buf_is_space = Some(is_space);
+        }
+        buf.push(ch);
+    }
+    if let Some(prev) = buf_is_space {
+        flush(&mut buf, prev, &mut spans);
+    }
+    spans
+}
+
+/// Theme-style a line of plain slash-command output: section headers in bold
+/// `heading`, `/command  description` rows (command in `strong`, key-press refs
+/// highlighted, rest dim), and `Label␣␣␣␣value` rows (label `heading`, value
+/// default). Slice: tui theme colors.
+fn style_command_line(line: &str, palette: &TuiPalette) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return Line::raw("");
     }
     let indent = &line[..line.len() - trimmed.len()];
+    // `/command  description`
     if trimmed.starts_with('/') {
-        // Split the command token from its description at the first 2+ spaces.
         if let Some(pos) = trimmed.find("  ") {
             let (cmd, rest) = trimmed.split_at(pos);
-            return Line::from(vec![
+            let mut spans = vec![
                 Span::raw(indent.to_string()),
-                Span::styled(cmd.to_string(), Style::default().fg(accent_color).bold()),
-                Span::styled(rest.to_string(), dim),
-            ]);
+                Span::styled(cmd.to_string(), Style::default().fg(palette.strong).bold()),
+            ];
+            spans.extend(key_reference_spans(rest, palette, dim));
+            return Line::from(spans);
         }
         return Line::from(vec![
             Span::raw(indent.to_string()),
             Span::styled(
                 trimmed.to_string(),
-                Style::default().fg(accent_color).bold(),
+                Style::default().fg(palette.strong).bold(),
             ),
         ]);
     }
-    // A short, non-indented line reads as a section header.
+    // Short non-indented line → section header.
     if indent.is_empty() && trimmed.len() <= 32 {
-        return Line::styled(line.to_string(), Style::default().fg(accent_color).bold());
+        return Line::styled(
+            line.to_string(),
+            Style::default().fg(palette.heading).bold(),
+        );
+    }
+    // Indented `Label␣␣␣␣value` → key/value (label has no inner spaces).
+    if !indent.is_empty() {
+        if let Some(pos) = trimmed.find("  ") {
+            let label = &trimmed[..pos];
+            let tail = &trimmed[pos..];
+            let value = tail.trim_start();
+            if !label.is_empty() && !label.contains(' ') && !value.is_empty() {
+                let gap = &tail[..tail.len() - value.len()];
+                // A key-press ref as the label (e.g. `Ctrl-R  Reverse-search`)
+                // gets the keyref color; a plain label gets the heading color.
+                let label_style = if is_key_token(label) {
+                    Style::default().fg(palette.inline_code).bold()
+                } else {
+                    Style::default().fg(palette.heading)
+                };
+                let mut spans = vec![
+                    Span::raw(indent.to_string()),
+                    Span::styled(label.to_string(), label_style),
+                    Span::raw(gap.to_string()),
+                ];
+                spans.extend(key_reference_spans(value, palette, Style::default()));
+                return Line::from(spans);
+            }
+        }
+        // Generic indented line — still highlight any key-press refs.
+        let mut spans = vec![Span::raw(indent.to_string())];
+        spans.extend(key_reference_spans(trimmed, palette, Style::default()));
+        return Line::from(spans);
     }
     Line::styled(line.to_string(), Style::default())
 }
 
-/// Render one frame of the TUI.
-pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
+/// Wrap each styled `Line` to `width` display columns, splitting spans at the
+/// boundary and preserving their styles, so the rendered row count equals
+/// `lines.len()` (ratatui's own `Wrap` would re-flow and break the scroll math).
+/// Lines that already fit pass through untouched. CJK/wide aware.
+fn wrap_styled_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out = Vec::new();
+    for line in lines {
+        let total: usize = line
+            .spans
+            .iter()
+            .map(|span| display_width(&span.content))
+            .sum();
+        if total <= width {
+            out.push(line);
+            continue;
+        }
+        let mut current: Vec<Span<'static>> = Vec::new();
+        let mut col = 0usize;
+        for span in line.spans {
+            let style = span.style;
+            let mut buf = String::new();
+            for ch in span.content.chars() {
+                let w = display_width(&ch.to_string()).max(1);
+                if col + w > width && (col > 0 || !buf.is_empty()) {
+                    if !buf.is_empty() {
+                        current.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    out.push(Line::from(std::mem::take(&mut current)));
+                    col = 0;
+                }
+                buf.push(ch);
+                col += w;
+            }
+            if !buf.is_empty() {
+                current.push(Span::styled(buf, style));
+            }
+        }
+        if !current.is_empty() {
+            out.push(Line::from(current));
+        }
+    }
+    out
+}
+
+/// Render one frame of the TUI. Returns `max_scroll` (rows the transcript can be
+/// scrolled up) so the control loop can clamp `scroll_back`.
+pub(crate) fn draw(frame: &mut Frame, state: &TuiState) -> u16 {
     let area = frame.area();
     let accent_color = accent(state.mode);
     let border = Style::default().fg(accent_color);
@@ -259,7 +394,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                     }
                 } else {
                     for line in text.lines() {
-                        lines.push(style_command_line(line, accent_color));
+                        lines.push(style_command_line(line, state.theme));
                     }
                 }
             }
@@ -305,20 +440,35 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         }
         lines.push(Line::raw(""));
     }
+    // Pre-wrap to the inner width so the row count is exact (ratatui's own Wrap
+    // would re-flow and desync the scroll offset, clipping the newest output).
+    let lines = wrap_styled_lines(lines, inner_w.max(1));
     let total = lines.len() as u16;
     let view = chunks[0].height.saturating_sub(2);
-    let scroll = total.saturating_sub(view).saturating_sub(state.scroll_back);
-    let transcript = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(border)
-                .title(format!(" gi · {} ", state.title)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let max_scroll = total.saturating_sub(view);
+    // scroll_back is clamped by the caller's input, but clamp here too so a stale
+    // value (e.g. after resize) can't scroll past the top.
+    let scroll = max_scroll.saturating_sub(state.scroll_back.min(max_scroll));
+    let transcript = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border)
+            .title(format!(" gi · {} ", state.title)),
+    );
     frame.render_widget(transcript, chunks[0]);
+
+    // Discreet scrollbar on the transcript's right edge — only when scrolled up.
+    if state.scroll_back > 0 && total > view {
+        let mut sb_state = ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, chunks[0], &mut sb_state);
+    }
 
     // Input box — or a thinking indicator while a turn runs.
     let input_line = if state.busy {
@@ -434,11 +584,89 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
             .wrap(Wrap { trim: false });
         frame.render_widget(overlay, popup);
     }
+
+    max_scroll
 }
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_line;
+    use super::{is_key_token, style_command_line, wrap_line, wrap_styled_lines, TuiPalette};
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+
+    fn test_palette() -> TuiPalette {
+        TuiPalette {
+            heading: Color::Cyan,
+            strong: Color::Green,
+            inline_code: Color::Yellow,
+            border: Color::DarkGray,
+        }
+    }
+
+    #[test]
+    fn wrap_styled_lines_splits_long_lines_preserving_count() {
+        // One 30-col span wrapped at width 10 → 3 rows.
+        let line = Line::from(vec![Span::styled("a".repeat(30), Style::default())]);
+        let wrapped = wrap_styled_lines(vec![line], 10);
+        assert_eq!(wrapped.len(), 3);
+        // Short line passes through unchanged (1 row).
+        let short = Line::from(vec![Span::raw("hi")]);
+        assert_eq!(wrap_styled_lines(vec![short], 10).len(), 1);
+    }
+
+    #[test]
+    fn wrap_styled_lines_handles_cjk_width() {
+        // 6 wide (CJK, 2 cols each) chars = 12 cols; width 6 → 2 rows.
+        let line = Line::from(vec![Span::raw("技".repeat(6))]);
+        assert_eq!(wrap_styled_lines(vec![line], 6).len(), 2);
+    }
+
+    #[test]
+    fn is_key_token_matches_keypress_refs() {
+        for k in [
+            "Ctrl+O",
+            "Ctrl-R",
+            "Shift+Enter",
+            "Tab",
+            "Esc",
+            "PageUp",
+            "Up/Down",
+            "Ctrl-C)",
+        ] {
+            assert!(is_key_token(k), "{k} should be a key token");
+        }
+        for w in ["hello", "models", "the", "file.rs"] {
+            assert!(!is_key_token(w), "{w} should not be a key token");
+        }
+    }
+
+    #[test]
+    fn style_command_line_styles_command_and_keyref() {
+        let p = test_palette();
+        // `/command  desc` → command span in `strong`.
+        let line = style_command_line("  /models  Pick a model", &p);
+        assert!(line
+            .spans
+            .iter()
+            .any(|s| s.content.contains("/models") && s.style.fg == Some(Color::Green)));
+        // Key-press refs in a description get the inline_code color.
+        let help = style_command_line("  Ctrl+O               cycle detail", &p);
+        assert!(help
+            .spans
+            .iter()
+            .any(|s| s.content.starts_with("Ctrl+O") && s.style.fg == Some(Color::Yellow)));
+    }
+
+    #[test]
+    fn style_command_line_discriminates_key_value() {
+        let p = test_palette();
+        // `Label    value` → label in heading color.
+        let line = style_command_line("  Model            mistral-small3.2", &p);
+        assert!(line
+            .spans
+            .iter()
+            .any(|s| s.content == "Model" && s.style.fg == Some(Color::Cyan)));
+    }
 
     #[test]
     fn markdown_answer_converts_to_ratatui_text() {

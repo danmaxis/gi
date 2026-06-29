@@ -203,6 +203,58 @@ fn theme_fg(color: Color) -> String {
     }
 }
 
+/// Convert a crossterm theme `Color` to a `ratatui` color for the full-screen
+/// TUI (the two `Color` enums are distinct types). Slice: tui theme colors.
+#[must_use]
+pub(crate) fn crossterm_to_ratatui(color: Color) -> ratatui::style::Color {
+    use ratatui::style::Color as Rt;
+    // crossterm's `Dark*` are the base ANSI colors; its bright variants map to
+    // ratatui `Light*` (which has no `Dark*` names).
+    match color {
+        Color::Rgb { r, g, b } => Rt::Rgb(r, g, b),
+        Color::AnsiValue(n) => Rt::Indexed(n),
+        Color::Black => Rt::Black,
+        Color::DarkGrey => Rt::DarkGray,
+        Color::Grey => Rt::Gray,
+        Color::White => Rt::White,
+        Color::DarkRed => Rt::Red,
+        Color::Red => Rt::LightRed,
+        Color::DarkGreen => Rt::Green,
+        Color::Green => Rt::LightGreen,
+        Color::DarkYellow => Rt::Yellow,
+        Color::Yellow => Rt::LightYellow,
+        Color::DarkBlue => Rt::Blue,
+        Color::Blue => Rt::LightBlue,
+        Color::DarkMagenta => Rt::Magenta,
+        Color::Magenta => Rt::LightMagenta,
+        Color::DarkCyan => Rt::Cyan,
+        Color::Cyan => Rt::LightCyan,
+        _ => Rt::Reset,
+    }
+}
+
+/// The active theme's colors converted for the full-screen TUI, styling content
+/// (headers, key/value, key-press refs, command lists). Slice: tui theme colors.
+pub(crate) struct TuiPalette {
+    pub heading: ratatui::style::Color,
+    pub strong: ratatui::style::Color,
+    pub inline_code: ratatui::style::Color,
+    pub border: ratatui::style::Color,
+}
+
+impl ColorTheme {
+    /// Project this theme into ratatui colors for the full-screen UI.
+    #[must_use]
+    pub(crate) fn tui_palette(&self) -> TuiPalette {
+        TuiPalette {
+            heading: crossterm_to_ratatui(self.heading),
+            strong: crossterm_to_ratatui(self.strong),
+            inline_code: crossterm_to_ratatui(self.inline_code),
+            border: crossterm_to_ratatui(self.code_block_border),
+        }
+    }
+}
+
 /// Semantic accent color for a non-default operating mode, used to tint the
 /// prompt box + `❯` glyph so the active mode is unmistakable. `default`/empty
 /// → `None` (keep the neutral theme color). These are intentional status

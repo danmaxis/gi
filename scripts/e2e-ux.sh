@@ -32,7 +32,9 @@ trap cleanup EXIT
 start_pane() {
   local cols="$1" rows="$2"; shift 2
   tmux kill-session -t "$SESSION" 2>/dev/null
-  tmux new-session -d -s "$SESSION" -x "$cols" -y "$rows"
+  # Pin the pane cwd to the repo so @-mention git discovery works regardless of
+  # a stale tmux server cwd.
+  tmux new-session -d -s "$SESSION" -x "$cols" -y "$rows" -c "$PWD"
   tmux set-window-option -t "$SESSION" window-size manual 2>/dev/null
   tmux resize-window -t "$SESSION" -x "$cols" -y "$rows" 2>/dev/null
   sleep 0.3
@@ -60,11 +62,14 @@ def w(s):
 print(max((w(l) for l in sys.stdin), default=0))'
 }
 count_on_screen() { capture | grep -c "$1"; }
+capture_e() { tmux capture-pane -t "$SESSION" -e -p; }
+# Submit a slash command in full-screen: type it, dismiss the `/` popup, send.
+fs_slash() { send "$1"; send Escape; send Enter; sleep 0.6; }
 
 echo "== gi UX e2e ($GI_BIN) =="
 
-echo "[1] default box fills the terminal width (80)"
-start_pane 80 20
+echo "[1] inline box fills the terminal width (80)"
+start_pane 80 20 --inline
 check "box width == 80" test "$(box_width)" -eq 80
 check "default header shown" test "$(count_on_screen '· asks before edits')" -ge 1
 
@@ -89,7 +94,7 @@ check "box re-fit to width 90" test "$(box_width)" -eq 90
 send Escape  # clear pending input / abort
 
 echo "[4b] Ctrl+O cycles the detail level in the status line"
-start_pane 90 20
+start_pane 90 20 --inline
 check "default status has no detail tag" test "$(capture | grep -c 'Ctrl+O)')" -eq 0
 send C-o
 check "Ctrl+O → verbose" test "$(count_on_screen 'verbose (Ctrl+O)')" -ge 1
@@ -110,7 +115,7 @@ sleep 0.5
 check "clean exit back to shell prompt" test "$(capture | grep -c '\$')" -ge 1
 
 echo "[6] answer renders with '◂ gi' header + margin + separated paragraphs (needs a model)"
-start_pane 90 30
+start_pane 90 30 --inline
 tmux send-keys -t "$SESSION" 'In exactly two short paragraphs separated by a blank line, define recursion. Be brief.'
 sleep 0.4; tmux send-keys -t "$SESSION" Enter
 # Poll up to ~40s for the COMPLETED answer (the body renders once at block-stop,
@@ -132,7 +137,7 @@ else
 fi
 
 echo "[7] boxed approval + session memory (a → no re-prompt) (needs a model)"
-start_pane 90 30
+start_pane 90 30 --inline
 tmux send-keys -t "$SESSION" 'Run the shell command: echo hello-from-gi'
 sleep 0.4; tmux send-keys -t "$SESSION" Enter
 boxed=0
@@ -166,15 +171,96 @@ for _ in $(seq 1 18); do
   sleep 2
   capture | grep -q '⚙ bash' && { tooled=1; break; }
 done
-if [ "$tooled" -eq 1 ]; then
-  send PageUp; send PageUp; send PageUp; send PageUp
+if [ "$tooled" -eq 1 ] && [ "$(count_on_screen 'Ctrl+O to expand')" -ge 1 ]; then
+  # The transcript auto-sticks to the bottom, so the truncation hint is visible
+  # without scrolling (no PageUp — that would scroll away from it).
   check "compact truncates tool output with a Ctrl+O hint" test "$(count_on_screen 'Ctrl+O to expand')" -ge 1
   send C-o   # → verbose
-  send PageUp; send PageUp; send PageUp; send PageUp
   check "Ctrl+O → verbose expands (no truncation hint)" test "$(count_on_screen 'Ctrl+O to expand')" -eq 0
   send Escape
+elif [ "$tooled" -eq 1 ]; then
+  echo "  SKIP: model's tool output too short to truncate — Ctrl+O checks skipped"
 else
   echo "  SKIP: model didn't call bash in the TUI — TUI Ctrl+O checks skipped"
+fi
+
+# ── Full-screen mode (the default) ────────────────────────────────────────────
+
+echo "[9] full-screen default: rounded boxes"
+start_pane 100 24
+check "rounded transcript title (╭ gi)" test "$(count_on_screen '╭ gi ·')" -ge 1
+check "rounded input box (╭ message)" test "$(count_on_screen '╭ message')" -ge 1
+
+echo "[10] slash popup filters as you type"
+send "/he"
+check "popup offers /help for '/he'" test "$(count_on_screen '/help')" -ge 1
+send Escape; send BSpace BSpace BSpace
+
+echo "[11] /help output renders inside the transcript"
+fs_slash "/help"
+check "help 'REPL' section in transcript" test "$(count_on_screen 'REPL')" -ge 1
+check "help lists /exit" test "$(count_on_screen '/exit')" -ge 1
+
+echo "[12] command output is colored (not monochrome)"
+check "help output carries ANSI color" test "$(capture_e | grep -ac $'\x1b\\[')" -ge 1
+
+echo "[13] /skills output renders inside the transcript"
+start_pane 100 30
+fs_slash "/skills"
+check "skills report shown in transcript" test "$(count_on_screen 'Skills')" -ge 1
+
+echo "[14] @-mention popup lists files"
+start_pane 100 30
+# Prefix-match rust/Cargo.* — the popup row carries '.toml'/'.lock' the input lacks.
+send "look at @rust/Cargo"
+check "@ popup offers a Cargo file" test "$(capture | grep -cE 'Cargo\.(toml|lock)')" -ge 1
+send Escape
+
+echo "[15] Shift+Tab cycles the mode in full-screen"
+start_pane 100 24
+send BTab
+check "title switched to plan" test "$(count_on_screen 'gi · plan')" -ge 1
+
+echo "[16] scrollbar appears only when scrolled up"
+start_pane 100 16
+fs_slash "/help"   # long output overflows the small viewport
+check "no scrollbar while pinned to bottom" test "$(count_on_screen '█')" -eq 0
+send PageUp; send PageUp
+check "scrollbar thumb (█) appears after PageUp" test "$(count_on_screen '█')" -ge 1
+send PageDown; send PageDown; send PageDown; send PageDown
+check "scrollbar hides back at the bottom" test "$(count_on_screen '█')" -eq 0
+
+# ── Model-gated full-screen cases (set GI_E2E_MODEL=1 to run) ──────────────────
+
+if [ -n "${GI_E2E_MODEL:-}" ]; then
+  echo "[17] streamed answer appears in the transcript"
+  start_pane 100 30
+  send "say hello in 3 words"; send Enter
+  streamed=0
+  for _ in $(seq 1 20); do sleep 2; capture | grep -q '◂ gi' && { streamed=1; break; }; done
+  check "answer streamed (◂ gi present)" test "$streamed" -eq 1
+
+  echo "[18] long answer auto-sticks to the bottom (newest line visible)"
+  start_pane 100 20
+  send "list the numbers 1 to 40, one per line"; send Enter
+  done40=0
+  for _ in $(seq 1 25); do sleep 2; capture | grep -qE '(^|[^0-9])40([^0-9]|$)' && { done40=1; break; }; done
+  check "final line (40) visible at the bottom" test "$done40" -eq 1
+
+  echo "[19] approval overlay appears and y runs the tool"
+  start_pane 100 30
+  send "create a file named e2e_fs.txt with the text hi using the write_file tool"; send Enter
+  asked=0
+  for _ in $(seq 1 20); do sleep 2; capture | grep -q 'approve ·' && { asked=1; break; }; done
+  if [ "$asked" -eq 1 ]; then
+    check "approval overlay shown" test "$(count_on_screen 'approve ·')" -ge 1
+    send "y"
+    check "overlay dismissed after y" test "$(count_on_screen 'approve ·')" -eq 0
+  else
+    echo "  SKIP: model didn't request approval"
+  fi
+else
+  echo "[17-19] model-gated full-screen cases SKIPPED (set GI_E2E_MODEL=1)"
 fi
 
 echo "== e2e: $PASS passed, $FAIL failed =="

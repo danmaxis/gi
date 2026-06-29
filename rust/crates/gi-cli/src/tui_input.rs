@@ -246,6 +246,11 @@ impl TuiInput {
         self.hist_pos = self.history.len();
     }
 
+    /// Clear the current draft (Esc on a non-empty input) without submitting.
+    pub(crate) fn clear(&mut self) {
+        self.reset();
+    }
+
     fn history_prev(&mut self) {
         if self.hist_pos == 0 {
             return;
@@ -344,6 +349,15 @@ mod tests {
         assert_eq!(input.buffer(), "first");
         input.on_key(KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(input.buffer(), "second");
+    }
+
+    #[test]
+    fn clear_empties_the_draft() {
+        let mut input = typed("some text");
+        assert_eq!(input.buffer(), "some text");
+        input.clear();
+        assert_eq!(input.buffer(), "");
+        assert_eq!(input.cursor(), 0);
     }
 
     #[test]

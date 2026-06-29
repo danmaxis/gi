@@ -598,7 +598,14 @@ where
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                         tool_use_id,
                         tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                        // The result is an error (denied), but the pre-hook's own
+                        // stdout is only "(error)" feedback if the pre-hook itself
+                        // caused the denial — otherwise it's benign context.
+                        merge_hook_feedback(
+                            pre_hook_result.messages(),
+                            reason,
+                            pre_hook_result.is_cancelled(),
+                        ),
                         true,
                     ),
                 };

@@ -251,6 +251,7 @@ struct RawPluginToolManifest {
     pub args: Vec<String>,
     #[serde(
         rename = "requiredPermission",
+        alias = "required_permission",
         default = "default_tool_permission_label"
     )]
     pub required_permission: String,
@@ -349,7 +350,10 @@ impl PluginTool {
 }
 
 fn default_tool_permission_label() -> String {
-    "danger-full-access".to_string()
+    // Safe default: a plugin tool that omits requiredPermission is treated as
+    // read-only rather than silently escalating to danger-full-access (which made
+    // even harmless tools prompt). Plugins that need more must declare it.
+    "read-only".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2387,6 +2391,30 @@ fn env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_tool_permission_defaults_to_read_only_and_accepts_snake_case() {
+        // Omitted requiredPermission → read-only (not danger-full-access).
+        let omitted: PluginToolManifest = serde_json::from_value(serde_json::json!({
+            "name": "t", "description": "d", "inputSchema": {}, "command": "x"
+        }))
+        .expect("manifest parses");
+        assert_eq!(omitted.required_permission, "read-only");
+        // snake_case alias is accepted.
+        let snake: PluginToolManifest = serde_json::from_value(serde_json::json!({
+            "name": "t", "description": "d", "inputSchema": {}, "command": "x",
+            "required_permission": "workspace-write"
+        }))
+        .expect("manifest parses");
+        assert_eq!(snake.required_permission, "workspace-write");
+        // camelCase still works.
+        let camel: PluginToolManifest = serde_json::from_value(serde_json::json!({
+            "name": "t", "description": "d", "inputSchema": {}, "command": "x",
+            "requiredPermission": "danger-full-access"
+        }))
+        .expect("manifest parses");
+        assert_eq!(camel.required_permission, "danger-full-access");
+    }
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         env_lock()

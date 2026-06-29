@@ -7102,8 +7102,26 @@ fn format_permissions_switch_report(previous: &str, next: &str) -> String {
     )
 }
 
-fn format_cost_report(usage: TokenUsage) -> String {
-    let estimated_cost = usage.estimate_cost_usd();
+/// Estimated-cost display for the active model: `(text, json)`. When the model
+/// has no known pricing (e.g. an Ollama/local model), the USD cost is unknowable,
+/// so show `n/a` and emit `null` rather than a misleading Anthropic-priced number.
+fn estimated_cost_display(usage: TokenUsage, model: Option<&str>) -> (String, serde_json::Value) {
+    match model.and_then(pricing_for_model) {
+        Some(pricing) => {
+            let cost = usage
+                .estimate_cost_usd_with_pricing(pricing)
+                .total_cost_usd();
+            (format_usd(cost), serde_json::json!(cost))
+        }
+        None => (
+            "n/a (no USD pricing for this model)".to_string(),
+            serde_json::Value::Null,
+        ),
+    }
+}
+
+fn format_cost_report(usage: TokenUsage, model: Option<&str>) -> String {
+    let (estimated_cost, _) = estimated_cost_display(usage, model);
     format!(
         "Cost
   Input tokens     {}
@@ -7117,7 +7135,7 @@ fn format_cost_report(usage: TokenUsage) -> String {
         usage.cache_creation_input_tokens,
         usage.cache_read_input_tokens,
         usage.total_tokens(),
-        format_usd(estimated_cost.total_cost_usd()),
+        estimated_cost,
     )
 }
 
@@ -7448,8 +7466,12 @@ fn run_resume_command(
         SlashCommand::Compact => {
             let result = runtime::trident::trident_compact_session(
                 session,
+                // Manual /compact is an explicit request: force compaction (don't
+                // keep N recent messages back) so it acts even on small sessions
+                // instead of reporting "below threshold".
                 CompactionConfig {
                     max_estimated_tokens: 0,
+                    preserve_recent_messages: 0,
                     ..CompactionConfig::default()
                 },
                 &runtime::trident::TridentConfig::default(),
@@ -7560,7 +7582,7 @@ fn run_resume_command(
             let usage = UsageTracker::from_session(session).cumulative_usage();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_cost_report(usage)),
+                message: Some(format_cost_report(usage, session.model.as_deref())),
                 json: Some(serde_json::json!({
                     "kind": "cost",
                     "action": "show",
@@ -7570,7 +7592,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
-                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.estimate_cost_usd().total_cost_usd(),
+                    "estimated_cost_usd": estimated_cost_display(usage, session.model.as_deref()).0,
+                    "estimated_cost_usd_num": estimated_cost_display(usage, session.model.as_deref()).1,
                     "pricing": "estimated-default",
                 })),
             })
@@ -7771,7 +7794,7 @@ fn run_resume_command(
             let usage = UsageTracker::from_session(session).cumulative_usage();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_cost_report(usage)),
+                message: Some(format_cost_report(usage, session.model.as_deref())),
                 json: Some(serde_json::json!({
                     "kind": "stats",
                     "action": "show",
@@ -7781,7 +7804,8 @@ fn run_resume_command(
                     "cache_creation_input_tokens": usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": usage.cache_read_input_tokens,
                     "total_tokens": usage.total_tokens(),
-                    "estimated_cost_usd": format_usd(usage.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.estimate_cost_usd().total_cost_usd(),
+                    "estimated_cost_usd": estimated_cost_display(usage, session.model.as_deref()).0,
+                    "estimated_cost_usd_num": estimated_cost_display(usage, session.model.as_deref()).1,
                     "pricing": "estimated-default",
                 })),
             })
@@ -9906,10 +9930,13 @@ impl LiveCli {
                         transcript.push(tui::TranscriptEntry::System(format!("error: {error}")));
                     }
                 }
-                // Esc dismisses an open popup first; otherwise it exits.
+                // Esc dismisses an open popup, else clears a non-empty input, else
+                // (empty input) quits — so a stray Esc can't discard a typed prompt.
                 (KeyCode::Esc, _) => {
                     if tinput.has_popup() {
                         tinput.dismiss_popup();
+                    } else if !tinput.buffer().is_empty() {
+                        tinput.clear();
                     } else {
                         break Ok(());
                     }
@@ -10130,6 +10157,13 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.last_response = Some(final_assistant_text(&summary));
+                // Surface auto-compaction in the full-screen transcript too (the
+                // line-REPL/json paths already do).
+                if let Some(event) = summary.auto_compaction {
+                    transcript.push(tui::TranscriptEntry::System(format_auto_compaction_notice(
+                        event.removed_message_count,
+                    )));
+                }
                 maybe_capture_memory_turn(prompt, &summary);
             }
             Err(error) => {
@@ -10926,7 +10960,7 @@ impl LiveCli {
             }
             SlashCommand::Stats => {
                 let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
-                println!("{}", format_cost_report(usage));
+                println!("{}", format_cost_report(usage, Some(&self.model)));
                 false
             }
             SlashCommand::Theme { name } => {
@@ -11348,7 +11382,7 @@ impl LiveCli {
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
+        println!("{}", format_cost_report(cumulative, Some(&self.model)));
     }
 
     fn resume_session(
@@ -12180,7 +12214,12 @@ impl LiveCli {
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        // Manual /compact is explicit: force compaction regardless of size/recent
+        // count, so it acts instead of reporting "below threshold".
+        let result = self.runtime.compact(CompactionConfig {
+            max_estimated_tokens: 0,
+            preserve_recent_messages: 0,
+        });
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
@@ -12941,7 +12980,8 @@ fn status_json_value(
             "cumulative_cache_creation_input": usage.cumulative.cache_creation_input_tokens,
             "cumulative_cache_read_input": usage.cumulative.cache_read_input_tokens,
             "cumulative_total": usage.cumulative.total_tokens(),
-            "estimated_cost_usd": format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()), "estimated_cost_usd_num": usage.cumulative.estimate_cost_usd().total_cost_usd(),
+            "estimated_cost_usd": estimated_cost_display(usage.cumulative, model).0,
+            "estimated_cost_usd_num": estimated_cost_display(usage.cumulative, model).1,
             "pricing": "estimated-default",
             "estimated_tokens": usage.estimated_tokens,
         },
@@ -13211,7 +13251,7 @@ fn format_status_report(
             usage.cumulative.cache_creation_input_tokens,
             usage.cumulative.cache_read_input_tokens,
             usage.cumulative.total_tokens(),
-            format_usd(usage.cumulative.estimate_cost_usd().total_cost_usd()),
+            estimated_cost_display(usage.cumulative, Some(model)).0,
         ),
         format!(
             "Workspace
@@ -16414,6 +16454,20 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         if session_approved(&request.tool_name) {
             return runtime::PermissionPromptDecision::Allow;
         }
+        // Non-interactive (e.g. `gi -p … --output-format json`, pipelines): there's
+        // no one to answer, so deny cleanly instead of printing the approval panel
+        // to stdout (which would corrupt JSON output). The deny reason flows into
+        // the tool_result. Mirrors the structured deny used by exit_plan_mode /
+        // ask_user.
+        if !io::stdin().is_terminal() {
+            return runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "{} requires approval but no interactive terminal is available; \
+                     re-run interactively or use --permission-mode danger-full-access.",
+                    request.tool_name
+                ),
+            };
+        }
         // Pause the thinking animation (and clear its line) for the prompt.
         let _anim_guard = self.anim_lock.as_ref().map(|lock| {
             lock.lock()
@@ -18271,10 +18325,22 @@ impl CliToolExecutor {
             return self.execute_spawn_agent(value);
         }
         if tool_name == "exit_plan_mode" {
-            return self.execute_exit_plan_mode(value);
+            // Only valid in plan mode (mirrors the advertisement gate); reject a
+            // call the model made even though the tool wasn't offered.
+            if plan_tools() && !subagent_active() {
+                return self.execute_exit_plan_mode(value);
+            }
+            return Err(ToolError::new(
+                "exit_plan_mode is only available in plan mode",
+            ));
         }
         if tool_name == "task_complete" {
-            return Self::execute_task_complete(&value);
+            if mugen_tools() && !subagent_active() {
+                return Self::execute_task_complete(&value);
+            }
+            return Err(ToolError::new(
+                "task_complete is only available in mugen mode",
+            ));
         }
 
         let Some(mcp_state) = &self.mcp_state else {
@@ -22524,12 +22590,14 @@ mod tests {
 
     #[test]
     fn cost_report_uses_sectioned_layout() {
-        let report = format_cost_report(runtime::TokenUsage {
+        let usage = runtime::TokenUsage {
             input_tokens: 20,
             output_tokens: 8,
             cache_creation_input_tokens: 3,
             cache_read_input_tokens: 1,
-        });
+        };
+        // Known model → a priced estimate; unknown model → "n/a".
+        let report = format_cost_report(usage, Some("sonnet"));
         assert!(report.contains("Cost"));
         assert!(report.contains("Input tokens     20"));
         assert!(report.contains("Output tokens    8"));
@@ -22537,6 +22605,8 @@ mod tests {
         assert!(report.contains("Cache read       1"));
         assert!(report.contains("Total tokens     32"));
         assert!(report.contains("Estimated cost"));
+        assert!(format_cost_report(usage, Some("ollama-local")).contains("n/a"));
+        assert!(format_cost_report(usage, None).contains("n/a"));
     }
 
     #[test]

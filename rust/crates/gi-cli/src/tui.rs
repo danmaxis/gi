@@ -8,7 +8,7 @@
 
 use ansi_to_tui::IntoText;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::render::TerminalRenderer;
 
@@ -30,6 +30,9 @@ pub(crate) enum TranscriptEntry {
         is_error: bool,
     },
     Thinking(String),
+    /// Captured ANSI output from a slash command (rendered colored). Slice:
+    /// unified full-screen mode (Phase 2 followup).
+    CommandOutput(String),
 }
 
 /// Everything the renderer needs for one frame.
@@ -132,6 +135,41 @@ fn wrap_line(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Accent-highlight a line of plain slash-command output: section headers (no
+/// indent, not a `/command`) in bold accent, and `/command  description` rows
+/// with the command token in accent and the description dimmed.
+fn style_command_line(line: &str, accent_color: Color) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return Line::raw("");
+    }
+    let indent = &line[..line.len() - trimmed.len()];
+    if trimmed.starts_with('/') {
+        // Split the command token from its description at the first 2+ spaces.
+        if let Some(pos) = trimmed.find("  ") {
+            let (cmd, rest) = trimmed.split_at(pos);
+            return Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(cmd.to_string(), Style::default().fg(accent_color).bold()),
+                Span::styled(rest.to_string(), dim),
+            ]);
+        }
+        return Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(
+                trimmed.to_string(),
+                Style::default().fg(accent_color).bold(),
+            ),
+        ]);
+    }
+    // A short, non-indented line reads as a section header.
+    if indent.is_empty() && trimmed.len() <= 32 {
+        return Line::styled(line.to_string(), Style::default().fg(accent_color).bold());
+    }
+    Line::styled(line.to_string(), Style::default())
+}
+
 /// Render one frame of the TUI.
 pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
     let area = frame.area();
@@ -210,6 +248,21 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                 }
                 lines.extend(block(&format!("▶ thinking  {text}"), dim, true));
             }
+            TranscriptEntry::CommandOutput(text) => {
+                // If the command emitted ANSI, render it colored; otherwise apply
+                // light accent highlighting (section headers + `/command` tokens)
+                // so plain reports (like /help) aren't a wall of monochrome.
+                if text.contains('\x1b') {
+                    match text.into_text() {
+                        Ok(rendered) => lines.extend(rendered.lines),
+                        Err(_) => lines.extend(block(text, dim, true)),
+                    }
+                } else {
+                    for line in text.lines() {
+                        lines.push(style_command_line(line, accent_color));
+                    }
+                }
+            }
             TranscriptEntry::Tool {
                 name,
                 summary,
@@ -259,6 +312,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border)
                 .title(format!(" gi · {} ", state.title)),
         )
@@ -287,6 +341,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(border)
                 .title(input_title),
         )
@@ -372,6 +427,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(Color::Rgb(236, 72, 120)))
                     .title(format!(" approve · {} ", approval.tool_name)),
             )

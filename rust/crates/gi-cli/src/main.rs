@@ -9175,29 +9175,21 @@ impl HookAbortMonitor {
     }
 }
 
-/// Pure-output slash commands whose text can be safely captured into the
-/// full-screen transcript: no interactive modal, and no stdin reads (so they
-/// can't deadlock under the alt-screen). Anything not listed suspends the
-/// alt-screen instead — the safe default for unknown/interactive commands.
-fn is_capturable_text_command(command: &SlashCommand) -> bool {
-    matches!(
-        command,
-        SlashCommand::Help
-            | SlashCommand::Status
-            | SlashCommand::Cost
-            | SlashCommand::Diff
-            | SlashCommand::Version
-            | SlashCommand::Doctor
-            | SlashCommand::Config { .. }
-            | SlashCommand::History { .. }
-            | SlashCommand::Mcp { .. }
-            | SlashCommand::Memory { args: Some(_) }
-            | SlashCommand::Agents { args: Some(_) }
-            | SlashCommand::Plugins {
-                action: Some(_),
-                ..
-            }
-    )
+/// Slash commands that need the real terminal in full-screen mode: they read
+/// stdin (confirmations) or run an interactive wizard, so capturing their stdout
+/// would deadlock or break. These suspend the alt-screen; everything else has
+/// its output captured into the transcript (the stdout redirect makes
+/// `menu_tty()` false, so list commands print text reports instead of modals).
+fn command_needs_real_terminal(command: &SlashCommand) -> bool {
+    match command {
+        SlashCommand::Clear { .. } | SlashCommand::Setup => true,
+        // `delete` confirms via stdin; `delete-force` does not.
+        SlashCommand::Session {
+            action: Some(action),
+            ..
+        } => action == "delete",
+        _ => false,
+    }
 }
 
 /// Whether the line REPL should use an interactive selection modal: both stdin
@@ -9896,26 +9888,34 @@ impl LiveCli {
                         if matches!(prompt.as_str(), "/exit" | "/quit") {
                             break Ok(());
                         }
-                        // Slash commands (incl. modals like /agents) run outside the
-                        // alt-screen: suspend it, run the command, then re-enter.
                         match SlashCommand::parse(&prompt) {
                             Ok(Some(command)) => {
                                 transcript.push(tui::TranscriptEntry::User(prompt.clone()));
-                                if is_capturable_text_command(&command) {
-                                    // Pure-output command: capture its text into the
-                                    // transcript instead of leaking onto the screen.
-                                    let output = self.run_slash_capturing(command);
-                                    let _ = self.persist_session();
-                                    let trimmed = output.trim_end();
-                                    if !trimmed.is_empty() {
-                                        transcript.push(tui::TranscriptEntry::System(
-                                            trimmed.to_string(),
-                                        ));
+                                // A `/skills <name>` invocation runs as a streaming
+                                // turn, not a captured command.
+                                if let SlashCommand::Skills { args } = &command {
+                                    if let SkillSlashDispatch::Invoke(skill_prompt) =
+                                        classify_skills_slash_command(args.as_deref())
+                                    {
+                                        self.record_prompt_history(&prompt);
+                                        if let Err(error) = self.run_streaming_turn(
+                                            &mut terminal,
+                                            status_branch,
+                                            &mut transcript,
+                                            &mut scroll_back,
+                                            &skill_prompt,
+                                        ) {
+                                            transcript.push(tui::TranscriptEntry::System(format!(
+                                                "error: {error}"
+                                            )));
+                                        }
+                                        tinput.set_mentions(merged_mentions(&cwd));
+                                        continue;
                                     }
-                                } else {
-                                    // Modal / interactive (may read stdin): suspend
-                                    // the alt-screen, run on the real terminal, then
-                                    // re-enter.
+                                }
+                                if command_needs_real_terminal(&command) {
+                                    // Reads stdin / runs a wizard: suspend the
+                                    // alt-screen, run on the real terminal, re-enter.
                                     ratatui::restore();
                                     set_tui_active(false);
                                     if let Err(error) = self.handle_repl_command(command) {
@@ -9924,6 +9924,18 @@ impl LiveCli {
                                     let _ = self.persist_session();
                                     terminal = ratatui::init();
                                     set_tui_active(true);
+                                } else {
+                                    // Capture the command's output into the transcript
+                                    // (colored). The stdout redirect makes menu_tty()
+                                    // false, so list commands print text reports.
+                                    let output = self.run_slash_capturing(command);
+                                    let _ = self.persist_session();
+                                    let trimmed = output.trim_end();
+                                    if !trimmed.is_empty() {
+                                        transcript.push(tui::TranscriptEntry::CommandOutput(
+                                            trimmed.to_string(),
+                                        ));
+                                    }
                                 }
                                 // A command may change model/agents/files.
                                 tinput.set_completions(
@@ -10110,7 +10122,8 @@ impl LiveCli {
         drop(file);
         let captured = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
-        render::strip_ansi(&captured)
+        // Return the raw ANSI — the transcript renders it colored via ansi-to-tui.
+        captured
     }
 
     /// List connected MCP servers' resources as `mcp:<server>/<uri>` @-mention
@@ -17157,6 +17170,10 @@ fn dump_transcript_to_scrollback(
             }
             tui::TranscriptEntry::System(text) => {
                 println!("\x1b[2m· {text}\x1b[0m");
+            }
+            tui::TranscriptEntry::CommandOutput(ansi) => {
+                // Already ANSI — print verbatim so scrollback keeps the colors.
+                println!("{ansi}");
             }
         }
     }

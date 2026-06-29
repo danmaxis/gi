@@ -9304,7 +9304,8 @@ fn collect_at_tokens(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     for word in input.split_whitespace() {
         if let Some(rest) = word.strip_prefix('@') {
-            if !rest.is_empty() && seen.insert(rest.to_string()) {
+            // `@mcp:…` resources are expanded separately (need the MCP client).
+            if !rest.is_empty() && !rest.starts_with("mcp:") && seen.insert(rest.to_string()) {
                 out.push(rest.to_string());
             }
         }
@@ -9817,10 +9818,18 @@ impl LiveCli {
         );
         let cwd = env::current_dir().unwrap_or_default();
         let mut scroll_back: u16 = 0;
+        // MCP resource candidates are queried once (block_on per server) and
+        // merged with the file/dir candidates; empty when no MCP is configured.
+        let mcp_candidates = self.mcp_mention_candidates();
+        let merged_mentions = |cwd: &Path| {
+            let mut mentions = workspace_mention_candidates(cwd);
+            mentions.extend(mcp_candidates.iter().cloned());
+            mentions
+        };
         // Candidates are cached and only refreshed after a turn or command (not
         // per frame) — `workspace_mention_candidates` shells out to git.
         tinput.set_completions(self.repl_completion_candidates().unwrap_or_default());
-        tinput.set_mentions(workspace_mention_candidates(&cwd));
+        tinput.set_mentions(merged_mentions(&cwd));
 
         let outcome = loop {
             let popup = tinput.popup_view();
@@ -9855,6 +9864,14 @@ impl LiveCli {
 
             match (key.code, key.modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => break Ok(()),
+                // Shift+Tab cycles the operating mode (default → plan → edit →
+                // mugen); the title/accent update on the next draw. Slice 15.
+                (KeyCode::BackTab, _) => {
+                    let next = self.mode.next();
+                    if let Err(error) = self.set_mode(next, false) {
+                        transcript.push(tui::TranscriptEntry::System(format!("error: {error}")));
+                    }
+                }
                 // Esc dismisses an open popup first; otherwise it exits.
                 (KeyCode::Esc, _) => {
                     if tinput.has_popup() {
@@ -9912,7 +9929,7 @@ impl LiveCli {
                                 tinput.set_completions(
                                     self.repl_completion_candidates().unwrap_or_default(),
                                 );
-                                tinput.set_mentions(workspace_mention_candidates(&cwd));
+                                tinput.set_mentions(merged_mentions(&cwd));
                                 continue;
                             }
                             Ok(None) => {}
@@ -9925,6 +9942,7 @@ impl LiveCli {
                         self.record_prompt_history(&prompt);
                         // Expand @path mentions into inline context before the turn.
                         let expanded = expand_at_mentions(&prompt, &cwd);
+                        let expanded = self.expand_mcp_mentions(&expanded);
                         if let Err(error) = self.run_streaming_turn(
                             &mut terminal,
                             status_branch,
@@ -10093,6 +10111,95 @@ impl LiveCli {
         let captured = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
         render::strip_ansi(&captured)
+    }
+
+    /// List connected MCP servers' resources as `mcp:<server>/<uri>` @-mention
+    /// candidates. Queried once (block_on per server) and cached by the caller;
+    /// empty when no MCP servers are configured or the query fails. Slice:
+    /// unified full-screen mode (Phase 2 followup).
+    fn mcp_mention_candidates(&mut self) -> Vec<String> {
+        let Some(state) = self.runtime.mcp_state.clone() else {
+            return Vec::new();
+        };
+        let Ok(json) = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list_resources_for_all_servers()
+        else {
+            return Vec::new();
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+        let mut out = Vec::new();
+        if let Some(servers) = parsed.get("resources").and_then(|value| value.as_array()) {
+            for entry in servers {
+                let server = entry.get("server").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(resources) = entry.get("resources").and_then(|v| v.as_array()) {
+                    for resource in resources {
+                        if let Some(uri) = resource.get("uri").and_then(|v| v.as_str()) {
+                            out.push(format!("mcp:{server}/{uri}"));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Expand `@mcp:<server>/<uri>` tokens by reading each resource and appending
+    /// its text as a fenced block, so the model sees the contents. Unresolved
+    /// reads are noted, never fatal. Slice: unified full-screen mode (Phase 2).
+    fn expand_mcp_mentions(&mut self, input: &str) -> String {
+        let mut seen = std::collections::BTreeSet::new();
+        let tokens: Vec<String> = input
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix("@mcp:").map(str::to_string))
+            .filter(|token| seen.insert(token.clone()))
+            .collect();
+        if tokens.is_empty() {
+            return input.to_string();
+        }
+        let Some(state) = self.runtime.mcp_state.clone() else {
+            return input.to_string();
+        };
+        let mut sections = String::new();
+        let mut warnings = Vec::new();
+        for token in tokens {
+            let Some((server, uri)) = token.split_once('/') else {
+                continue;
+            };
+            let result = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_resource(server, uri);
+            match result {
+                Ok(json) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+                    let text = parsed
+                        .get("contents")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_default();
+                    sections.push_str(&format!("\n```text mcp={server}/{uri}\n{text}\n```\n"));
+                }
+                Err(error) => warnings.push(format!("@mcp:{token} ({error})")),
+            }
+        }
+        if sections.is_empty() && warnings.is_empty() {
+            return input.to_string();
+        }
+        let mut out = input.to_string();
+        out.push_str("\n\n⟨referenced mcp resources⟩");
+        out.push_str(&sections);
+        if !warnings.is_empty() {
+            out.push_str(&format!("\n(unresolved: {})", warnings.join(", ")));
+        }
+        out
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {

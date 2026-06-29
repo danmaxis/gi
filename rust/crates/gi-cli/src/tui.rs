@@ -6,8 +6,11 @@
 //! suspends the TUI to run a turn with the normal streaming output, then records
 //! the result here. The default line-stream REPL is untouched.
 
+use ansi_to_tui::IntoText;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+use crate::render::TerminalRenderer;
 
 /// One entry in the scrollback transcript. Tool/thinking entries keep their raw
 /// data so Ctrl+O can re-render them at any detail level. Slice 17.
@@ -167,6 +170,7 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
             .collect()
     };
     let dim = Style::default().fg(Color::DarkGray);
+    let renderer = TerminalRenderer::new();
     for entry in state.transcript {
         match entry {
             TranscriptEntry::User(text) => {
@@ -177,11 +181,24 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
                 ));
             }
             TranscriptEntry::Assistant(text) => {
-                // `◂ gi` header on its own dim line, then the answer body with a
-                // small left gutter — mirrors the inline default look. Slice 17.
+                // `◂ gi` header, then the answer rendered as markdown (bold,
+                // code, lists, headings) with a 4-space gutter — same look as the
+                // inline REPL. Falls back to plain text if conversion fails.
                 lines.extend(block("◂ gi", dim, false));
-                for line in text.lines() {
-                    lines.extend(block(&format!("  {line}"), Style::default(), false));
+                let ansi = renderer.markdown_to_ansi(text);
+                match ansi.into_text() {
+                    Ok(rendered) => {
+                        for line in rendered.lines {
+                            let mut spans = vec![Span::raw("  ")];
+                            spans.extend(line.spans);
+                            lines.push(Line::from(spans));
+                        }
+                    }
+                    Err(_) => {
+                        for line in text.lines() {
+                            lines.extend(block(&format!("  {line}"), Style::default(), false));
+                        }
+                    }
                 }
             }
             TranscriptEntry::System(text) => {
@@ -366,6 +383,25 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) {
 #[cfg(test)]
 mod tests {
     use super::wrap_line;
+
+    #[test]
+    fn markdown_answer_converts_to_ratatui_text() {
+        use ansi_to_tui::IntoText;
+        let renderer = crate::render::TerminalRenderer::new();
+        let ansi = renderer.markdown_to_ansi("**bold** and `code`\n\n- one\n- two");
+        let text = ansi
+            .into_text()
+            .expect("markdown ANSI should convert to ratatui Text");
+        // Non-empty and carries the list content (styling is applied via spans).
+        let joined: String = text
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(joined.contains("bold"));
+        assert!(joined.contains("one") && joined.contains("two"));
+    }
 
     #[test]
     fn wrap_line_wraps_words_and_hard_splits_long_ones() {

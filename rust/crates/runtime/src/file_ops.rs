@@ -288,17 +288,23 @@ pub fn edit_file(
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "old_string not found in file",
-        ));
-    }
-
-    let updated = if replace_all {
-        original_file.replace(old_string, new_string)
+    let updated = if original_file.contains(old_string) {
+        // Exact match (supports replace_all).
+        if replace_all {
+            original_file.replace(old_string, new_string)
+        } else {
+            original_file.replacen(old_string, new_string, 1)
+        }
+    } else if let Some((start, end)) = find_block_whitespace_tolerant(&original_file, old_string) {
+        // Fall back to a per-line whitespace-tolerant match (handles the common
+        // case where the model got indentation/trailing space slightly wrong).
+        let mut out = String::with_capacity(original_file.len() + new_string.len());
+        out.push_str(&original_file[..start]);
+        out.push_str(new_string);
+        out.push_str(&original_file[end..]);
+        out
     } else {
-        original_file.replacen(old_string, new_string, 1)
+        return Err(old_string_not_found_error(&original_file, old_string));
     };
     fs::write(&absolute_path, &updated)?;
 
@@ -312,6 +318,85 @@ pub fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Find the byte range of a block in `haystack` matching `needle` up to
+/// per-line leading/trailing whitespace (returns the first match). Lets
+/// `edit_file` succeed when the model's `old_string` has slightly wrong
+/// indentation — a frequent weak-model failure. Returns `(start, end)` covering
+/// the matched lines' content (excluding the trailing newline of the last line).
+fn find_block_whitespace_tolerant(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle_lines: Vec<&str> = needle.lines().map(str::trim).collect();
+    if needle_lines.is_empty() {
+        return None;
+    }
+    // (byte offset, line-with-newline) for each haystack line.
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut offset = 0;
+    for line in haystack.split_inclusive('\n') {
+        lines.push((offset, line));
+        offset += line.len();
+    }
+    let n = needle_lines.len();
+    if n > lines.len() {
+        return None;
+    }
+    for start_i in 0..=(lines.len() - n) {
+        let matches =
+            (0..n).all(|k| lines[start_i + k].1.trim_end_matches('\n').trim() == needle_lines[k]);
+        if matches {
+            let start = lines[start_i].0;
+            let last = &lines[start_i + n - 1];
+            let end = last.0 + last.1.trim_end_matches('\n').len();
+            return Some((start, end));
+        }
+    }
+    None
+}
+
+/// Build a `NotFound` error for a missing `old_string` that points the model at
+/// the closest matching location so it can retry with the exact text.
+fn old_string_not_found_error(file: &str, old_string: &str) -> io::Error {
+    let target = old_string.lines().next().unwrap_or("").trim();
+    let file_lines: Vec<&str> = file.lines().collect();
+    let mut best: Option<(usize, usize)> = None; // (line_index, score)
+    if !target.is_empty() {
+        for (i, line) in file_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            let score = if trimmed == target {
+                1000
+            } else if trimmed.contains(target) || (!trimmed.is_empty() && target.contains(trimmed))
+            {
+                500
+            } else {
+                target
+                    .chars()
+                    .zip(trimmed.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            };
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some((i, score));
+            }
+        }
+    }
+    let message = match best.filter(|&(_, s)| s > 0) {
+        Some((i, _)) => {
+            let lo = i.saturating_sub(2);
+            let hi = (i + 3).min(file_lines.len());
+            let context = (lo..hi)
+                .map(|j| format!("{:>4} | {}", j + 1, file_lines[j]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "old_string not found in file. Closest text is near line {}:\n{context}\n\
+                 Copy the exact text including indentation, or use write_file to replace the file.",
+                i + 1
+            )
+        }
+        None => "old_string not found in file".to_string(),
+    };
+    io::Error::new(io::ErrorKind::NotFound, message)
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -796,6 +881,36 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn edit_file_tolerates_indentation_mismatch() {
+        let path = temp_path("edit-ws.txt");
+        let p = path.to_string_lossy();
+        // File indented with 8 spaces; model supplies old_string with 4.
+        write_file(&p, "fn main() {\n        println!(\"hi\");\n}\n").expect("write");
+        edit_file(&p, "    println!(\"hi\");", "    println!(\"bye\");", false)
+            .expect("whitespace-tolerant match should succeed");
+        let after = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("bye"),
+            "expected replacement, got: {after:?}"
+        );
+        assert!(
+            !after.contains("\"hi\""),
+            "old line should be gone: {after:?}"
+        );
+    }
+
+    #[test]
+    fn edit_file_missing_old_string_reports_nearby_context() {
+        let path = temp_path("edit-miss.txt");
+        let p = path.to_string_lossy();
+        write_file(&p, "alpha\nbeta\ngamma\n").expect("write");
+        let err = edit_file(&p, "betaX", "z", false).expect_err("should not match");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains("beta"), "should show the nearby line: {msg}");
     }
 
     #[test]

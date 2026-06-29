@@ -126,6 +126,60 @@ pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
 }
 
+/// Synthetic follow-up sent when the model announces an action but ends the turn
+/// without calling any tool, so the work never actually happens.
+const NOOP_CONTINUATION_NUDGE: &str =
+    "You described an action but did not call any tool, so nothing actually changed. \
+If the task needs file edits or commands, perform them NOW using the available tools. \
+If no change is needed, briefly say so.";
+
+/// Concatenated text content of the most recent assistant message.
+fn final_text_of(assistant_messages: &[ConversationMessage]) -> String {
+    assistant_messages
+        .last()
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Heuristic: the assistant's text announces an action it intends to take (so a
+/// turn ending here with zero tool calls likely forgot to act). Deliberately
+/// conservative first-person/future markers; a false positive costs one bounded
+/// extra turn, while a miss leaves a silent no-op reported as success.
+fn text_announces_unperformed_action(text: &str) -> bool {
+    let t = text.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "i'll ",
+        "i will ",
+        "let me ",
+        "i'm going to",
+        "i am going to",
+        "let's ",
+        "i'll go ahead",
+        "going to create",
+        "going to add",
+        "going to fix",
+        "going to update",
+        "going to write",
+        "here's the fix",
+        "here is the fix",
+        "should be:",
+        "the corrected",
+        "fixed version",
+        "# fixed",
+    ];
+    MARKERS.iter().any(|marker| t.contains(marker))
+}
+
 /// Coordinates the model loop, tool execution, hooks, and session updates.
 pub struct ConversationRuntime<C, T> {
     session: Session,
@@ -140,6 +194,10 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    /// How many times a turn may auto-continue when the model announced an action
+    /// but ended with no tool calls (the "narrated but didn't act" failure, common
+    /// with weaker local models). 0 disables. See [`Self::run_turn`].
+    max_noop_continuation_attempts: usize,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -189,12 +247,21 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            max_noop_continuation_attempts: 1,
         }
     }
 
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Bound how many times a turn auto-continues after the model announces an
+    /// action but makes no tool call. 0 disables the nudge.
+    #[must_use]
+    pub fn with_max_noop_continuation_attempts(mut self, max: usize) -> Self {
+        self.max_noop_continuation_attempts = max;
         self
     }
 
@@ -356,6 +423,10 @@ where
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
         let mut auto_compaction = None;
+        // Track tools used this turn + how many no-op nudges we've sent, to fix the
+        // "narrated an action but never called a tool" failure (weak local models).
+        let mut turn_tool_calls = 0usize;
+        let mut noop_nudges = 0usize;
 
         loop {
             iterations += 1;
@@ -418,8 +489,24 @@ where
             }
 
             if pending_tool_uses.is_empty() {
+                // The model ended its turn with text only. If it used no tools at
+                // all this turn yet its text announces an action it meant to take,
+                // it likely forgot to call a tool — nudge it once to actually act
+                // instead of reporting a false success. Bounded by
+                // `max_noop_continuation_attempts`.
+                if turn_tool_calls == 0
+                    && noop_nudges < self.max_noop_continuation_attempts
+                    && text_announces_unperformed_action(&final_text_of(&assistant_messages))
+                {
+                    noop_nudges += 1;
+                    self.session
+                        .push_user_text(NOOP_CONTINUATION_NUDGE)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    continue;
+                }
                 break;
             }
+            turn_tool_calls += pending_tool_uses.len();
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
@@ -999,6 +1086,105 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn noop_turn_with_action_intent_nudges_model_to_act() {
+        // Call 1: text only, announces an action, NO tool use. The guard should
+        // inject a nudge and re-run; call 2 then actually calls the tool.
+        struct NudgeThenToolClient {
+            calls: usize,
+        }
+        impl ApiClient for NudgeThenToolClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::TextDelta("Let me fix it now.".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        let last = request.messages.last().expect("nudge present");
+                        assert_eq!(last.role, MessageRole::User);
+                        assert!(matches!(&last.blocks[0],
+                            ContentBlock::Text { text } if text.contains("did not call any tool")));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "t1".to_string(),
+                                name: "add".to_string(),
+                                input: "2,2".to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    3 => Ok(vec![
+                        AssistantEvent::TextDelta("Done.".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => unreachable!("extra API call after nudge"),
+                }
+            }
+        }
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            NudgeThenToolClient { calls: 0 },
+            StaticToolExecutor::new().register("add", |_| Ok("4".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("fix the add function", Some(&mut PromptAllowOnce))
+            .expect("turn should succeed");
+        assert_eq!(
+            summary.tool_results.len(),
+            1,
+            "the no-op nudge should have driven the model to actually call the tool"
+        );
+    }
+
+    #[test]
+    fn text_only_turn_without_intent_does_not_nudge() {
+        struct OneCallOnly {
+            calls: usize,
+        }
+        impl ApiClient for OneCallOnly {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                assert_eq!(
+                    self.calls, 1,
+                    "a plain answer must not be nudged into a 2nd call"
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("The answer is 4.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            OneCallOnly { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        );
+        let summary = runtime
+            .run_turn("what is 2 + 2?", None)
+            .expect("turn should succeed");
+        assert_eq!(summary.assistant_messages.len(), 1);
+        assert_eq!(summary.tool_results.len(), 0);
+    }
+
+    #[test]
+    fn action_intent_detection() {
+        use super::text_announces_unperformed_action as intent;
+        assert!(intent("I'll create the files now."));
+        assert!(intent("Let me fix that."));
+        assert!(intent("Should be: fib(n - 2)"));
+        assert!(!intent("The answer is 4."));
+        assert!(!intent("Here are the search results you asked for."));
     }
 
     #[test]

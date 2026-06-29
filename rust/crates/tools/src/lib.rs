@@ -523,7 +523,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace (creating parent directories). Use this — not shell redirection — to create or overwrite files: content is written verbatim with no shell quoting or newline issues.",
+            description: "Write a text file in the workspace (creating parent directories). Use this — not shell redirection — to create NEW files or fully replace a file's contents: content is written verbatim with no shell quoting or newline issues. For a small change to an existing file, prefer `edit_file` (replace just the changed text) rather than rewriting the whole file.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

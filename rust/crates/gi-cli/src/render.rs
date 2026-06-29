@@ -838,7 +838,12 @@ impl TerminalRenderer {
         let mut code_buffer = String::new();
         let mut in_code_block = false;
 
-        for event in Parser::new_ext(&normalized, Options::all()) {
+        // All extensions except smart punctuation: for a coding tool, accurate
+        // quotes/dashes matter more than typography (smart quotes mangle inline
+        // code, paths, and error text like `"missing field path"`).
+        let mut md_options = Options::all();
+        md_options.remove(Options::ENABLE_SMART_PUNCTUATION);
+        for event in Parser::new_ext(&normalized, md_options) {
             self.render_event(
                 event,
                 &mut state,

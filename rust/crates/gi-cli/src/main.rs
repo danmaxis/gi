@@ -16228,6 +16228,43 @@ fn human_bytes(n: usize) -> String {
     }
 }
 
+/// A compact `-`/`+` preview of an edit, skipping the common leading/trailing
+/// context lines so only the lines that actually change are shown (avoids the
+/// misleading "identical `-`/`+` lines" when old/new share their first line).
+fn changed_lines_preview(old: &str, new: &str, max: usize) -> Vec<String> {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    // Trim equal lines from the front.
+    let mut start = 0;
+    while start < old_lines.len() && start < new_lines.len() && old_lines[start] == new_lines[start]
+    {
+        start += 1;
+    }
+    // Trim equal lines from the back.
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > start && new_end > start && old_lines[old_end - 1] == new_lines[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    let mut preview = Vec::new();
+    let push = |sign: char, lines: &[&str], preview: &mut Vec<String>| {
+        for line in lines {
+            if preview.len() >= max {
+                preview.push("  …".to_string());
+                return;
+            }
+            preview.push(format!("{sign} {}", truncate_inline(line, 68)));
+        }
+    };
+    push('-', &old_lines[start..old_end], &mut preview);
+    push('+', &new_lines[start..new_end], &mut preview);
+    if preview.is_empty() {
+        preview.push("  (no textual change)".to_string());
+    }
+    preview
+}
+
 /// A friendly, human-readable action title + a short preview for the approval
 /// box: write→"Write `<path>` (N lines, size)", edit→"Edit `<path>`" + a 1–3
 /// line diff, bash→"Run shell command" + `$ cmd`. Slice 17.
@@ -16250,18 +16287,9 @@ fn describe_permission_action(tool_name: &str, input: &str) -> (String, Vec<Stri
         }
         "edit_file" | "Edit" => {
             let path = field(&["path", "file_path"]).unwrap_or_else(|| "file".to_string());
-            let mut preview = Vec::new();
-            if let Some(old) = field(&["old_string", "old_str"]) {
-                for line in old.lines().filter(|l| !l.trim().is_empty()).take(2) {
-                    preview.push(format!("- {}", truncate_inline(line, 68)));
-                }
-            }
-            if let Some(new) = field(&["new_string", "new_str"]) {
-                for line in new.lines().filter(|l| !l.trim().is_empty()).take(2) {
-                    preview.push(format!("+ {}", truncate_inline(line, 68)));
-                }
-            }
-            (format!("Edit {path}"), preview)
+            let old = field(&["old_string", "old_str"]).unwrap_or_default();
+            let new = field(&["new_string", "new_str"]).unwrap_or_default();
+            (format!("Edit {path}"), changed_lines_preview(&old, &new, 6))
         }
         "bash" | "Bash" => {
             let cmd = field(&["command", "cmd"]).unwrap_or_default();
@@ -24277,6 +24305,29 @@ UU conflicted.rs",
         );
         assert_eq!(SessionMode::parse_execute_target("plan"), None);
         assert_eq!(SessionMode::parse_execute_target("default"), None);
+    }
+
+    #[test]
+    fn changed_lines_preview_shows_only_changed_lines() {
+        use super::changed_lines_preview;
+        // Shared signature line is skipped; only the body line shows as -/+.
+        let preview = changed_lines_preview(
+            "def add(a, b):\n    return a - b",
+            "def add(a, b):\n    return a + b",
+            6,
+        );
+        assert_eq!(
+            preview,
+            vec![
+                "-     return a - b".to_string(),
+                "+     return a + b".to_string()
+            ]
+        );
+        // Identical input yields a no-change note, not a fake diff.
+        assert_eq!(
+            changed_lines_preview("same", "same", 6),
+            vec!["  (no textual change)".to_string()]
+        );
     }
 
     #[test]

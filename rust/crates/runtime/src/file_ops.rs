@@ -18,6 +18,7 @@ const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
 
 const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     ".git",
+    ".gi",
     "node_modules",
     ".build",
     "target",
@@ -248,7 +249,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+    atomic_write(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -262,6 +263,33 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         original_file,
         git_diff: None,
     })
+}
+
+/// Write `content` to `path` atomically: write a temp file in the same
+/// directory, then rename it over the target. An interrupted/failed write then
+/// leaves the original file intact rather than a half-written, truncated file.
+fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = dir.join(format!(".{file_name}.gi-tmp-{}", std::process::id()));
+    let _ = fs::remove_file(&tmp); // clear any stale temp from a prior crash
+    if let Err(error) = fs::write(&tmp, content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Rename can fail across filesystems; fall back to a direct write so
+            // the change is never silently lost, then clean up the temp.
+            let result = fs::write(path, content);
+            let _ = fs::remove_file(&tmp);
+            result
+        }
+    }
 }
 
 /// Performs an in-file string replacement and returns patch metadata.
@@ -306,7 +334,7 @@ pub fn edit_file(
     } else {
         return Err(old_string_not_found_error(&original_file, old_string));
     };
-    fs::write(&absolute_path, &updated)?;
+    atomic_write(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -665,7 +693,10 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    let walker = WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_glob_dir(entry));
+    for entry in walker {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
         if entry.file_type().is_file() {
             files.push(entry.path().to_path_buf());
@@ -1197,6 +1228,48 @@ mod tests {
             .any(|path| path.contains("node_modules")
                 || path.contains(".build")
                 || path.contains("/target/")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_skips_dot_gi_session_dir() {
+        let dir = temp_path("dotgi-skip");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".gi/sessions")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.join(".gi/sessions/s.jsonl"), "{\"needle\":1}\n").unwrap();
+
+        let g = glob_search("**/*", Some(dir.to_str().unwrap())).expect("glob");
+        assert!(
+            g.filenames.iter().all(|p| !p.contains("/.gi/")),
+            "glob must skip .gi: {:?}",
+            g.filenames
+        );
+
+        let input = GrepSearchInput {
+            pattern: "needle".to_string(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some("files_with_matches".to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        };
+        let r = grep_search(&input).expect("grep");
+        assert!(
+            r.filenames.iter().all(|p| !p.contains("/.gi/")),
+            "grep must skip .gi: {:?}",
+            r.filenames
+        );
+        assert!(r.filenames.iter().any(|p| p.ends_with("src/main.rs")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

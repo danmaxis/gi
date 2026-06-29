@@ -604,7 +604,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url", "prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            // A network read, not arbitrary shell: usable with approval in default
+            // mode and auto-allowed in edit/mugen (denied in strict read-only).
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "WebSearch",
@@ -625,7 +627,9 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::DangerFullAccess,
+            // A network read, not arbitrary shell: usable with approval in default
+            // mode and auto-allowed in edit/mugen (denied in strict read-only).
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "TodoWrite",
@@ -3472,6 +3476,8 @@ enum WebSearchResultItem {
 struct SearchHit {
     title: String,
     url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -3508,22 +3514,206 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
+/// Which web-search backend `web_search` uses, resolved from environment (the
+/// CLI sets these from `~/.gi/settings.json` `web_search`, or set them directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchBackend {
+    Brave,
+    Tavily,
+    Searxng,
+    /// Keyless HTML scrape — DuckDuckGo, or a generic `GI_WEB_SEARCH_BASE_URL`.
+    Html,
+}
+
+fn search_backend() -> SearchBackend {
+    match std::env::var("GI_SEARCH_PROVIDER")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("brave") => SearchBackend::Brave,
+        Some("tavily") => SearchBackend::Tavily,
+        Some("searxng" | "searx") => SearchBackend::Searxng,
+        // Explicit "duckduckgo"/unset/unknown → keyless HTML scrape.
+        _ => SearchBackend::Html,
+    }
+}
+
+fn search_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn require_search_key() -> Result<String, String> {
+    search_env("GI_SEARCH_API_KEY").ok_or_else(|| {
+        "web_search needs an API key: set GI_SEARCH_API_KEY (or web_search.api_key in \
+         ~/.gi/settings.json) for the configured provider. Alternatively set \
+         GI_SEARCH_PROVIDER=searxng with GI_SEARCH_BASE_URL, or unset GI_SEARCH_PROVIDER \
+         for keyless search."
+            .to_string()
+    })
+}
+
+/// Parse a JSON results array (`value[array_key]`) into hits using the given
+/// title/url/snippet field names.
+fn hits_from_json_array(
+    value: &serde_json::Value,
+    array_key: &str,
+    title_key: &str,
+    url_key: &str,
+    snippet_key: &str,
+) -> Vec<SearchHit> {
+    value
+        .get(array_key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let url = item.get(url_key)?.as_str()?.to_string();
+                    let title = item
+                        .get(title_key)
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&url)
+                        .to_string();
+                    let snippet = item
+                        .get(snippet_key)
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| text.trim().to_string())
+                        .filter(|text| !text.is_empty());
+                    Some(SearchHit {
+                        title,
+                        url,
+                        snippet,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn search_get_json(
+    url: reqwest::Url,
+    headers: &[(&str, &str)],
+) -> Result<serde_json::Value, String> {
     let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "search provider returned HTTP {}: {}",
+            status.as_u16(),
+            preview_text(&body, 200)
+        ));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| format!("invalid JSON from search provider: {error}"))
+}
+
+fn brave_search(query: &str) -> Result<Vec<SearchHit>, String> {
+    let key = require_search_key()?;
+    let base = search_env("GI_SEARCH_BASE_URL")
+        .unwrap_or_else(|| "https://api.search.brave.com/res/v1/web/search".to_string());
+    let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("count", "8");
+    let value = search_get_json(url, &[("X-Subscription-Token", key.as_str())])?;
+    // Brave: { "web": { "results": [ {title, url, description}, ... ] } }
+    let web = value.get("web").cloned().unwrap_or(serde_json::Value::Null);
+    Ok(hits_from_json_array(
+        &web,
+        "results",
+        "title",
+        "url",
+        "description",
+    ))
+}
+
+fn tavily_search(query: &str) -> Result<Vec<SearchHit>, String> {
+    let key = require_search_key()?;
+    let base = search_env("GI_SEARCH_BASE_URL")
+        .unwrap_or_else(|| "https://api.tavily.com/search".to_string());
+    let client = build_http_client()?;
+    let body = serde_json::json!({ "api_key": key, "query": query, "max_results": 8 });
+    let response = client
+        .post(&base)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&body)
+        .send()
+        .map_err(|error| error.to_string())?;
+    let status = response.status();
+    let text = response.text().map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "Tavily returned HTTP {}: {}",
+            status.as_u16(),
+            preview_text(&text, 200)
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid JSON from Tavily: {error}"))?;
+    // Tavily: { "results": [ {title, url, content}, ... ] }
+    Ok(hits_from_json_array(
+        &value, "results", "title", "url", "content",
+    ))
+}
+
+fn searxng_search(query: &str) -> Result<Vec<SearchHit>, String> {
+    let base = search_env("GI_SEARCH_BASE_URL").ok_or_else(|| {
+        "searxng search needs GI_SEARCH_BASE_URL (your SearXNG instance, e.g. \
+         http://host:8888) — set web_search.base_url in ~/.gi/settings.json."
+            .to_string()
+    })?;
+    let trimmed = base.trim_end_matches('/');
+    let endpoint = if trimmed.ends_with("/search") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/search")
+    };
+    let mut url = reqwest::Url::parse(&endpoint).map_err(|error| error.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("format", "json");
+    let value = search_get_json(url, &[])?;
+    // SearXNG: { "results": [ {title, url, content}, ... ] }
+    Ok(hits_from_json_array(
+        &value, "results", "title", "url", "content",
+    ))
+}
+
+fn html_scrape_search(query: &str) -> Result<Vec<SearchHit>, String> {
+    let client = build_http_client()?;
+    let search_url = build_search_url(query)?;
     let response = client
         .get(search_url)
         .send()
         .map_err(|error| error.to_string())?;
-
     let final_url = response.url().clone();
     let html = response.text().map_err(|error| error.to_string())?;
     let mut hits = extract_search_hits(&html);
-
     if hits.is_empty() && final_url.host_str().is_some() {
         hits = extract_search_hits_from_generic_links(&html);
     }
+    Ok(hits)
+}
+
+fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let started = Instant::now();
+    let mut hits = match search_backend() {
+        SearchBackend::Brave => brave_search(&input.query)?,
+        SearchBackend::Tavily => tavily_search(&input.query)?,
+        SearchBackend::Searxng => searxng_search(&input.query)?,
+        SearchBackend::Html => html_scrape_search(&input.query)?,
+    };
 
     if let Some(allowed) = input.allowed_domains.as_ref() {
         hits.retain(|hit| host_matches_list(&hit.url, allowed));
@@ -3540,7 +3730,12 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     } else {
         let rendered_hits = hits
             .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+            .map(|hit| match &hit.snippet {
+                Some(snippet) if !snippet.trim().is_empty() => {
+                    format!("- [{}]({})\n  {}", hit.title, hit.url, snippet.trim())
+                }
+                _ => format!("- [{}]({})", hit.title, hit.url),
+            })
             .collect::<Vec<_>>()
             .join("\n");
         format!(
@@ -3737,6 +3932,7 @@ fn extract_search_hits(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -3779,6 +3975,7 @@ fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
             hits.push(SearchHit {
                 title: title.trim().to_string(),
                 url: decoded_url,
+                snippet: None,
             });
         }
         remaining = &after_tag[end_anchor_idx + 4..];
@@ -8084,6 +8281,86 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["title"], "Reqwest docs");
         assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+    }
+
+    #[test]
+    fn web_search_searxng_backend_parses_json() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /search?q=rust"));
+            assert!(request_line.contains("format=json"));
+            HttpResponse::text(
+                200,
+                "OK",
+                r#"{"results":[{"title":"Rust","url":"https://rust-lang.org","content":"systems language"},{"title":"Docs","url":"https://docs.rs","content":"docs"}]}"#,
+            )
+        }));
+        std::env::set_var("GI_SEARCH_PROVIDER", "searxng");
+        std::env::set_var("GI_SEARCH_BASE_URL", format!("http://{}", server.addr()));
+        let result = execute_tool("WebSearch", &json!({ "query": "rust" }));
+        std::env::remove_var("GI_SEARCH_PROVIDER");
+        std::env::remove_var("GI_SEARCH_BASE_URL");
+        let result = result.expect("searxng WebSearch should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item.get("content").is_some()))
+            .expect("search result block")["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["url"], "https://rust-lang.org");
+        assert_eq!(content[0]["snippet"], "systems language");
+    }
+
+    #[test]
+    fn web_search_brave_backend_parses_json_with_key() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /res/v1/web/search?q=rust"));
+            HttpResponse::text(
+                200,
+                "OK",
+                r#"{"web":{"results":[{"title":"Rust","url":"https://rust-lang.org","description":"the language"}]}}"#,
+            )
+        }));
+        std::env::set_var("GI_SEARCH_PROVIDER", "brave");
+        std::env::set_var(
+            "GI_SEARCH_BASE_URL",
+            format!("http://{}/res/v1/web/search", server.addr()),
+        );
+        std::env::set_var("GI_SEARCH_API_KEY", "test-key");
+        let result = execute_tool("WebSearch", &json!({ "query": "rust" }));
+        std::env::remove_var("GI_SEARCH_PROVIDER");
+        std::env::remove_var("GI_SEARCH_BASE_URL");
+        std::env::remove_var("GI_SEARCH_API_KEY");
+        let result = result.expect("brave WebSearch should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let content = output["results"]
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item.get("content").is_some()))
+            .expect("search result block")["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(content[0]["url"], "https://rust-lang.org");
+        assert_eq!(content[0]["snippet"], "the language");
+    }
+
+    #[test]
+    fn web_search_key_required_backend_errors_clearly_without_key() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("GI_SEARCH_PROVIDER", "brave");
+        std::env::remove_var("GI_SEARCH_API_KEY");
+        let result = execute_tool("WebSearch", &json!({ "query": "rust" }));
+        std::env::remove_var("GI_SEARCH_PROVIDER");
+        let error = result.expect_err("brave without a key should error");
+        assert!(error.contains("API key"), "{error}");
     }
 
     #[test]

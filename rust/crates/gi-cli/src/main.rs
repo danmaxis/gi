@@ -3523,6 +3523,42 @@ fn apply_saved_provider_env() {
         }
         _ => {}
     }
+    apply_saved_web_search_env();
+}
+
+/// Translate a `"web_search": { provider, base_url, api_key }` block from
+/// settings.json into the `GI_SEARCH_*` env the `web_search` tool reads (kept
+/// decoupled — tools see env only). Project settings win over user settings, and
+/// an already-set env var wins over both.
+fn apply_saved_web_search_env() {
+    let set_if_unset = |key: &str, value: Option<&str>| {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            if env::var_os(key).is_none() {
+                env::set_var(key, value);
+            }
+        }
+    };
+    // Project first (set_if_unset means first-applied wins), then user-level.
+    let mut paths = Vec::new();
+    if let Ok(cwd) = env::current_dir() {
+        paths.push(cwd.join(".gi").join("settings.json"));
+    }
+    paths.push(runtime::default_config_home().join("settings.json"));
+    for path in paths {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(web_search) = value.get("web_search") else {
+            continue;
+        };
+        let field = |key: &str| web_search.get(key).and_then(serde_json::Value::as_str);
+        set_if_unset("GI_SEARCH_PROVIDER", field("provider"));
+        set_if_unset("GI_SEARCH_BASE_URL", field("base_url"));
+        set_if_unset("GI_SEARCH_API_KEY", field("api_key"));
+    }
 }
 
 /// Outcome of a `/theme` invocation, usable from both the interactive REPL and

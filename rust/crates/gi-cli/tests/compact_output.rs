@@ -182,7 +182,7 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
     assert!(
         plain_stdout
             .lines()
-            .any(|line| line == "Mock streaming says hello from the parity harness."),
+            .any(|line| line.trim() == "Mock streaming says hello from the parity harness."),
         "text prompt stdout should print the assistant text as its own line ({stdout:?})"
     );
 

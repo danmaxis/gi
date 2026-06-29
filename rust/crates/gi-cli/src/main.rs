@@ -10107,7 +10107,9 @@ impl LiveCli {
     /// Run a non-interactive slash command while the alt-screen stays up,
     /// capturing its stdout (by redirecting fd 1 to a temp file) so the output
     /// can be shown inside the transcript instead of leaking onto the real
-    /// terminal. ANSI-stripped. Unix-only. Slice: unified full-screen mode.
+    /// terminal. Unix-only (fd redirection); the non-unix fallback runs the
+    /// command without capture. Slice: unified full-screen mode.
+    #[cfg(unix)]
     fn run_slash_capturing(&mut self, command: SlashCommand) -> String {
         use std::os::fd::{AsRawFd, RawFd};
         let _ = io::stdout().flush();
@@ -10156,6 +10158,16 @@ impl LiveCli {
         }
         // Return the raw ANSI — the transcript renders it colored via ansi-to-tui.
         captured
+    }
+
+    /// Non-unix fallback: no fd redirection available, so run the command
+    /// without capturing its stdout (it prints to the real terminal).
+    #[cfg(not(unix))]
+    fn run_slash_capturing(&mut self, command: SlashCommand) -> String {
+        match self.handle_repl_command(command) {
+            Ok(_) => String::new(),
+            Err(error) => format!("{error}"),
+        }
     }
 
     /// List connected MCP servers' resources as `mcp:<server>/<uri>` @-mention

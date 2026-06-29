@@ -6652,8 +6652,12 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
+    // Use a non-login shell so detection honors the current process PATH — the
+    // same PATH `Command::new(shell)` uses to actually spawn the tool. A login
+    // shell (`-lc`) re-sources /etc/profile, which hard-resets PATH and can hide
+    // an executable that the process can in fact spawn (detection/exec mismatch).
     std::process::Command::new("sh")
-        .arg("-lc")
+        .arg("-c")
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
         .is_ok_and(|status| status.success())

@@ -2957,7 +2957,15 @@ mod tests {
     #[test]
     fn discovers_builtin_and_bundled_plugins() {
         let _guard = env_guard();
-        let manager = PluginManager::new(PluginManagerConfig::new(temp_dir("discover")));
+        // Pin the bundled root to the repo path so the test is reliable
+        // regardless of where the test binary runs from. The default
+        // `bundled_root()` probes `current_exe`-relative paths under
+        // `target/debug`, which concurrent `cargo test --workspace` processes
+        // can transiently create, flaking this test.
+        let repo_bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bundled");
+        let mut config = PluginManagerConfig::new(temp_dir("discover"));
+        config.bundled_root = Some(repo_bundled);
+        let manager = PluginManager::new(config);
         let plugins = manager.list_plugins().expect("plugins should list");
         assert!(plugins
             .iter()

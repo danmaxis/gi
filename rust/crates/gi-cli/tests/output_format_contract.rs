@@ -470,10 +470,20 @@ fn direct_resume_safe_slash_commands_route_to_local_json_actions_831() {
             .unwrap_or_else(|_| panic!("{command} must emit JSON (#831), got: {stdout:?}"));
 
         assert_eq!(parsed["kind"], expected_kind, "{command} kind: {parsed}");
-        assert_eq!(
-            parsed["status"], expected_status,
-            "{command} status: {parsed}"
-        );
+        if command == "/sandbox" {
+            // Sandbox health is host-dependent ("ok" when namespaces are fully
+            // supported, "warn" when degraded). #831 only asserts the command
+            // routes to a local JSON action, so accept either.
+            assert!(
+                parsed["status"] == "ok" || parsed["status"] == "warn",
+                "{command} status should be ok or warn: {parsed}"
+            );
+        } else {
+            assert_eq!(
+                parsed["status"], expected_status,
+                "{command} status: {parsed}"
+            );
+        }
         assert_ne!(
             parsed["error_kind"], "interactive_only",
             "{command} must not emit interactive_only (#831): {parsed}"

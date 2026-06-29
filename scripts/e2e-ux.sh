@@ -198,8 +198,9 @@ send Escape; send BSpace BSpace BSpace
 
 echo "[11] /help output renders inside the transcript"
 fs_slash "/help"
-check "help 'REPL' section in transcript" test "$(count_on_screen 'REPL')" -ge 1
-check "help lists /exit" test "$(count_on_screen '/exit')" -ge 1
+# Output auto-sticks to the bottom, so assert the LAST entries are visible.
+check "help output in transcript (/doctor visible)" test "$(count_on_screen '/doctor')" -ge 1
+check "help 'Debug' section visible at bottom" test "$(count_on_screen 'Debug')" -ge 1
 
 echo "[12] command output is colored (not monochrome)"
 check "help output carries ANSI color" test "$(capture_e | grep -ac $'\x1b\\[')" -ge 1
@@ -221,13 +222,23 @@ start_pane 100 24
 send BTab
 check "title switched to plan" test "$(count_on_screen 'gi · plan')" -ge 1
 
-echo "[16] scrollbar appears only when scrolled up"
+echo "[16] short terminal: newest output is visible (auto-stick to bottom)"
+start_pane 70 12   # tiny viewport — overflowing output must scroll to the end
+fs_slash "/help"
+# /doctor is the last entry in /help; it must be on screen, not clipped above.
+check "last help entry (/doctor) visible at the bottom" test "$(count_on_screen '/doctor')" -ge 1
+check "top help section (REPL) is scrolled off" test "$(count_on_screen 'REPL')" -eq 0
+
+echo "[16b] scrollbar appears only when scrolled up"
 start_pane 100 16
 fs_slash "/help"   # long output overflows the small viewport
 check "no scrollbar while pinned to bottom" test "$(count_on_screen '█')" -eq 0
 send PageUp; send PageUp
 check "scrollbar thumb (█) appears after PageUp" test "$(count_on_screen '█')" -ge 1
-send PageDown; send PageDown; send PageDown; send PageDown
+# Scroll all the way up to reveal the very top of the output.
+for _ in $(seq 1 20); do send PageUp; done
+check "scrolling up reveals the top (REPL)" test "$(count_on_screen 'REPL')" -ge 1
+for _ in $(seq 1 25); do send PageDown; done
 check "scrollbar hides back at the bottom" test "$(count_on_screen '█')" -eq 0
 
 # ── Model-gated full-screen cases (set GI_E2E_MODEL=1 to run) ──────────────────

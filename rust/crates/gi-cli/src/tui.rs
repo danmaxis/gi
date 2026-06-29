@@ -449,13 +449,18 @@ pub(crate) fn draw(frame: &mut Frame, state: &TuiState) -> u16 {
     // scroll_back is clamped by the caller's input, but clamp here too so a stale
     // value (e.g. after resize) can't scroll past the top.
     let scroll = max_scroll.saturating_sub(state.scroll_back.min(max_scroll));
-    let transcript = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(border)
-            .title(format!(" gi · {} ", state.title)),
-    );
+    let transcript = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border)
+                .title(format!(" gi · {} ", state.title)),
+        )
+        // Lines are pre-wrapped, so scroll in row units lands exactly. Without
+        // this the transcript always renders from the top, clipping the newest
+        // output once it overflows the viewport.
+        .scroll((scroll, 0));
     frame.render_widget(transcript, chunks[0]);
 
     // Discreet scrollbar on the transcript's right edge — only when scrolled up.

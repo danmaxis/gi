@@ -297,6 +297,7 @@ impl HarnessWorkspace {
 struct ScenarioRun {
     response: Value,
     stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Clone)]
@@ -372,9 +373,11 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
 
     assert_success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     ScenarioRun {
         response: parse_json_output(&stdout),
         stdout,
+        stderr,
     }
 }
 
@@ -642,11 +645,11 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
 
 fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(
-        run.stdout.contains("approve · bash"),
-        "stdout:\n{}",
-        run.stdout
+        run.stderr.contains("approve · bash"),
+        "stderr:\n{}",
+        run.stderr
     );
-    assert!(run.stdout.contains("[a]lways this tool"));
+    assert!(run.stderr.contains("[a]lways this tool"));
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
@@ -668,11 +671,11 @@ fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRu
 
 fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
     assert!(
-        run.stdout.contains("approve · bash"),
-        "stdout:\n{}",
-        run.stdout
+        run.stderr.contains("approve · bash"),
+        "stderr:\n{}",
+        run.stderr
     );
-    assert!(run.stdout.contains("[a]lways this tool"));
+    assert!(run.stderr.contains("[a]lways this tool"));
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()

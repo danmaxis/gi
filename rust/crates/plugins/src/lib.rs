@@ -2395,20 +2395,20 @@ mod tests {
     #[test]
     fn plugin_tool_permission_defaults_to_read_only_and_accepts_snake_case() {
         // Omitted requiredPermission → read-only (not danger-full-access).
-        let omitted: PluginToolManifest = serde_json::from_value(serde_json::json!({
+        let omitted: RawPluginToolManifest = serde_json::from_value(serde_json::json!({
             "name": "t", "description": "d", "inputSchema": {}, "command": "x"
         }))
         .expect("manifest parses");
         assert_eq!(omitted.required_permission, "read-only");
         // snake_case alias is accepted.
-        let snake: PluginToolManifest = serde_json::from_value(serde_json::json!({
+        let snake: RawPluginToolManifest = serde_json::from_value(serde_json::json!({
             "name": "t", "description": "d", "inputSchema": {}, "command": "x",
             "required_permission": "workspace-write"
         }))
         .expect("manifest parses");
         assert_eq!(snake.required_permission, "workspace-write");
         // camelCase still works.
-        let camel: PluginToolManifest = serde_json::from_value(serde_json::json!({
+        let camel: RawPluginToolManifest = serde_json::from_value(serde_json::json!({
             "name": "t", "description": "d", "inputSchema": {}, "command": "x",
             "requiredPermission": "danger-full-access"
         }))

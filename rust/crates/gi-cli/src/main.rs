@@ -10707,7 +10707,8 @@ impl LiveCli {
 
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter =
+            CliPermissionPrompter::new(self.permission_mode).non_interactive();
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -10732,7 +10733,8 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor, _abort_signal) = self.prepare_turn_runtime(false)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter =
+            CliPermissionPrompter::new(self.permission_mode).non_interactive();
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -16429,6 +16431,11 @@ struct CliPermissionPrompter {
     /// When set, held while prompting so the background "thinking" animation is
     /// paused and the spinner line is cleared first.
     anim_lock: Option<Arc<Mutex<()>>>,
+    /// Structured (`--output-format json`) mode: print the approval panel to
+    /// STDERR (not stdout) so stdout stays pure JSON for `| jq`, while still
+    /// reading the answer from stdin (so piped approval like `echo y | gi …`
+    /// works; with no input the read hits EOF and the tool is denied cleanly).
+    panel_to_stderr: bool,
 }
 
 impl CliPermissionPrompter {
@@ -16436,11 +16443,17 @@ impl CliPermissionPrompter {
         Self {
             current_mode,
             anim_lock: None,
+            panel_to_stderr: false,
         }
     }
 
     fn with_anim_lock(mut self, lock: Arc<Mutex<()>>) -> Self {
         self.anim_lock = Some(lock);
+        self
+    }
+
+    fn non_interactive(mut self) -> Self {
+        self.panel_to_stderr = true;
         self
     }
 }
@@ -16453,20 +16466,6 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         // Session memory: a previous `a`/`A` already approved this — don't prompt.
         if session_approved(&request.tool_name) {
             return runtime::PermissionPromptDecision::Allow;
-        }
-        // Non-interactive (e.g. `gi -p … --output-format json`, pipelines): there's
-        // no one to answer, so deny cleanly instead of printing the approval panel
-        // to stdout (which would corrupt JSON output). The deny reason flows into
-        // the tool_result. Mirrors the structured deny used by exit_plan_mode /
-        // ask_user.
-        if !io::stdin().is_terminal() {
-            return runtime::PermissionPromptDecision::Deny {
-                reason: format!(
-                    "{} requires approval but no interactive terminal is available; \
-                     re-run interactively or use --permission-mode danger-full-access.",
-                    request.tool_name
-                ),
-            };
         }
         // Pause the thinking animation (and clear its line) for the prompt.
         let _anim_guard = self.anim_lock.as_ref().map(|lock| {
@@ -16485,17 +16484,25 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             body.push_str(line);
         }
         body.push_str("\n[y]es  [n]o  [a]lways this tool  [A]ll tools");
-        println!();
-        println!(
-            "{}",
-            render::panel(
-                Some(&format!("approve · {}", request.tool_name)),
-                &body,
-                use_color
-            )
+        let panel = render::panel(
+            Some(&format!("approve · {}", request.tool_name)),
+            &body,
+            use_color,
         );
-        print!("> ");
-        let _ = io::stdout().flush();
+        // In JSON mode the panel goes to stderr so stdout stays valid JSON for
+        // `| jq`; otherwise it's a normal stdout prompt. Either way the answer is
+        // read from stdin (so `echo y | gi …` works; EOF → deny).
+        if self.panel_to_stderr {
+            eprintln!();
+            eprintln!("{panel}");
+            eprint!("> ");
+            let _ = io::stderr().flush();
+        } else {
+            println!();
+            println!("{panel}");
+            print!("> ");
+            let _ = io::stdout().flush();
+        }
 
         let mut response = String::new();
         match io::stdin().read_line(&mut response) {

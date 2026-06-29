@@ -1564,7 +1564,24 @@ impl PluginManager {
         enabled: Option<bool>,
     ) -> Result<(), PluginError> {
         update_settings_json(&self.settings_path(), |root| {
-            let enabled_plugins = ensure_object(root, "enabledPlugins");
+            // Write the current key `plugins.enabled` (not the deprecated
+            // top-level `enabledPlugins`), and migrate any legacy entries over so
+            // the loader no longer warns about a key gi itself wrote.
+            let legacy: Vec<(String, Value)> = root
+                .get("enabledPlugins")
+                .and_then(Value::as_object)
+                .map(|object| {
+                    object
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let plugins = ensure_object(root, "plugins");
+            let enabled_plugins = ensure_object(plugins, "enabled");
+            for (key, value) in legacy {
+                enabled_plugins.entry(key).or_insert(value);
+            }
             match enabled {
                 Some(value) => {
                     enabled_plugins.insert(plugin_id.to_string(), Value::Bool(value));
@@ -1573,6 +1590,7 @@ impl PluginManager {
                     enabled_plugins.remove(plugin_id);
                 }
             }
+            root.remove("enabledPlugins");
         })
     }
 
@@ -2561,7 +2579,12 @@ mod tests {
     fn load_enabled_plugins(path: &Path) -> BTreeMap<String, bool> {
         let contents = fs::read_to_string(path).expect("settings should exist");
         let root: Value = serde_json::from_str(&contents).expect("settings json");
-        root.get("enabledPlugins")
+        // Current key is `plugins.enabled`; fall back to the legacy top-level
+        // `enabledPlugins` for older settings files.
+        root.get("plugins")
+            .and_then(Value::as_object)
+            .and_then(|plugins| plugins.get("enabled"))
+            .or_else(|| root.get("enabledPlugins"))
             .and_then(Value::as_object)
             .map(|enabled_plugins| {
                 enabled_plugins

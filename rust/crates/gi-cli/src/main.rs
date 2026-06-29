@@ -10597,6 +10597,13 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Expand @file/@dir/@mcp mentions here too, so non-interactive/scripted
+        // runs (`gi -p "summarize @file"`, pipelines) get the same inlining as the
+        // REPL/TUI submit paths.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let expanded = expand_at_mentions(input, &cwd);
+        let expanded = self.expand_mcp_mentions(&expanded);
+        let input = expanded.as_str();
         match output_format {
             CliOutputFormat::Json if compact => self.run_prompt_compact_json(input),
             CliOutputFormat::Text if compact => self.run_prompt_compact(input),

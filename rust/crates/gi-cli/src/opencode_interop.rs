@@ -374,6 +374,53 @@ pub fn strip_jsonc_comments(input: &str) -> String {
             _ => out.push(c),
         }
     }
+    // opencode's own .jsonc configs use trailing commas (valid JSONC, not strict
+    // JSON), so strip those too before serde_json parses the result.
+    strip_trailing_commas(&out)
+}
+
+/// Remove commas immediately before a closing `}` or `]` (ignoring whitespace),
+/// while preserving commas inside strings. Lets JSONC trailing commas parse.
+fn strip_trailing_commas(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                // trailing comma — drop it (following whitespace emitted normally).
+                i += 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
     out
 }
 
@@ -592,6 +639,24 @@ mod tests {
         assert_eq!(parsed["model"], json!("anthropic/claude"));
         assert_eq!(parsed["url"], json!("https://x/y"));
         assert_eq!(parsed["note"], json!("keep // these /* slashes */ literal"));
+    }
+
+    #[test]
+    fn strips_jsonc_trailing_commas() {
+        // opencode's own .jsonc configs use trailing commas.
+        let src = r#"{
+  "tools": {
+    "a": false,
+    "b": true,
+  },
+  "list": [1, 2, 3,],
+  "note": "keep, commas, in strings,",
+}"#;
+        let stripped = strip_jsonc_comments(src);
+        let parsed: Value = serde_json::from_str(&stripped).expect("valid JSON after stripping");
+        assert_eq!(parsed["tools"]["b"], json!(true));
+        assert_eq!(parsed["list"], json!([1, 2, 3]));
+        assert_eq!(parsed["note"], json!("keep, commas, in strings,"));
     }
 
     #[test]
